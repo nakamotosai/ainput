@@ -1,0 +1,21 @@
+{
+  "shortcuts": {
+    "push_to_talk": "Ctrl+Win"
+  },
+  "asr": {
+    "model_dir": "models/sense-voice",
+    "provider": "cpu",
+    "sample_rate_hz": 16000,
+    "language": "auto",
+    "use_itn": true,
+    "num_threads": 1
+  },
+  "output": {
+    "prefer_direct_paste": true,
+    "fallback_to_clipboard": true
+  },
+  "logging": {
+    "level": "info",
+    "file_name": "ainput.log"
+  }
+}

@@ -1,0 +1,9 @@
+/target/
+/.idea/
+/.vscode/
+/logs/
+/dist/
+/runtime/
+/models/
+/data/terms/user_terms.json
+/data/prompts/user_prompts.json

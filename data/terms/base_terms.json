@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "description": "ainput built-in technical terms",
+  "terms": [
+    { "spoken": ["codex", "code x"], "canonical": "Codex" },
+    { "spoken": ["cursor"], "canonical": "Cursor" },
+    { "spoken": ["claude"], "canonical": "Claude" },
+    { "spoken": ["chat gpt", "chatgpt"], "canonical": "ChatGPT" },
+    { "spoken": ["open ai", "openai"], "canonical": "OpenAI" },
+    { "spoken": ["refactor"], "canonical": "refactor" },
+    { "spoken": ["work tree", "worktree"], "canonical": "worktree" },
+    { "spoken": ["trace back", "traceback"], "canonical": "traceback" },
+    { "spoken": ["fast api", "fastapi"], "canonical": "FastAPI" },
+    { "spoken": ["type script", "typescript"], "canonical": "TypeScript" }
+  ]
+}

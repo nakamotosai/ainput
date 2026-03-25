@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "apps/ainput-desktop",
+    "crates/ainput-shell",
+    "crates/ainput-audio",
+    "crates/ainput-asr",
+    "crates/ainput-rewrite",
+    "crates/ainput-output",
+    "crates/ainput-data",
+]
+
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Proprietary"
+version = "0.1.0"
+authors = ["sai"]
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
