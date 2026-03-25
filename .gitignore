@@ -5,5 +5,7 @@
 /dist/
 /runtime/
 /models/
+/tmp/
+/data/terms/user_terms.txt
 /data/terms/user_terms.json
 /data/prompts/user_prompts.json

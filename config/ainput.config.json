@@ -1,6 +1,7 @@
 {
   "shortcuts": {
-    "push_to_talk": "Ctrl+Win"
+    "push_to_talk": "Ctrl+Win",
+    "mouse_middle_hold_enabled": true
   },
   "asr": {
     "model_dir": "models/sense-voice",
@@ -8,7 +9,7 @@
     "sample_rate_hz": 16000,
     "language": "auto",
     "use_itn": true,
-    "num_threads": 1
+    "num_threads": 4
   },
   "output": {
     "prefer_direct_paste": true,

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug)]
 pub struct Bootstrap {
@@ -27,6 +27,7 @@ pub struct AppConfig {
 #[serde(default)]
 pub struct ShortcutConfig {
     pub push_to_talk: String,
+    pub mouse_middle_hold_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +78,7 @@ impl Default for ShortcutConfig {
     fn default() -> Self {
         Self {
             push_to_talk: "Ctrl+Win".to_string(),
+            mouse_middle_hold_enabled: true,
         }
     }
 }
@@ -89,7 +91,7 @@ impl Default for AsrConfig {
             sample_rate_hz: 16_000,
             language: "auto".to_string(),
             use_itn: true,
-            num_threads: 1,
+            num_threads: 4,
         }
     }
 }
@@ -132,6 +134,13 @@ pub fn bootstrap() -> Result<Bootstrap> {
     })
 }
 
+pub fn save_config(paths: &RuntimePaths, config: &AppConfig) -> Result<()> {
+    let payload = serde_json::to_string_pretty(config).context("serialize config")?;
+    fs::write(&paths.config_file, payload)
+        .with_context(|| format!("write config file {}", paths.config_file.display()))?;
+    Ok(())
+}
+
 impl RuntimePaths {
     pub fn discover() -> Result<Self> {
         let root_dir = if let Ok(value) = env::var("AINPUT_ROOT") {
@@ -156,6 +165,10 @@ fn discover_root_dir() -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("resolve executable directory"))?;
 
+    if has_runtime_asset_markers(&exe_dir) {
+        return Ok(exe_dir);
+    }
+
     if let Some(found) = find_runtime_root(&exe_dir) {
         return Ok(found);
     }
@@ -170,13 +183,13 @@ fn discover_root_dir() -> Result<PathBuf> {
 
 fn find_runtime_root(start: &Path) -> Option<PathBuf> {
     for candidate in start.ancestors() {
-        if has_project_root_markers(candidate) {
+        if has_runtime_asset_markers(candidate) {
             return Some(candidate.to_path_buf());
         }
     }
 
     for candidate in start.ancestors() {
-        if has_runtime_asset_markers(candidate) {
+        if has_project_root_markers(candidate) {
             return Some(candidate.to_path_buf());
         }
     }
@@ -195,9 +208,8 @@ fn has_runtime_asset_markers(candidate: &Path) -> bool {
 
 fn load_or_create_config(paths: &RuntimePaths) -> Result<AppConfig> {
     if let Some(parent) = paths.config_file.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("create config directory {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create config directory {}", parent.display()))?;
     }
 
     fs::create_dir_all(&paths.logs_dir)
@@ -209,9 +221,8 @@ fn load_or_create_config(paths: &RuntimePaths) -> Result<AppConfig> {
         let default_config = AppConfig::default();
         let payload =
             serde_json::to_string_pretty(&default_config).context("serialize default config")?;
-        fs::write(&paths.config_file, payload).with_context(|| {
-            format!("write default config {}", paths.config_file.display())
-        })?;
+        fs::write(&paths.config_file, payload)
+            .with_context(|| format!("write default config {}", paths.config_file.display()))?;
         return Ok(default_config);
     }
 

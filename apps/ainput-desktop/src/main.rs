@@ -2,9 +2,11 @@
 
 mod hotkey;
 mod overlay;
+mod worker;
 
 use anyhow::Result;
 use std::fs;
+use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{
     Arc,
@@ -12,12 +14,14 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use worker::{WorkerCommand, WorkerEvent};
 
 fn main() -> Result<()> {
     let bootstrap = ainput_shell::bootstrap()?;
@@ -117,34 +121,36 @@ fn cache_recent_text(logs_dir: &std::path::Path, text: &str) -> Result<()> {
     fs::write(logs_dir.join("last_result.txt"), text).map_err(Into::into)
 }
 
+fn open_user_terms_document(runtime: &AppRuntime) -> Result<()> {
+    let path = ainput_output::ensure_user_terms_document(&runtime.runtime_paths.root_dir)?;
+    Command::new("notepad.exe")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
+fn open_readme_document(runtime: &AppRuntime) -> Result<()> {
+    let path = runtime.runtime_paths.root_dir.join("README.md");
+    Command::new("notepad.exe")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 #[derive(Clone)]
-struct AppRuntime {
+pub(crate) struct AppRuntime {
     config: ainput_shell::AppConfig,
     runtime_paths: ainput_shell::RuntimePaths,
 }
 
-enum AppEvent {
+pub(crate) enum AppEvent {
     Worker(WorkerEvent),
     Hotkey(hotkey::HotkeyState),
     OverlayTick,
     Tray(TrayIconEvent),
     Menu(MenuEvent),
-}
-
-enum WorkerEvent {
-    Started,
-    RecordingStarted,
-    Meter(f32),
-    RecordingStopped,
-    Transcribing,
-    Delivered(String),
-    ClipboardFallback(String),
-    Error(String),
-}
-
-enum WorkerCommand {
-    HotkeyPressed,
-    HotkeyReleased,
 }
 
 struct DesktopApp {
@@ -153,6 +159,7 @@ struct DesktopApp {
     shutdown: Arc<AtomicBool>,
     worker_started: bool,
     overlay_tick_started: bool,
+    resource_monitor_started: bool,
     worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     hotkey_monitor: Option<hotkey::GlobalHotkeyMonitor>,
     tray_icon: Option<TrayIcon>,
@@ -160,6 +167,9 @@ struct DesktopApp {
     overlay_available: bool,
     exit_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
+    open_terms_item: Option<MenuItem>,
+    learn_terms_item: Option<MenuItem>,
+    mouse_middle_item: Option<CheckMenuItem>,
 }
 
 impl DesktopApp {
@@ -170,6 +180,7 @@ impl DesktopApp {
             shutdown: Arc::new(AtomicBool::new(false)),
             worker_started: false,
             overlay_tick_started: false,
+            resource_monitor_started: false,
             worker_tx: None,
             hotkey_monitor: None,
             tray_icon: None,
@@ -177,6 +188,9 @@ impl DesktopApp {
             overlay_available: true,
             exit_item: None,
             status_item: None,
+            open_terms_item: None,
+            learn_terms_item: None,
+            mouse_middle_item: None,
         }
     }
 
@@ -192,7 +206,7 @@ impl DesktopApp {
         let (worker_tx, worker_rx) = mpsc::channel();
         self.worker_tx = Some(worker_tx);
 
-        thread::spawn(move || push_to_talk_worker(runtime, proxy, shutdown, worker_rx));
+        thread::spawn(move || worker::push_to_talk_worker(runtime, proxy, shutdown, worker_rx));
     }
 
     fn start_overlay_tick_once(&mut self) {
@@ -207,6 +221,30 @@ impl DesktopApp {
             while !shutdown.load(Ordering::Relaxed) {
                 let _ = proxy.send_event(AppEvent::OverlayTick);
                 thread::sleep(Duration::from_millis(7));
+            }
+        });
+    }
+
+    fn start_resource_monitor_once(&mut self) {
+        if self.resource_monitor_started {
+            return;
+        }
+
+        self.resource_monitor_started = true;
+        let shutdown = self.shutdown.clone();
+        thread::spawn(move || {
+            let pid = Pid::from_u32(std::process::id());
+            let mut system = System::new_all();
+
+            while !shutdown.load(Ordering::Relaxed) {
+                log_process_heartbeat(&mut system, pid);
+
+                for _ in 0..300 {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
         });
     }
@@ -244,18 +282,30 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
         if self.tray_icon.is_none() {
             let tray_menu = Menu::new();
             let status_item = MenuItem::with_id("status", "状态：待机中", false, None);
+            let learn_terms_item = MenuItem::with_id("learn_terms", "学习最近一次修正", true, None);
+            let open_terms_item = MenuItem::with_id("open_terms", "手动添加易错词", true, None);
+            let mouse_middle_item = CheckMenuItem::with_id(
+                "mouse_middle_toggle",
+                "启用鼠标中键长按录音",
+                true,
+                self.runtime.config.shortcuts.mouse_middle_hold_enabled,
+                None,
+            );
             let help_item = MenuItem::with_id("help", "使用说明", true, None);
             let exit_item = MenuItem::with_id("exit", "退出", true, None);
             let separator = PredefinedMenuItem::separator();
 
             let _ = tray_menu.append(&status_item);
             let _ = tray_menu.append(&separator);
+            let _ = tray_menu.append(&mouse_middle_item);
+            let _ = tray_menu.append(&learn_terms_item);
+            let _ = tray_menu.append(&open_terms_item);
             let _ = tray_menu.append(&help_item);
             let _ = tray_menu.append(&exit_item);
 
             let tray_icon = TrayIconBuilder::new()
                 .with_tooltip("ainput\n待机中")
-                .with_icon(app_icon())
+                .with_icon(app_icon(&self.runtime))
                 .with_menu(Box::new(tray_menu))
                 .build()
                 .expect("create ainput tray icon");
@@ -271,16 +321,24 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
 
             self.status_item = Some(status_item);
             self.exit_item = Some(exit_item);
+            self.open_terms_item = Some(open_terms_item);
+            self.learn_terms_item = Some(learn_terms_item);
+            self.mouse_middle_item = Some(mouse_middle_item);
             self.tray_icon = Some(tray_icon);
             self.overlay = overlay;
         }
 
         self.start_worker_once();
         self.start_overlay_tick_once();
+        self.start_resource_monitor_once();
         if self.hotkey_monitor.is_none() {
             self.hotkey_monitor = Some(
-                hotkey::GlobalHotkeyMonitor::start(self.proxy.clone(), self.shutdown.clone())
-                    .expect("start global hotkey monitor"),
+                hotkey::GlobalHotkeyMonitor::start(
+                    self.proxy.clone(),
+                    self.shutdown.clone(),
+                    self.runtime.config.shortcuts.mouse_middle_hold_enabled,
+                )
+                .expect("start global hotkey monitor"),
             );
         }
         self.set_tray_status("状态：待机中");
@@ -312,6 +370,9 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 }
                 WorkerEvent::Transcribing => {
                     self.set_tray_status("状态：正在识别");
+                }
+                WorkerEvent::IgnoredSilence => {
+                    self.set_tray_status("状态：待机中");
                 }
                 WorkerEvent::Delivered(_text) => {
                     self.set_tray_status("状态：待机中");
@@ -356,7 +417,94 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.shutdown.store(true, Ordering::Relaxed);
                     event_loop.exit();
                 } else if event.id.0 == "help" {
-                    self.set_tray_status("状态：按住 Ctrl+Win 录音");
+                    match open_readme_document(&self.runtime) {
+                        Ok(()) => self.set_tray_status("状态：已打开使用说明"),
+                        Err(error) => self.set_tray_status(&format!(
+                            "状态：打开说明失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        )),
+                    }
+                } else if self
+                    .mouse_middle_item
+                    .as_ref()
+                    .map(|item| event.id == *item.id())
+                    .unwrap_or(false)
+                {
+                    let next_enabled = !self.runtime.config.shortcuts.mouse_middle_hold_enabled;
+                    self.runtime.config.shortcuts.mouse_middle_hold_enabled = next_enabled;
+                    hotkey::set_mouse_middle_enabled(next_enabled);
+                    if let Some(item) = &self.mouse_middle_item {
+                        item.set_checked(next_enabled);
+                    }
+                    match ainput_shell::save_config(
+                        &self.runtime.runtime_paths,
+                        &self.runtime.config,
+                    ) {
+                        Ok(()) => {
+                            let status = if next_enabled {
+                                "状态：已启用鼠标中键长按录音"
+                            } else {
+                                "状态：已关闭鼠标中键长按录音"
+                            };
+                            self.set_tray_status(status);
+                        }
+                        Err(error) => {
+                            self.runtime.config.shortcuts.mouse_middle_hold_enabled = !next_enabled;
+                            hotkey::set_mouse_middle_enabled(!next_enabled);
+                            if let Some(item) = &self.mouse_middle_item {
+                                item.set_checked(!next_enabled);
+                            }
+                            self.set_tray_status(&format!(
+                                "状态：保存设置失败 - {}",
+                                shorten(&error.to_string(), 16)
+                            ));
+                        }
+                    }
+                } else if self
+                    .open_terms_item
+                    .as_ref()
+                    .map(|item| event.id == *item.id())
+                    .unwrap_or(false)
+                {
+                    match open_user_terms_document(&self.runtime) {
+                        Ok(()) => self.set_tray_status("状态：已打开易错词文档"),
+                        Err(error) => self.set_tray_status(&format!(
+                            "状态：打开文档失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        )),
+                    }
+                } else if self
+                    .learn_terms_item
+                    .as_ref()
+                    .map(|item| event.id == *item.id())
+                    .unwrap_or(false)
+                {
+                    match ainput_output::learn_from_recent_correction(
+                        &self.runtime.runtime_paths.root_dir,
+                        &self.runtime.runtime_paths.logs_dir,
+                    ) {
+                        Ok(Some(outcome)) => {
+                            let status = if outcome.activated {
+                                format!(
+                                    "状态：已学习 {} -> {}（已生效）",
+                                    outcome.spoken, outcome.canonical
+                                )
+                            } else {
+                                format!(
+                                    "状态：已记录 {} -> {}（{}/2）",
+                                    outcome.spoken, outcome.canonical, outcome.count
+                                )
+                            };
+                            self.set_tray_status(&status);
+                        }
+                        Ok(None) => {
+                            self.set_tray_status("状态：未识别到单词修正，先复制修正后文本");
+                        }
+                        Err(error) => self.set_tray_status(&format!(
+                            "状态：学习失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        )),
+                    }
                 }
             }
         }
@@ -373,148 +521,25 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
     }
 }
 
-fn push_to_talk_worker(
-    runtime: AppRuntime,
-    proxy: EventLoopProxy<AppEvent>,
-    shutdown: Arc<AtomicBool>,
-    worker_rx: mpsc::Receiver<WorkerCommand>,
-) {
-    let recognizer = match build_recognizer(&runtime) {
-        Ok(recognizer) => recognizer,
-        Err(error) => {
-            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(format!(
-                "初始化识别器失败：{error}"
-            ))));
-            return;
-        }
-    };
+fn app_icon(runtime: &AppRuntime) -> Icon {
+    let icon_path = runtime
+        .runtime_paths
+        .root_dir
+        .join("assets")
+        .join("app-icon.ico");
+    if let Ok(icon) = Icon::from_path(&icon_path, Some((32, 32))) {
+        return icon;
+    }
 
-    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Started));
-    let mut active_recording: Option<ainput_audio::ActiveRecording> = None;
-
-    tracing::info!(
-        shortcut = %runtime.config.shortcuts.push_to_talk,
-        root_dir = %runtime.runtime_paths.root_dir.display(),
-        "ainput worker loop started"
+    tracing::warn!(
+        icon_path = %icon_path.display(),
+        "failed to load custom icon from file, fallback to built-in placeholder icon"
     );
 
-    while !shutdown.load(Ordering::Relaxed) {
-        if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(16)) {
-            match command {
-                WorkerCommand::HotkeyPressed => {
-                    if active_recording.is_none() {
-                        match ainput_audio::ActiveRecording::start_default_input() {
-                            Ok(recording) => {
-                                active_recording = Some(recording);
-                                let _ =
-                                    proxy.send_event(AppEvent::Worker(WorkerEvent::RecordingStarted));
-                                tracing::info!("push-to-talk recording started");
-                            }
-                            Err(error) => {
-                                tracing::error!(error = %error, "failed to start microphone recording");
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("启动录音失败：{error}"),
-                                )));
-                            }
-                        }
-                    }
-                }
-                WorkerCommand::HotkeyReleased => {
-                    if let Some(recording) = active_recording.take() {
-                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::RecordingStopped));
-
-                        match recording.stop() {
-                            Ok(audio) => {
-                                tracing::info!(
-                                    sample_rate_hz = audio.sample_rate_hz,
-                                    frames = audio.samples.len(),
-                                    "push-to-talk recording captured"
-                                );
-
-                                if !audio.samples.is_empty() {
-                                    let _ =
-                                        proxy.send_event(AppEvent::Worker(WorkerEvent::Transcribing));
-                                    match recognizer.transcribe_samples(
-                                        audio.sample_rate_hz,
-                                        &audio.samples,
-                                        "microphone",
-                                    ) {
-                                        Ok(transcription) => {
-                                            let text = transcription.text.trim().to_string();
-
-                                            if !text.is_empty() {
-                                                thread::sleep(Duration::from_millis(120));
-                                                match ainput_output::deliver_text(
-                                                    &text,
-                                                    runtime.config.output.prefer_direct_paste,
-                                                ) {
-                                                    Ok(delivery) => {
-                                                        let _ = cache_recent_text(
-                                                            &runtime.runtime_paths.logs_dir,
-                                                            &text,
-                                                        );
-                                                        tracing::info!(
-                                                            ?delivery,
-                                                            text = %text,
-                                                            "transcription delivered"
-                                                        );
-
-                                                        let event = match delivery {
-                                                            ainput_output::OutputDelivery::DirectPaste => {
-                                                                WorkerEvent::Delivered(text)
-                                                            }
-                                                            ainput_output::OutputDelivery::ClipboardOnly => {
-                                                                WorkerEvent::ClipboardFallback(text)
-                                                            }
-                                                        };
-                                                        let _ = proxy.send_event(AppEvent::Worker(event));
-                                                    }
-                                                    Err(error) => {
-                                                        tracing::error!(
-                                                            error = %error,
-                                                            "failed to deliver transcription output"
-                                                        );
-                                                        let _ = proxy.send_event(AppEvent::Worker(
-                                                            WorkerEvent::Error(format!(
-                                                                "输出结果失败：{error}"
-                                                            )),
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(error) => {
-                                            tracing::error!(
-                                                error = %error,
-                                                "failed to transcribe microphone audio"
-                                            );
-                                            let _ = proxy.send_event(AppEvent::Worker(
-                                                WorkerEvent::Error(format!("语音识别失败：{error}")),
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(error = %error, "failed to stop microphone recording");
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("停止录音失败：{error}"),
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(recording) = &active_recording {
-            let level = normalize_audio_level(recording.current_level());
-            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Meter(level)));
-        }
-    }
+    fallback_app_icon()
 }
 
-fn app_icon() -> Icon {
+fn fallback_app_icon() -> Icon {
     let size = 32u32;
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
 
@@ -547,6 +572,20 @@ fn shorten(text: &str, max_chars: usize) -> String {
     shortened
 }
 
-fn normalize_audio_level(raw_level: f32) -> f32 {
-    (raw_level * 6.5).sqrt().clamp(0.0, 1.0)
+fn log_process_heartbeat(system: &mut System, pid: Pid) {
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+
+    let Some(process) = system.process(pid) else {
+        tracing::warn!("process heartbeat skipped because current process is unavailable");
+        return;
+    };
+
+    tracing::info!(
+        cpu_usage_percent = format_args!("{:.2}", process.cpu_usage()),
+        working_set_mb = format_args!("{:.1}", process.memory() as f64 / 1024.0 / 1024.0),
+        virtual_memory_mb =
+            format_args!("{:.1}", process.virtual_memory() as f64 / 1024.0 / 1024.0),
+        runtime_seconds = process.run_time(),
+        "process heartbeat"
+    );
 }
