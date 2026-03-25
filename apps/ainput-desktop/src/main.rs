@@ -4,8 +4,9 @@ mod hotkey;
 mod overlay;
 mod worker;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{
@@ -22,6 +23,9 @@ use tray_icon::{
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use worker::{WorkerCommand, WorkerEvent};
+
+const RUN_REGISTRY_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_REGISTRY_VALUE_NAME: &str = "ainput";
 
 fn main() -> Result<()> {
     let bootstrap = ainput_shell::bootstrap()?;
@@ -170,6 +174,7 @@ struct DesktopApp {
     open_terms_item: Option<MenuItem>,
     learn_terms_item: Option<MenuItem>,
     mouse_middle_item: Option<CheckMenuItem>,
+    launch_at_login_item: Option<CheckMenuItem>,
 }
 
 impl DesktopApp {
@@ -191,6 +196,7 @@ impl DesktopApp {
             open_terms_item: None,
             learn_terms_item: None,
             mouse_middle_item: None,
+            launch_at_login_item: None,
         }
     }
 
@@ -291,12 +297,20 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 self.runtime.config.shortcuts.mouse_middle_hold_enabled,
                 None,
             );
+            let launch_at_login_item = CheckMenuItem::with_id(
+                "launch_at_login_toggle",
+                "开机自动启动",
+                true,
+                self.runtime.config.startup.launch_at_login,
+                None,
+            );
             let help_item = MenuItem::with_id("help", "使用说明", true, None);
             let exit_item = MenuItem::with_id("exit", "退出", true, None);
             let separator = PredefinedMenuItem::separator();
 
             let _ = tray_menu.append(&status_item);
             let _ = tray_menu.append(&separator);
+            let _ = tray_menu.append(&launch_at_login_item);
             let _ = tray_menu.append(&mouse_middle_item);
             let _ = tray_menu.append(&learn_terms_item);
             let _ = tray_menu.append(&open_terms_item);
@@ -324,6 +338,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             self.open_terms_item = Some(open_terms_item);
             self.learn_terms_item = Some(learn_terms_item);
             self.mouse_middle_item = Some(mouse_middle_item);
+            self.launch_at_login_item = Some(launch_at_login_item);
             self.tray_icon = Some(tray_icon);
             self.overlay = overlay;
         }
@@ -341,7 +356,16 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 .expect("start global hotkey monitor"),
             );
         }
-        self.set_tray_status("状态：待机中");
+        match sync_launch_at_login(self.runtime.config.startup.launch_at_login) {
+            Ok(()) => self.set_tray_status("状态：待机中"),
+            Err(error) => {
+                tracing::error!(error = %error, "sync launch-at-login setting failed");
+                self.set_tray_status(&format!(
+                    "状态：开机启动设置失败 - {}",
+                    shorten(&error.to_string(), 14)
+                ));
+            }
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
@@ -423,6 +447,44 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                             "状态：打开说明失败 - {}",
                             shorten(&error.to_string(), 16)
                         )),
+                    }
+                } else if self
+                    .launch_at_login_item
+                    .as_ref()
+                    .map(|item| event.id == *item.id())
+                    .unwrap_or(false)
+                {
+                    let previous_enabled = self.runtime.config.startup.launch_at_login;
+                    let next_enabled = !self.runtime.config.startup.launch_at_login;
+                    self.runtime.config.startup.launch_at_login = next_enabled;
+                    if let Some(item) = &self.launch_at_login_item {
+                        item.set_checked(next_enabled);
+                    }
+                    let result = sync_launch_at_login(next_enabled).and_then(|_| {
+                        ainput_shell::save_config(
+                            &self.runtime.runtime_paths,
+                            &self.runtime.config,
+                        )
+                        .inspect_err(|_| {
+                            let _ = sync_launch_at_login(previous_enabled);
+                        })
+                    });
+                    if let Err(error) = result {
+                        self.runtime.config.startup.launch_at_login = previous_enabled;
+                        if let Some(item) = &self.launch_at_login_item {
+                            item.set_checked(previous_enabled);
+                        }
+                        self.set_tray_status(&format!(
+                            "状态：开机启动设置失败 - {}",
+                            shorten(&error.to_string(), 14)
+                        ));
+                    } else {
+                        let status = if next_enabled {
+                            "状态：已开启开机自动启动"
+                        } else {
+                            "状态：已关闭开机自动启动"
+                        };
+                        self.set_tray_status(status);
                     }
                 } else if self
                     .mouse_middle_item
@@ -588,4 +650,70 @@ fn log_process_heartbeat(system: &mut System, pid: Pid) {
         runtime_seconds = process.run_time(),
         "process heartbeat"
     );
+}
+
+fn sync_launch_at_login(enabled: bool) -> Result<()> {
+    if enabled {
+        set_launch_at_login_registry_value()
+    } else {
+        remove_launch_at_login_registry_value()
+    }
+}
+
+fn set_launch_at_login_registry_value() -> Result<()> {
+    let exe = current_exe_for_launch_at_login()?;
+    let status = Command::new("reg")
+        .args([
+            "add",
+            RUN_REGISTRY_KEY,
+            "/v",
+            RUN_REGISTRY_VALUE_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+            exe.as_str(),
+            "/f",
+        ])
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("write launch-at-login registry value failed"))
+    }
+}
+
+fn remove_launch_at_login_registry_value() -> Result<()> {
+    let delete_status = Command::new("reg")
+        .args([
+            "delete",
+            RUN_REGISTRY_KEY,
+            "/v",
+            RUN_REGISTRY_VALUE_NAME,
+            "/f",
+        ])
+        .status()?;
+
+    if delete_status.success() {
+        return Ok(());
+    }
+
+    let query_status = Command::new("reg")
+        .args(["query", RUN_REGISTRY_KEY, "/v", RUN_REGISTRY_VALUE_NAME])
+        .status()?;
+
+    if !query_status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("remove launch-at-login registry value failed"))
+    }
+}
+
+fn current_exe_for_launch_at_login() -> Result<String> {
+    let path = std::env::current_exe()?;
+    Ok(quote_command_path(path))
+}
+
+fn quote_command_path(path: PathBuf) -> String {
+    format!("\"{}\"", path.display())
 }

@@ -2,10 +2,10 @@
 
 ## 默认工作流
 
-1. 读取 [AGENTS.md](AGENTS.md)
-2. 读取 [SPEC.md](SPEC.md)
-3. 读取 [PLAN.md](PLAN.md)
-4. 读取 [TASKLIST.md](TASKLIST.md)
+1. 读取 [AGENTS.md](C:/Users/sai/ainput/AGENTS.md)
+2. 读取 [SPEC.md](C:/Users/sai/ainput/SPEC.md)
+3. 读取 [PLAN.md](C:/Users/sai/ainput/PLAN.md)
+4. 读取 [TASKLIST.md](C:/Users/sai/ainput/TASKLIST.md)
 5. 根据当前轮次开始实施
 6. 实施后更新：
    - `TASKLIST.md`

@@ -151,8 +151,7 @@ fn append_input_data<T>(
     channels: usize,
     shared_samples: &Arc<Mutex<Vec<f32>>>,
     shared_level_bits: &Arc<AtomicU32>,
-)
-where
+) where
     T: Sample,
     f32: FromSample<T>,
 {

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.1"
+    [string]$Version = "1.0.2"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,6 +11,20 @@ $packageDir = Join-Path $distRoot $packageName
 $zipPath = Join-Path $distRoot "$packageName.zip"
 $modelSource = Join-Path $repoRoot "models\sense-voice\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 $modelTarget = Join-Path $packageDir "models\sense-voice"
+$packageExe = Join-Path $packageDir "ainput-desktop.exe"
+
+Get-Process ainput-desktop -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -eq $packageExe } |
+    Stop-Process -Force
+
+for ($i = 0; $i -lt 20; $i++) {
+    $running = Get-Process ainput-desktop -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $packageExe }
+    if (-not $running) {
+        break
+    }
+    Start-Sleep -Milliseconds 250
+}
 
 if (Test-Path $packageDir) {
     Remove-Item $packageDir -Recurse -Force
@@ -48,7 +62,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "Start:",
     "1. Double-click run-ainput.bat",
     "2. The app will stay in the system tray",
-    "3. Hold Ctrl+Win or hold mouse middle button, then release to transcribe and paste",
+    "3. Hold Ctrl+Win to talk; mouse middle hold is off by default and can be enabled in the tray menu",
     "",
     "Files:",
     "- ainput-desktop.exe: main app",
@@ -60,6 +74,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- logs\: runtime logs",
     "",
     "Notes:",
+    "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.txt will be created on first use",
     "- Clipboard fallback is used when direct paste fails"

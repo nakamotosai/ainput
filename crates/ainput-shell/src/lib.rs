@@ -18,6 +18,7 @@ pub struct Bootstrap {
 #[serde(default)]
 pub struct AppConfig {
     pub shortcuts: ShortcutConfig,
+    pub startup: StartupConfig,
     pub asr: AsrConfig,
     pub output: OutputConfig,
     pub logging: LoggingConfig,
@@ -28,6 +29,12 @@ pub struct AppConfig {
 pub struct ShortcutConfig {
     pub push_to_talk: String,
     pub mouse_middle_hold_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartupConfig {
+    pub launch_at_login: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +74,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             shortcuts: ShortcutConfig::default(),
+            startup: StartupConfig::default(),
             asr: AsrConfig::default(),
             output: OutputConfig::default(),
             logging: LoggingConfig::default(),
@@ -78,7 +86,15 @@ impl Default for ShortcutConfig {
     fn default() -> Self {
         Self {
             push_to_talk: "Ctrl+Win".to_string(),
-            mouse_middle_hold_enabled: true,
+            mouse_middle_hold_enabled: false,
+        }
+    }
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            launch_at_login: true,
         }
     }
 }

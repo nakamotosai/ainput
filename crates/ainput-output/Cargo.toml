@@ -7,5 +7,14 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 arboard = "3.6.1"
 enigo = { version = "0.6.1", default-features = false, features = ["platform_specific"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+] }

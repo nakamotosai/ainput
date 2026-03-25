@@ -24,6 +24,9 @@
 - 双触发方式
   - `Ctrl+Win` 按住说话
   - 鼠标中键长按约 `200ms` 说话
+- 开机自动启动
+  - 默认开启
+  - 可在托盘菜单里实时开关
 - 鼠标中键冲突处理
   - 短按中键仍保留原来的中键点击功能
   - 只有长按才进入录音
@@ -56,7 +59,11 @@
 - `状态`
   - 显示当前待机、录音、识别、错误等状态
 - `启用鼠标中键长按录音`
+  - 默认关闭
   - 可实时开关鼠标中键触发
+- `开机自动启动`
+  - 默认开启
+  - 可实时开关是否随 Windows 登录自动启动
 - `学习最近一次修正`
   - 把最近一次识别文本与当前剪贴板文本做比较
   - 自动学习错误词到正确词的映射
@@ -90,7 +97,19 @@ run-latest.bat
 
 ### 方式 3：正式版运行
 
-正式版包目录里直接双击：
+推荐直接使用安装包：
+
+```text
+dist\ainput-setup-1.0.2.exe
+```
+
+安装后：
+
+- 程序默认安装到 `%LOCALAPPDATA%\Programs\ainput`
+- 可从开始菜单里的 `ainput` 启动
+- 可通过系统“已安装的应用”或开始菜单里的卸载入口移除
+
+如果你仍然想用便携版，正式版包目录里也可以直接双击：
 
 ```bat
 run-ainput.bat
@@ -115,7 +134,8 @@ run-ainput.bat
 注意：
 
 - 短按鼠标中键仍然保留原生功能
-- 如果你不想启用鼠标中键，可以在托盘菜单里关闭
+- 当前默认关闭鼠标中键长按录音
+- 如果你想启用鼠标中键，可以在托盘菜单里打开
 
 ## 术语增强怎么用
 
@@ -228,6 +248,7 @@ agent
 
 - `shortcuts.push_to_talk`
 - `shortcuts.mouse_middle_hold_enabled`
+- `startup.launch_at_login`
 - `asr.model_dir`
 - `asr.provider`
 - `asr.num_threads`
@@ -239,6 +260,7 @@ agent
 
 - 当前默认还是 `CPU` 推理，不走 GPU
 - 当前热键方案基于 Windows 全局 hook
+- 开机自动启动通过当前用户的 `Run` 注册表项实现
 - `Ctrl+Win` 已针对 `Win` 粘滞问题做了专门状态机修复
 - 不同应用对直接粘贴的前台体验可能略有差异
 - 某些不支持 UI Automation 的输入框，智能句号会回退成保守行为
@@ -255,8 +277,16 @@ cargo build --release -p ainput-desktop
 
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.1\`
-- `dist\ainput-1.0.1.zip`
+- `dist\ainput-setup-1.0.2.exe`
+- `dist\ainput-1.0.2\`
+- `dist\ainput-1.0.2.zip`
+
+其中：
+
+- `ainput-setup-1.0.2.exe`
+  - 安装包，推荐日常使用
+- `ainput-1.0.2.zip`
+  - 便携版压缩包，适合手动解压自管目录
 
 ## 项目结构
 

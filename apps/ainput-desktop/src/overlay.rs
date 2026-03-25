@@ -7,10 +7,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics,
     HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW, SET_WINDOW_POS_FLAGS,
-    SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SM_CXSCREEN, SM_CYSCREEN,
+    SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, WINDOW_STYLE,
     WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, SWP_NOACTIVATE,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
@@ -143,7 +143,8 @@ impl RecordingOverlay {
         }
 
         if self.shown {
-            let offset = ((1.0 - self.current_visibility) * SLIDE_DISTANCE_PX as f32).round() as i32;
+            let offset =
+                ((1.0 - self.current_visibility) * SLIDE_DISTANCE_PX as f32).round() as i32;
             let track_y = self.base_y + offset;
             let track_alpha = (TRACK_ALPHA_MAX as f32 * self.current_visibility).round() as u8;
             let fill_alpha = (FILL_ALPHA_MAX as f32 * self.current_visibility).round() as u8;
@@ -234,11 +235,7 @@ unsafe fn create_overlay_window(
 ) -> Result<OverlayWindow> {
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED
-                | WS_EX_TRANSPARENT
-                | WS_EX_TOPMOST
-                | WS_EX_TOOLWINDOW
-                | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name,
             w!(""),
             WINDOW_STYLE(WS_POPUP.0),

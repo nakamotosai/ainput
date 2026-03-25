@@ -1,7 +1,10 @@
 {
   "shortcuts": {
     "push_to_talk": "Ctrl+Win",
-    "mouse_middle_hold_enabled": true
+    "mouse_middle_hold_enabled": false
+  },
+  "startup": {
+    "launch_at_login": true
   },
   "asr": {
     "model_dir": "models/sense-voice",

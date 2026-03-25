@@ -145,3 +145,22 @@
 
 - 便于开发阶段直接解压官方模型包
 - 兼容后续你替换不同版本模型时的目录差异
+
+---
+
+## D-010 Windows 安装包先采用 IExpress
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 当前机器已自带 `IExpress`
+- 不需要额外安装 NSIS / Inno Setup / WiX
+- 对当前“单用户、自用、快速收口”的发布诉求足够
+
+约定：
+
+- 继续保留 zip 便携包
+- 额外产出一个 `setup.exe` 安装包
+- 安装目录先固定为当前用户的 `LocalAppData\\Programs\\ainput`

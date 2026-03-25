@@ -395,24 +395,47 @@
 - `cargo check -p ainput-desktop`
 - `cargo test -p ainput-output -p ainput-rewrite`
 
-### 发布目录修正
+### 托盘菜单默认值与开机启动
 
-- 修复正式包在仓库内启动时，错误向上识别到仓库根目录的问题
-- 当前 root 发现逻辑改为：
-  - 优先识别 exe 同目录下的运行时资源
-  - 其次才向祖先目录回溯
-  - 最后才退回项目根标记
-- 默认 ASR 线程数从 `1` 提升到 `4`，与当前实测最优配置保持一致
-- 发布默认配置恢复为：
-  - `mouse_middle_hold_enabled = true`
-  - `num_threads = 4`
-- 新增 `scripts/package-release.ps1` 作为固定打包入口
-- 重打正式包：
-  - `dist\\ainput-1.0.1`
-  - `dist\\ainput-1.0.1.zip`
+- 将“启用鼠标中键长按录音”的默认值从开启调整为关闭
+- 配置文件新增：
+  - `startup.launch_at_login`
+- 托盘右键菜单新增“开机自动启动”开关，默认开启
+- 开机自动启动通过当前用户 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册表项实现
+- 启动时会按当前配置自动对齐注册表状态
+- `README.md`、默认配置文件、打包脚本说明一并回写，避免默认行为与文档不一致
+
+验证：
+
+- `cargo check -p ainput-desktop`
+- `cargo build --release -p ainput-desktop`
+- `powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 -Version 1.0.2`
+
+### 安装包交付
+
+- 新增安装脚本：`scripts\install-ainput.ps1`
+- 新增卸载脚本：`scripts\uninstall-ainput.ps1`
+- 新增安装包构建脚本：`scripts\build-installer.ps1`
+- 当前安装包方案：
+  - 使用系统自带 `IExpress`
+  - 继续保留便携版 zip
+  - 额外生成单文件安装包 `dist\ainput-setup-1.0.2.exe`
+- 安装行为固定为：
+  - 安装到 `%LOCALAPPDATA%\Programs\ainput`
+  - 创建开始菜单入口
+  - 写入卸载注册信息
+  - 默认启动程序，由程序自身按配置同步开机自启
+- 卸载行为固定为：
+  - 停止已安装实例
+  - 清理开机自启
+  - 清理开始菜单入口
+  - 清理卸载注册信息
+  - 删除安装目录
+- `README.md` 已回写为“安装包优先”的使用口径
 
 验证：
 
 - `cargo build --release -p ainput-desktop`
-- `powershell -ExecutionPolicy Bypass -File .\\scripts\\package-release.ps1 -Version 1.0.1`
-- 在 `dist\\ainput-1.0.1` 目录执行 `.\\ainput-desktop.exe bootstrap`，确认配置路径已落在发布目录内
+- `powershell -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1 -Version 1.0.2`
+- `powershell -ExecutionPolicy Bypass -File .\scripts\install-ainput.ps1 -PayloadZip .\dist\ainput-1.0.2.zip`
+- `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\ainput\scripts\uninstall-ainput.ps1" -InstallDir "$env:LOCALAPPDATA\Programs\ainput"`
