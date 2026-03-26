@@ -8,3 +8,4 @@ license.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sherpa-onnx = "1.12.33"
+hound = "3.5.1"

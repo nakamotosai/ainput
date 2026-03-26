@@ -1,10 +1,9 @@
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use ainput_output::{OutputConfig, OutputDelivery};
 use anyhow::Result;
 use winit::event_loop::EventLoopProxy;
 
@@ -17,14 +16,21 @@ pub(crate) enum WorkerEvent {
     RecordingStopped,
     Transcribing,
     IgnoredSilence,
-    Delivered(String),
-    ClipboardFallback(String),
+    Delivered,
+    ClipboardFallback,
     Error(String),
 }
 
 pub(crate) enum WorkerCommand {
     HotkeyPressed,
     HotkeyReleased,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VoiceHistoryEntry {
+    pub timestamp: String,
+    pub delivery_label: &'static str,
+    pub text: String,
 }
 
 pub(crate) fn push_to_talk_worker(
@@ -47,7 +53,7 @@ pub(crate) fn push_to_talk_worker(
     let mut active_recording: Option<ainput_audio::ActiveRecording> = None;
 
     tracing::info!(
-        shortcut = %runtime.config.shortcuts.push_to_talk,
+        shortcut = %runtime.config.hotkeys.voice_input,
         root_dir = %runtime.runtime_paths.root_dir.display(),
         "ainput worker loop started"
     );
@@ -158,17 +164,32 @@ pub(crate) fn push_to_talk_worker(
                                             );
                                         }
                                         let output_started_at = Instant::now();
-                                        match ainput_output::deliver_text(
-                                            &text,
-                                            runtime.config.output.prefer_direct_paste,
-                                            &runtime.runtime_paths.root_dir,
-                                        ) {
+                                        let output_config = OutputConfig {
+                                            prefer_direct_paste: runtime
+                                                .config
+                                                .voice
+                                                .prefer_direct_paste,
+                                            fallback_to_clipboard: runtime
+                                                .config
+                                                .voice
+                                                .fallback_to_clipboard,
+                                        };
+                                        match runtime
+                                            .output_controller
+                                            .deliver_text(&text, &output_config)
+                                        {
                                             Ok(delivery) => {
                                                 let output_elapsed_ms =
                                                     output_started_at.elapsed().as_millis();
-                                                let _ = cache_recent_text(
-                                                    &runtime.runtime_paths.logs_dir,
-                                                    &text,
+                                                runtime
+                                                    .shared_state
+                                                    .set_last_voice_text(text.clone());
+                                                runtime.maintenance.persist_voice_result(
+                                                    VoiceHistoryEntry {
+                                                        timestamp: current_timestamp(),
+                                                        delivery_label: delivery_label(delivery),
+                                                        text: text.clone(),
+                                                    },
                                                 );
                                                 let pipeline_elapsed_ms =
                                                     pipeline_started_at.elapsed().as_millis();
@@ -191,11 +212,11 @@ pub(crate) fn push_to_talk_worker(
                                                 );
 
                                                 let event = match delivery {
-                                                    ainput_output::OutputDelivery::DirectPaste => {
-                                                        WorkerEvent::Delivered(text)
+                                                    OutputDelivery::DirectPaste => {
+                                                        WorkerEvent::Delivered
                                                     }
-                                                    ainput_output::OutputDelivery::ClipboardOnly => {
-                                                        WorkerEvent::ClipboardFallback(text)
+                                                    OutputDelivery::ClipboardOnly => {
+                                                        WorkerEvent::ClipboardFallback
                                                     }
                                                 };
                                                 let _ = proxy.send_event(AppEvent::Worker(event));
@@ -255,10 +276,6 @@ fn build_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::SenseVoiceRecogn
         use_itn: runtime.config.asr.use_itn,
         num_threads: runtime.config.asr.num_threads,
     })
-}
-
-fn cache_recent_text(logs_dir: &Path, text: &str) -> Result<()> {
-    fs::write(logs_dir.join("last_result.txt"), text).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -342,4 +359,19 @@ fn is_sentence_punctuation(ch: char) -> bool {
 
 fn normalize_audio_level(raw_level: f32) -> f32 {
     (raw_level * 6.5).sqrt().clamp(0.0, 1.0)
+}
+
+fn current_timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.to_string()
+}
+
+fn delivery_label(delivery: OutputDelivery) -> &'static str {
+    match delivery {
+        OutputDelivery::DirectPaste => "voice_direct_paste",
+        OutputDelivery::ClipboardOnly => "voice_clipboard_only",
+    }
 }

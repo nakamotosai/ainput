@@ -223,6 +223,7 @@ unsafe fn register_overlay_class(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_overlay_window(
     instance: HINSTANCE,
     class_name: windows::core::PCWSTR,

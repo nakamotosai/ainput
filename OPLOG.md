@@ -1,5 +1,75 @@
 # ainput OPLOG
 
+## 2026-03-26 语音触发 emoji 方案设计
+
+- 将“句尾说笑死 -> [破涕为笑]”纳入当前 `SPEC.md` / `PLAN.md` / `TASKLIST.md`
+- 明确首版必须依赖现有输出上下文判断，只在光标位于末尾时触发
+- 记录设计决策：该规则先落在上下文感知输出规则，不直接塞进纯文本归一化函数
+
+## 2026-03-26 语音触发 emoji 实施完成
+
+- 在 `ainput-output` 中增加首版 voice action 规则：仅当上下文为 `EditableAtEnd` 时，将句尾 `笑死` 替换为 `[破涕为笑]`
+- 保持 `EditableWithContentOnRight`、`Unknown` 默认不触发，避免句中和未知上下文误替换
+- 补充句尾命中、句中不命中、终端不命中、命中后不再补句号的单元测试
+- 顺手修复 `ainput-output` crate 独立测试缺少 `windows` feature 的问题，使 `cargo test -p ainput-output` 可单独通过
+
+## 2026-03-26 清除终端特例
+
+- 删除语音输出链路里的 `terminal_strip_trailing_period` 与 `terminal_processes` 正式配置项
+- 删除输出层按进程名区分 `TerminalLike` 的逻辑，不再把终端作为特例类别
+- 统一保留三种上下文：`EditableAtEnd`、`EditableWithContentOnRight`、`Unknown`
+- 统一口径改为：未知上下文默认补句号；emoji 规则只在 `EditableAtEnd` 触发
+
+## 2026-03-26 扩充句尾 emoji 映射
+
+- 将句尾语音触发从单条 `笑死 -> [破涕为笑]` 扩成 8 条固定映射
+- 本轮新增支持：
+  - `偷笑 -> [偷笑]`
+  - `哭死 -> [流泪]`
+  - `震惊 -> [震惊]`
+  - `点赞 -> [强]`
+  - `抱拳 -> [抱拳]`
+  - `狗头 -> [狗头]`
+  - `捂脸 -> [捂脸]`
+- 将“emoji 命中后不补句号”改为通用逻辑，避免新映射命中后被追加 `。`
+
+## 2026-03-26 同步配置与 README 文档
+
+- 在 `config\ainput.toml` 的 `[voice]` 段补充句尾 emoji 语音触发说明
+- 明确当前规则为内置固定映射，只能查看说明，不能通过 TOML 自定义
+- 在 `README.md` 中新增“句尾 Emoji 触发”章节，并同步当前 8 条支持映射与触发边界
+
+## 2026-03-26 修复单个“那个 / 就是”被误删
+
+- 定位到问题不在重复词折叠，而在 `ainput-rewrite` 的开头 filler 清理
+- 移除单个 `那个` 与单个 `就是` 的“开头直接删除”规则
+- 保留重复口头禅 `那个那个` / `就是就是` 的清理能力
+- 补充回归测试，确保单个语义词保留、重复口头禅仍会清除
+
+## 2026-03-26 收紧截图热键触发条件
+
+- 排查到截图进入十字态只有 `WM_HOTKEY -> ScreenshotTriggered -> start_capture_session` 这一条入口
+- 原实现收到 `WM_HOTKEY` 后直接启动截图，没有再核对截图主键是否真的仍处于按下状态
+- 为截图热键新增物理按键复核：只有修饰键和主键当前都处于按下状态时才真正触发截图
+- 这样即使系统侧出现偏脏的 `WM_HOTKEY`，单独按 `Alt` 也不会再误进截图态
+
+## 2026-03-26 为截图热键增加真实主键门禁
+
+- 根据终端前台复现现象，继续收紧截图热键入口
+- 现在除了 `WM_HOTKEY` 外，还必须先在低层键盘钩子里观察到截图主键的真实 `keydown`
+- 对当前默认 `Alt+X` 而言，只有先看到真实 `X keydown`，再收到系统热键消息，才允许进入截图态
+- 这样可以进一步挡住“只按了 Alt，但系统错误投递截图热键消息”的场景
+
+## 2026-03-26 放弃截图的 RegisterHotKey 入口
+
+- 用户实测证明：在 Tabby / 终端前台，单按 `Alt` 仍会误进十字截图态
+- 这说明问题不只是门禁不够，而是截图的 `RegisterHotKey` 入口在终端前台本身不可靠
+- 因此将截图热键改为只走低层键盘钩子：
+  - 必须观察到截图主键的真实 `keydown`
+  - 且修饰键条件同时满足
+  - 才发送 `ScreenshotTriggered`
+- 现在线路与语音热键一致，不再依赖系统投递的 `WM_HOTKEY`
+
 ## 2026-03-25
 
 ### 初始化
@@ -439,3 +509,174 @@
 - `powershell -ExecutionPolicy Bypass -File .\scripts\build-installer.ps1 -Version 1.0.2`
 - `powershell -ExecutionPolicy Bypass -File .\scripts\install-ainput.ps1 -PayloadZip .\dist\ainput-1.0.2.zip`
 - `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\ainput\scripts\uninstall-ainput.ps1" -InstallDir "$env:LOCALAPPDATA\Programs\ainput"`
+# 2026-03-26
+
+- 启动截图能力开发，补充 `SPEC.md` / `PLAN.md` / `TASKLIST.md` / `DECISIONS.md`
+- 确认截图走 Rust + Windows API 路线，并把桌面自动保存定义为截图结果的可选第二出口
+- 完成 `Win+Alt` 截图热键、冻结框选窗口、图片剪贴板输出、桌面自动保存开关与 PNG 落盘
+- 通过 `cargo check -p ainput-desktop` 与 `cargo build -p ainput-desktop`，并已自动拉起本地测试版 `target/debug/ainput-desktop.exe`
+
+## 2026-03-26 体检与重构规划
+
+- 完成一轮面向当前 worktree 的全库体检
+- 当前状态：
+  - `cargo check` 通过
+  - `cargo test` 通过，但覆盖主要集中在文本处理
+  - `cargo clippy --all-targets --all-features -- -D warnings` 未通过
+  - `cargo fmt --check` 未通过
+- 新确认的高优先级问题：
+  - 句号策略在终端类输入区失效
+  - 自动学习机制不可见、不可迁移、不可确认
+  - 缺少滚动语音历史
+  - 托盘菜单信息结构混乱
+  - 热键不可配置，且主逻辑仍依赖复杂 Win 键状态机
+  - 语音 / 截图链路的系统接口选择未完全收口
+  - 截图剪贴板存在位图句柄所有权风险
+  - 存在伪配置项、根目录发现过宽、空闲高频 tick、版本号分散硬编码
+- 已同步更新：
+  - `SPEC.md`
+  - `PLAN.md`
+  - `TASKLIST.md`
+- 正式启动 Round 9“稳定性与产品化重构”，后续按专项方案推进，而不是继续做零散补丁
+
+## 2026-03-26 Round 9 第一轮重构完成
+
+- 配置正式升级为 `config\ainput.toml`
+- 启动时支持从旧 `ainput.config.json` 自动迁移到新 TOML
+- 语音默认热键恢复为 `Ctrl+Win`
+- 截图默认热键恢复为 `Alt+Win`
+- 语音与截图共用统一热键配置模型
+- 截图热键改为 Windows 原生 `RegisterHotKey`
+- 语音链路保留按住/松开语义，并增加可配置热键字符串解析
+- 终端 / 控制台 / 类 TTY 输入区增加单独标点策略，默认不乱补句号
+- `ainput-output` 改为长期持有术语资产，不再每次输出时重新装载
+- 术语与学习系统改为结构化文件：
+  - `data\terms\base_terms.json`
+  - `data\terms\user_terms.json`
+  - `data\terms\learned_terms.json`
+- 内置 AI 编程词库显著扩充，覆盖常见模型、工具、工程术语
+- 托盘菜单重做为：
+  - `语音`
+  - `截图`
+  - `术语与学习`
+  - `通用`
+- 新增 `logs\voice-history.log`，滚动保留最近 500 条语音结果
+- `last_result.txt` 与语音历史写入改为独立维护线程处理
+- 截图剪贴板所有权 bug 已修复，避免部分成功路径下二次释放位图句柄
+- 运行根发现逻辑改为严格模式，不再静默退回错误 cwd
+- overlay 空闲 tick 从 `7ms` 降到 `33ms`
+- 移除默认后台资源心跳，避免后台维护动作干扰前台主链路
+- 新增单实例接管机制：启动第二个桌面实例时，会先结束旧实例，再由新实例接管
+
+## 2026-03-26 终端与 Win 组合专项收口
+
+- 终端类进程默认识别新增：
+  - `Tabby.exe`
+  - `tabby-agent.exe`
+- 当前终端句号策略明确收口为：
+  - Windows PowerShell / pwsh / Tabby 统一按终端类保守策略处理
+  - 不再试图把这几类终端误当成普通可编辑文本框
+- 热键层把 `Ctrl+Win` 和 `Alt+Win` 从通用逻辑中拆开，改为独立的 Win 组合管理：
+  - `Ctrl+Win` 单独负责按住说话
+  - `Alt+Win` 单独负责截图触发
+  - 组合激活后会吞掉相关 `Win` 组合事件，降低误弹开始菜单的概率
+- 内置词库新增常见工程词：
+  - `OpenClaw`
+  - `gateway`
+  - `session`
+  - `watchdog`
+  - `memory`
+  - `workspace`
+  - `Gmail`
+  - `Calendar`
+  - `VPS`
+  - `Cloudflare`
+  - `ASR`
+  - 以及用户指定的其余基础词
+
+验证：
+
+- `cargo build -p ainput-desktop`
+- `cargo test`
+- `cargo fmt --check`
+
+验证：
+
+- `cargo build -p ainput-desktop`
+- `cargo test`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `target\debug\ainput-desktop.exe bootstrap`
+- `target\debug\ainput-desktop.exe clipboard-selftest-image`
+- `target\debug\ainput-desktop.exe capture-fullscreen-selftest`
+
+## 2026-03-26 1.0.3 打包与中文路径兼容
+
+结果：
+
+- 工作区版本号统一升级到 `1.0.3`
+- 发布脚本、安装脚本、README 打包文案同步切到 `1.0.3`
+- 修复中文安装路径下的 ASR 运行时兼容问题：
+  - `sherpa-onnx` 直接读取中文模型路径不稳定
+  - 现在检测到非 ASCII 模型目录时，会把 `model.onnx` / `tokens.txt` 缓存到 `%LOCALAPPDATA%\\ainput\\asr-cache\\...`
+  - 后续直接从 ASCII 安全缓存目录加载，避免因安装目录含中文而无法启动或无法识别
+- `transcribe-wav` 不再依赖 `sherpa-onnx` 的文件路径读取，改为本地读取 WAV 再喂样本，避免中文路径下的 WAV 打开失败
+- 开机启动注册表命令路径改成更稳妥的 Unicode 字符串引用方式
+
+验证：
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test`
+- `cargo build --release -p ainput-desktop`
+- `powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 -Version 1.0.3`
+- 将 `dist\ainput-1.0.3.zip` 解压到 `C:\Users\sai\AppData\Local\Temp\中文路径-ainput-107`
+- 在中文路径内执行：
+  - `.\ainput-desktop.exe transcribe-wav .\models\sense-voice\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17\test_wavs\en.wav`
+  - 成功生成 `logs\last_result.txt`
+- 在中文路径内直接启动 `ainput-desktop.exe`，进程保持常驻
+
+## 2026-03-26 默认热键改为 Alt+Z / Alt+X
+
+结果：
+
+- 默认语音热键改为 `Alt+Z`
+- 默认截图热键改为 `Alt+X`
+- 默认运行口径不再占用 `Win` 组合作为主热键，系统 `Win` 键恢复原生默认行为
+- 打包说明、配置模板、旧配置迁移默认值、README 与计划文档同步更新
+- 删除原先为 `Ctrl+Win / Alt+Win` 保留的专项兼容层，不再在主链路里保留无效的 `Win` 组合吞键状态机
+
+验证：
+
+- `cargo build -p ainput-desktop`
+- `target\debug\ainput-desktop.exe bootstrap`
+- `powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 -Version 1.0.3`
+
+## 2026-03-26 截图模式增加暗膜反馈
+
+结果：
+
+- 截图窗口进入时会先显示整屏冻结画面，并覆盖一层半透明黑色暗膜
+- 拖选区域会回亮到原始截图亮度，形成“内亮外暗”的视觉反馈
+- 选区边框改为 1px 白色描边，鼠标仍保持十字
+- 取消或完成截图时，遮罩会随截图窗口立即消失
+- 本轮未加入任何淡入淡出动画
+
+实现说明：
+
+- 直接在现有截图全屏窗口里完成绘制，没有新增第二层遮罩窗口
+- 预先生成一份变暗后的截图位图，绘制时先铺满暗图，再把选区原图贴回去
+- 删除旧的焦点框反相重绘方式，改成标准整窗重绘，避免视觉闪烁
+
+验证：
+
+- `cargo fmt`
+- `cargo test -p ainput-desktop --no-run`
+
+补充修正：
+
+- 首版暗膜实现会在进入截图前额外生成一整张变暗位图，导致截图起手延迟明显
+- 现已改为绘制时直接对原始截图叠加黑色透明层，不再预先处理整屏像素
+- 目标是把截图进入速度恢复到接近旧版，同时保留暗膜反馈
+- 后续又进一步改成“进程内复用同一个截图窗口”，不再每次截图都创建/销毁全屏窗口
+- 这一步是为了继续压低任务栏右下角通知区域在截图开关瞬间的 Shell 抖动

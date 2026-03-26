@@ -1,6 +1,7 @@
 {
   "shortcuts": {
-    "push_to_talk": "Ctrl+Win",
+    "push_to_talk": "Alt+Z",
+    "screen_capture": "Alt+X",
     "mouse_middle_hold_enabled": false
   },
   "startup": {
@@ -13,6 +14,9 @@
     "language": "auto",
     "use_itn": true,
     "num_threads": 4
+  },
+  "capture": {
+    "auto_save_to_desktop": false
   },
   "output": {
     "prefer_direct_paste": true,

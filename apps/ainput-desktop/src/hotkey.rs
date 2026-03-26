@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc, OnceLock,
+    Arc, OnceLock, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
@@ -10,22 +10,37 @@ use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_CONTROL,
-    VK_LCONTROL, VK_LWIN, VK_RCONTROL, VK_RWIN,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEINPUT,
+    SendInput, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE,
+    VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8,
+    VK_F9, VK_F10, VK_F11, VK_F12, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT,
+    VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2,
+    VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_PAUSE,
+    VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
     PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use winit::event_loop::EventLoopProxy;
 
+const HOTKEY_CONTROL_MESSAGE: u32 = WM_APP + 7;
+const MOUSE_MIDDLE_HOLD_DELAY_MS: u64 = 200;
+
 #[derive(Clone, Copy)]
 pub enum HotkeyState {
-    Pressed,
-    Released,
+    VoicePressed,
+    VoiceReleased,
+    ScreenshotTriggered,
+}
+
+#[derive(Debug, Clone)]
+pub struct HotkeyBindings {
+    pub voice_input: String,
+    pub screen_capture: String,
 }
 
 pub struct GlobalHotkeyMonitor {
@@ -33,28 +48,60 @@ pub struct GlobalHotkeyMonitor {
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct HotkeyRuntimeConfig {
+    voice: ParsedHotkey,
+    screenshot: ParsedHotkey,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedHotkey {
+    modifiers: HotkeyModifiers,
+    key: Option<VIRTUAL_KEY>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HotkeyModifiers {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    win: bool,
+}
+
 static HOTKEY_PROXY: OnceLock<EventLoopProxy<crate::AppEvent>> = OnceLock::new();
+static HOTKEY_CONFIG: OnceLock<RwLock<HotkeyRuntimeConfig>> = OnceLock::new();
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static ALT_DOWN: AtomicBool = AtomicBool::new(false);
+static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
-static COMBO_DOWN: AtomicBool = AtomicBool::new(false);
-static WIN_PENDING: AtomicBool = AtomicBool::new(false);
-static WIN_PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
-static WIN_SUPPRESS_UNTIL_UP: AtomicBool = AtomicBool::new(false);
-static WIN_TRACKED_VK: AtomicU64 = AtomicU64::new(0);
+static SCREENSHOT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static VOICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_ENABLED: AtomicBool = AtomicBool::new(true);
 static MOUSE_MIDDLE_DOWN: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_TOKEN: AtomicU64 = AtomicU64::new(0);
 
-const MOUSE_MIDDLE_HOLD_DELAY_MS: u64 = 200;
-
 impl GlobalHotkeyMonitor {
     pub fn start(
         proxy: EventLoopProxy<crate::AppEvent>,
         shutdown: Arc<AtomicBool>,
+        bindings: HotkeyBindings,
         mouse_middle_enabled: bool,
     ) -> Result<Self> {
+        let parsed = HotkeyRuntimeConfig {
+            voice: parse_hotkey(&bindings.voice_input).map_err(|error| {
+                anyhow!("invalid voice hotkey {}: {error}", bindings.voice_input)
+            })?,
+            screenshot: parse_hotkey(&bindings.screen_capture).map_err(|error| {
+                anyhow!(
+                    "invalid screenshot hotkey {}: {error}",
+                    bindings.screen_capture
+                )
+            })?,
+        };
+
         let _ = HOTKEY_PROXY.set(proxy);
+        let _ = HOTKEY_CONFIG.set(RwLock::new(parsed.clone()));
         MOUSE_MIDDLE_ENABLED.store(mouse_middle_enabled, Ordering::Relaxed);
         let (thread_id_tx, thread_id_rx) = std::sync::mpsc::channel();
 
@@ -67,47 +114,32 @@ impl GlobalHotkeyMonitor {
                 .map(|module| HINSTANCE(module.0));
             let keyboard_hook =
                 SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), instance, 0)
-                    .map_err(|error| anyhow!("install global keyboard hook failed: {error}"));
+                    .map_err(|error| anyhow!("install keyboard hook failed: {error}"));
             let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), instance, 0)
-                .map_err(|error| anyhow!("install global mouse hook failed: {error}"));
+                .map_err(|error| anyhow!("install mouse hook failed: {error}"));
 
             let (keyboard_hook, mouse_hook) = match (keyboard_hook, mouse_hook) {
                 (Ok(keyboard_hook), Ok(mouse_hook)) => (keyboard_hook, mouse_hook),
-                (Err(error), _) => {
-                    if let Some(proxy) = HOTKEY_PROXY.get() {
-                        let _ = proxy.send_event(crate::AppEvent::Worker(
-                            crate::WorkerEvent::Error(format!("注册全局热键失败：{error}")),
-                        ));
-                    }
-                    return;
-                }
-                (_, Err(error)) => {
-                    if let Some(proxy) = HOTKEY_PROXY.get() {
-                        let _ = proxy.send_event(crate::AppEvent::Worker(
-                            crate::WorkerEvent::Error(format!("注册鼠标热键失败：{error}")),
-                        ));
-                    }
+                (Err(error), _) | (_, Err(error)) => {
+                    send_error(format!("注册全局热键失败：{error}"));
                     return;
                 }
             };
 
             let mut msg = MSG::default();
             while !shutdown.load(Ordering::Relaxed) && GetMessageW(&mut msg, None, 0, 0).into() {
-                let _ = TranslateMessage(&msg);
-                let _ = DispatchMessageW(&msg);
+                match msg.message {
+                    HOTKEY_CONTROL_MESSAGE => {}
+                    _ => {
+                        let _ = TranslateMessage(&msg);
+                        let _ = DispatchMessageW(&msg);
+                    }
+                }
             }
 
             let _ = UnhookWindowsHookEx(keyboard_hook);
             let _ = UnhookWindowsHookEx(mouse_hook);
-            CTRL_DOWN.store(false, Ordering::Relaxed);
-            WIN_DOWN.store(false, Ordering::Relaxed);
-            COMBO_DOWN.store(false, Ordering::Relaxed);
-            WIN_PENDING.store(false, Ordering::Relaxed);
-            WIN_PASSTHROUGH_ACTIVE.store(false, Ordering::Relaxed);
-            WIN_SUPPRESS_UNTIL_UP.store(false, Ordering::Relaxed);
-            WIN_TRACKED_VK.store(0, Ordering::Relaxed);
-            MOUSE_MIDDLE_DOWN.store(false, Ordering::Relaxed);
-            MOUSE_MIDDLE_ACTIVE.store(false, Ordering::Relaxed);
+            reset_hotkey_state();
         });
 
         let thread_id = thread_id_rx
@@ -125,16 +157,28 @@ pub fn set_mouse_middle_enabled(enabled: bool) {
     MOUSE_MIDDLE_ENABLED.store(enabled, Ordering::Relaxed);
     if !enabled {
         if MOUSE_MIDDLE_ACTIVE.swap(false, Ordering::Relaxed) {
-            if let Some(proxy) = HOTKEY_PROXY.get() {
-                let _ = proxy.send_event(crate::AppEvent::Hotkey(HotkeyState::Released));
-            }
+            send_hotkey_state(HotkeyState::VoiceReleased);
         }
         MOUSE_MIDDLE_DOWN.store(false, Ordering::Relaxed);
     }
 }
 
+pub fn reset_hotkey_state() {
+    CTRL_DOWN.store(false, Ordering::Relaxed);
+    ALT_DOWN.store(false, Ordering::Relaxed);
+    SHIFT_DOWN.store(false, Ordering::Relaxed);
+    WIN_DOWN.store(false, Ordering::Relaxed);
+    SCREENSHOT_ACTIVE.store(false, Ordering::Relaxed);
+    VOICE_ACTIVE.store(false, Ordering::Relaxed);
+    MOUSE_MIDDLE_DOWN.store(false, Ordering::Relaxed);
+    MOUSE_MIDDLE_ACTIVE.store(false, Ordering::Relaxed);
+}
+
 impl Drop for GlobalHotkeyMonitor {
     fn drop(&mut self) {
+        let _ = unsafe {
+            PostThreadMessageW(self.thread_id, HOTKEY_CONTROL_MESSAGE, WPARAM(0), LPARAM(0))
+        };
         let _ = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
@@ -148,20 +192,86 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let message = wparam.0 as u32;
         let is_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         let is_up = message == WM_KEYUP || message == WM_SYSKEYUP;
+        let vk = VIRTUAL_KEY(keyboard.vkCode as u16);
 
-        if is_down || is_up {
-            let vk = VIRTUAL_KEY(keyboard.vkCode as u16);
-            if WIN_PENDING.load(Ordering::Relaxed)
-                && is_down
-                && !matches!(
-                    vk,
-                    VK_CONTROL | VK_LCONTROL | VK_RCONTROL | VK_LWIN | VK_RWIN
-                )
-            {
-                flush_pending_win_press();
+        update_modifier_state(vk, is_down, is_up);
+
+        if matches!(vk, VIRTUAL_KEY(0x58) | VK_MENU | VK_LMENU | VK_RMENU) && (is_down || is_up) {
+            tracing::info!(
+                event_vk = vk.0,
+                scan_code = keyboard.scanCode,
+                flags = keyboard.flags.0,
+                message,
+                is_down,
+                is_up,
+                ctrl_down = CTRL_DOWN.load(Ordering::Relaxed),
+                alt_down = ALT_DOWN.load(Ordering::Relaxed),
+                shift_down = SHIFT_DOWN.load(Ordering::Relaxed),
+                win_down = WIN_DOWN.load(Ordering::Relaxed),
+                "observed raw hotkey-related key event"
+            );
+        }
+
+        if let Some(config) = current_config() {
+            if let Some(primary_key) = config.screenshot.key {
+                if vk == primary_key
+                    && is_down
+                    && config.screenshot.modifiers.matches_pressed()
+                    && !SCREENSHOT_ACTIVE.swap(true, Ordering::Relaxed)
+                {
+                    tracing::info!(
+                        screenshot_vk = primary_key.0,
+                        event_vk = vk.0,
+                        ctrl_down = CTRL_DOWN.load(Ordering::Relaxed),
+                        alt_down = ALT_DOWN.load(Ordering::Relaxed),
+                        shift_down = SHIFT_DOWN.load(Ordering::Relaxed),
+                        win_down = WIN_DOWN.load(Ordering::Relaxed),
+                        "screenshot hotkey matched in keyboard hook"
+                    );
+                    send_hotkey_state(HotkeyState::ScreenshotTriggered);
+                    return LRESULT(1);
+                }
+
+                if vk == primary_key && is_up {
+                    tracing::info!(
+                        screenshot_vk = primary_key.0,
+                        event_vk = vk.0,
+                        "screenshot hotkey released in keyboard hook"
+                    );
+                    SCREENSHOT_ACTIVE.store(false, Ordering::Relaxed);
+                    return LRESULT(1);
+                }
             }
-            if update_modifier_state(vk, is_down) {
-                return LRESULT(1);
+
+            if SCREENSHOT_ACTIVE.load(Ordering::Relaxed)
+                && config.screenshot.modifiers.any_released_requirement()
+            {
+                SCREENSHOT_ACTIVE.store(false, Ordering::Relaxed);
+            }
+
+            if let Some(primary_key) = config.voice.key {
+                if vk == primary_key && is_down && config.voice.modifiers.matches_pressed() {
+                    if !VOICE_ACTIVE.swap(true, Ordering::Relaxed) {
+                        send_hotkey_state(HotkeyState::VoicePressed);
+                    }
+                    return LRESULT(1);
+                }
+                if vk == primary_key && is_up && VOICE_ACTIVE.swap(false, Ordering::Relaxed) {
+                    send_hotkey_state(HotkeyState::VoiceReleased);
+                    return LRESULT(1);
+                }
+            } else if is_down
+                && config.voice.modifiers.matches_pressed()
+                && !VOICE_ACTIVE.swap(true, Ordering::Relaxed)
+            {
+                send_hotkey_state(HotkeyState::VoicePressed);
+            }
+
+            if VOICE_ACTIVE.load(Ordering::Relaxed)
+                && config.voice.modifiers.any_released_requirement()
+                && VOICE_ACTIVE.swap(false, Ordering::Relaxed)
+            {
+                send_hotkey_state(HotkeyState::VoiceReleased);
             }
         }
     }
@@ -186,101 +296,167 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     match wparam.0 as u32 {
         WM_MBUTTONDOWN => {
             handle_middle_button_down();
-            return LRESULT(1);
+            LRESULT(1)
         }
         WM_MBUTTONUP => {
             handle_middle_button_up();
-            return LRESULT(1);
+            LRESULT(1)
         }
-        _ => {}
+        _ => unsafe { CallNextHookEx(None, code, wparam, lparam) },
     }
-
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-fn update_modifier_state(vk: VIRTUAL_KEY, is_down: bool) -> bool {
+fn current_config() -> Option<HotkeyRuntimeConfig> {
+    HOTKEY_CONFIG
+        .get()
+        .and_then(|config| config.read().ok())
+        .map(|config| HotkeyRuntimeConfig {
+            voice: config.voice.clone(),
+            screenshot: config.screenshot.clone(),
+        })
+}
+
+fn update_modifier_state(vk: VIRTUAL_KEY, is_down: bool, is_up: bool) {
     match vk {
         VK_CONTROL | VK_LCONTROL | VK_RCONTROL => {
-            let was_ctrl_down = CTRL_DOWN.swap(is_down, Ordering::Relaxed);
-
-            if is_down
-                && !was_ctrl_down
-                && WIN_DOWN.load(Ordering::Relaxed)
-                && WIN_PENDING.swap(false, Ordering::Relaxed)
-            {
-                WIN_PASSTHROUGH_ACTIVE.store(false, Ordering::Relaxed);
-                WIN_SUPPRESS_UNTIL_UP.store(true, Ordering::Relaxed);
-                if !COMBO_DOWN.swap(true, Ordering::Relaxed) {
-                    send_hotkey_state(HotkeyState::Pressed);
-                }
-                return false;
+            if is_down {
+                CTRL_DOWN.store(true, Ordering::Relaxed);
             }
-
-            if !is_down && was_ctrl_down && COMBO_DOWN.swap(false, Ordering::Relaxed) {
-                send_hotkey_state(HotkeyState::Released);
-                WIN_PENDING.store(false, Ordering::Relaxed);
-                if WIN_DOWN.load(Ordering::Relaxed) {
-                    WIN_SUPPRESS_UNTIL_UP.store(true, Ordering::Relaxed);
-                }
+            if is_up {
+                CTRL_DOWN.store(false, Ordering::Relaxed);
             }
-
-            false
+        }
+        VK_MENU | VK_LMENU | VK_RMENU => {
+            if is_down {
+                ALT_DOWN.store(true, Ordering::Relaxed);
+            }
+            if is_up {
+                ALT_DOWN.store(false, Ordering::Relaxed);
+            }
+        }
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => {
+            if is_down {
+                SHIFT_DOWN.store(true, Ordering::Relaxed);
+            }
+            if is_up {
+                SHIFT_DOWN.store(false, Ordering::Relaxed);
+            }
         }
         VK_LWIN | VK_RWIN => {
             if is_down {
                 WIN_DOWN.store(true, Ordering::Relaxed);
-                WIN_TRACKED_VK.store(vk.0 as u64, Ordering::Relaxed);
-
-                if CTRL_DOWN.load(Ordering::Relaxed) {
-                    WIN_PENDING.store(false, Ordering::Relaxed);
-                    WIN_PASSTHROUGH_ACTIVE.store(false, Ordering::Relaxed);
-                    WIN_SUPPRESS_UNTIL_UP.store(true, Ordering::Relaxed);
-                    if !COMBO_DOWN.swap(true, Ordering::Relaxed) {
-                        send_hotkey_state(HotkeyState::Pressed);
-                    }
-                    return true;
-                }
-
-                WIN_PENDING.store(true, Ordering::Relaxed);
-                WIN_PASSTHROUGH_ACTIVE.store(false, Ordering::Relaxed);
-                return true;
             }
-
-            WIN_DOWN.store(false, Ordering::Relaxed);
-
-            if COMBO_DOWN.swap(false, Ordering::Relaxed) {
-                send_hotkey_state(HotkeyState::Released);
-                WIN_PENDING.store(false, Ordering::Relaxed);
-                WIN_PASSTHROUGH_ACTIVE.store(false, Ordering::Relaxed);
-                WIN_SUPPRESS_UNTIL_UP.store(false, Ordering::Relaxed);
-                WIN_TRACKED_VK.store(0, Ordering::Relaxed);
-                return true;
+            if is_up {
+                WIN_DOWN.store(false, Ordering::Relaxed);
             }
-
-            if WIN_SUPPRESS_UNTIL_UP.swap(false, Ordering::Relaxed) {
-                WIN_PENDING.store(false, Ordering::Relaxed);
-                WIN_PASSTHROUGH_ACTIVE.store(false, Ordering::Relaxed);
-                WIN_TRACKED_VK.store(0, Ordering::Relaxed);
-                return true;
-            }
-
-            if WIN_PENDING.swap(false, Ordering::Relaxed) {
-                WIN_PASSTHROUGH_ACTIVE.store(false, Ordering::Relaxed);
-                let tracked = VIRTUAL_KEY(WIN_TRACKED_VK.swap(0, Ordering::Relaxed) as u16);
-                synthesize_win_key_press_and_release(tracked);
-                return true;
-            }
-
-            if WIN_PASSTHROUGH_ACTIVE.swap(false, Ordering::Relaxed) {
-                WIN_TRACKED_VK.store(0, Ordering::Relaxed);
-                return false;
-            }
-
-            WIN_TRACKED_VK.store(0, Ordering::Relaxed);
-            false
         }
-        _ => false,
+        _ => {}
     }
+}
+
+impl HotkeyModifiers {
+    fn any(self) -> bool {
+        self.ctrl || self.alt || self.shift || self.win
+    }
+
+    fn matches_pressed(self) -> bool {
+        (!self.ctrl || CTRL_DOWN.load(Ordering::Relaxed))
+            && (!self.alt || ALT_DOWN.load(Ordering::Relaxed))
+            && (!self.shift || SHIFT_DOWN.load(Ordering::Relaxed))
+            && (!self.win || WIN_DOWN.load(Ordering::Relaxed))
+    }
+
+    fn any_released_requirement(self) -> bool {
+        (self.ctrl && !CTRL_DOWN.load(Ordering::Relaxed))
+            || (self.alt && !ALT_DOWN.load(Ordering::Relaxed))
+            || (self.shift && !SHIFT_DOWN.load(Ordering::Relaxed))
+            || (self.win && !WIN_DOWN.load(Ordering::Relaxed))
+    }
+}
+
+fn parse_hotkey(text: &str) -> Result<ParsedHotkey> {
+    let mut modifiers = HotkeyModifiers::default();
+    let mut key: Option<VIRTUAL_KEY> = None;
+
+    for token in text
+        .split('+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        match token.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers.ctrl = true,
+            "alt" => modifiers.alt = true,
+            "shift" => modifiers.shift = true,
+            "win" | "windows" => modifiers.win = true,
+            other => {
+                if key.is_some() {
+                    return Err(anyhow!("only one primary key is allowed, got {other}"));
+                }
+                key = Some(parse_primary_key(other)?);
+            }
+        }
+    }
+
+    if !modifiers.any() {
+        return Err(anyhow!("at least one modifier is required"));
+    }
+
+    Ok(ParsedHotkey { modifiers, key })
+}
+
+fn parse_primary_key(token: &str) -> Result<VIRTUAL_KEY> {
+    let upper = token.to_ascii_uppercase();
+    let vk = match upper.as_str() {
+        "SPACE" => VK_SPACE,
+        "ENTER" => VK_RETURN,
+        "TAB" => VK_TAB,
+        "ESC" | "ESCAPE" => VK_ESCAPE,
+        "UP" => VK_UP,
+        "DOWN" => VK_DOWN,
+        "LEFT" => VK_LEFT,
+        "RIGHT" => VK_RIGHT,
+        "HOME" => VK_HOME,
+        "END" => VK_END,
+        "PAGEUP" => VK_PRIOR,
+        "PAGEDOWN" => VK_NEXT,
+        "INSERT" => VK_INSERT,
+        "DELETE" => VK_DELETE,
+        "BACKSPACE" => VK_BACK,
+        "PRINTSCREEN" => VK_SNAPSHOT,
+        "PAUSE" => VK_PAUSE,
+        "CAPSLOCK" => VK_CAPITAL,
+        "NUMLOCK" => VK_NUMLOCK,
+        "NUM0" => VK_NUMPAD0,
+        "NUM1" => VK_NUMPAD1,
+        "NUM2" => VK_NUMPAD2,
+        "NUM3" => VK_NUMPAD3,
+        "NUM4" => VK_NUMPAD4,
+        "NUM5" => VK_NUMPAD5,
+        "NUM6" => VK_NUMPAD6,
+        "NUM7" => VK_NUMPAD7,
+        "NUM8" => VK_NUMPAD8,
+        "NUM9" => VK_NUMPAD9,
+        "NUM+" => VK_ADD,
+        "NUM-" => VK_SUBTRACT,
+        "NUM*" => VK_MULTIPLY,
+        "NUM/" => VK_DIVIDE,
+        "NUM." => VK_DECIMAL,
+        "F1" => VK_F1,
+        "F2" => VK_F2,
+        "F3" => VK_F3,
+        "F4" => VK_F4,
+        "F5" => VK_F5,
+        "F6" => VK_F6,
+        "F7" => VK_F7,
+        "F8" => VK_F8,
+        "F9" => VK_F9,
+        "F10" => VK_F10,
+        "F11" => VK_F11,
+        "F12" => VK_F12,
+        _ if upper.len() == 1 => VIRTUAL_KEY(upper.as_bytes()[0] as u16),
+        _ => return Err(anyhow!("unsupported key {token}")),
+    };
+    Ok(vk)
 }
 
 fn handle_middle_button_down() {
@@ -294,19 +470,15 @@ fn handle_middle_button_down() {
         if !MOUSE_MIDDLE_ENABLED.load(Ordering::Relaxed) {
             return;
         }
-
         if !MOUSE_MIDDLE_DOWN.load(Ordering::Relaxed) {
             return;
         }
-
         if MOUSE_MIDDLE_TOKEN.load(Ordering::Relaxed) != token {
             return;
         }
 
         if !MOUSE_MIDDLE_ACTIVE.swap(true, Ordering::Relaxed) {
-            if let Some(proxy) = HOTKEY_PROXY.get() {
-                let _ = proxy.send_event(crate::AppEvent::Hotkey(HotkeyState::Pressed));
-            }
+            send_hotkey_state(HotkeyState::VoicePressed);
         }
     });
 }
@@ -318,9 +490,7 @@ fn handle_middle_button_up() {
     }
 
     if MOUSE_MIDDLE_ACTIVE.swap(false, Ordering::Relaxed) {
-        if let Some(proxy) = HOTKEY_PROXY.get() {
-            let _ = proxy.send_event(crate::AppEvent::Hotkey(HotkeyState::Released));
-        }
+        send_hotkey_state(HotkeyState::VoiceReleased);
         return;
     }
 
@@ -360,39 +530,14 @@ fn synthesize_middle_click() {
     let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 }
 
-fn flush_pending_win_press() {
-    if !WIN_PENDING.swap(false, Ordering::Relaxed) {
-        return;
-    }
-
-    let vk = VIRTUAL_KEY(WIN_TRACKED_VK.load(Ordering::Relaxed) as u16);
-    synthesize_win_key(vk, KEYBD_EVENT_FLAGS(0));
-    WIN_PASSTHROUGH_ACTIVE.store(true, Ordering::Relaxed);
-}
-
-fn synthesize_win_key_press_and_release(vk: VIRTUAL_KEY) {
-    synthesize_win_key(vk, KEYBD_EVENT_FLAGS(0));
-    synthesize_win_key(vk, KEYBD_EVENT_FLAGS(KEYEVENTF_KEYUP.0));
-}
-
-fn synthesize_win_key(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) {
-    let inputs = [INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                wScan: 0,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }];
-    let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-}
-
 fn send_hotkey_state(state: HotkeyState) {
     if let Some(proxy) = HOTKEY_PROXY.get() {
         let _ = proxy.send_event(crate::AppEvent::Hotkey(state));
+    }
+}
+
+fn send_error(message: String) {
+    if let Some(proxy) = HOTKEY_PROXY.get() {
+        let _ = proxy.send_event(crate::AppEvent::Worker(crate::WorkerEvent::Error(message)));
     }
 }

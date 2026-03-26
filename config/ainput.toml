@@ -1,0 +1,100 @@
+# ainput 配置文件
+# 说明：
+# 1. 这是 ainput 的正式配置文件，按 TOML 格式读取。
+# 2. `#` 开头的内容是中文注释，不会影响程序运行。
+# 3. 修改后通常重启 ainput 即可生效。
+
+[hotkeys]
+# 按住说话的主热键。
+# 当前默认：Alt+Z
+voice_input = "Alt+Z"
+
+# 触发截图的主热键。
+# 当前默认：Alt+X
+screen_capture = "Alt+X"
+
+# 是否启用“鼠标中键长按录音”。
+# true = 启用，false = 关闭
+mouse_middle_hold_enabled = false
+
+[voice]
+# 是否启用语音输入主功能。
+enabled = true
+
+# 是否优先尝试“直接粘贴到当前输入框”。
+# true = 先写剪贴板再模拟 Ctrl+V
+# false = 不做直贴，只走剪贴板
+prefer_direct_paste = true
+
+# 当直接粘贴失败时，是否退回到“仅写入剪贴板”。
+fallback_to_clipboard = true
+
+# 句尾 emoji 语音触发说明：
+# 1. 当前为内置固定规则，不通过 TOML 单独开关或自定义。
+# 2. 只有当程序判断“光标位于末尾”时才会触发。
+# 3. 若光标在句中、右侧仍有内容、或上下文未知，则不触发。
+# 4. 当前支持的句尾触发词如下：
+#    - 笑死 -> [破涕为笑]
+#    - 偷笑 -> [偷笑]
+#    - 哭死 -> [流泪]
+#    - 震惊 -> [震惊]
+#    - 点赞 -> [强]
+#    - 抱拳 -> [抱拳]
+#    - 狗头 -> [狗头]
+#    - 捂脸 -> [捂脸]
+
+# 语音历史文件名。
+# 一行一条，滚动保留最近 history_limit 条。
+history_file_name = "voice-history.log"
+
+# 语音历史最多保留多少条。
+history_limit = 500
+
+[capture]
+# 是否启用截图主功能。
+enabled = true
+
+# 截图完成后，是否额外自动保存 PNG 到桌面。
+auto_save_to_desktop = false
+
+[startup]
+# 是否在 Windows 登录后自动启动 ainput。
+launch_at_login = true
+
+[asr]
+# 语音识别模型目录。
+# 默认是项目根目录下的 models/sense-voice
+model_dir = "models/sense-voice"
+
+# 推理后端。
+# 当前一般保持 cpu 即可。
+provider = "cpu"
+
+# 录音采样率。
+# 默认 16000，不建议随便改。
+sample_rate_hz = 16000
+
+# 识别语言。
+# auto = 自动判断
+language = "auto"
+
+# 是否启用 ITN（Inverse Text Normalization）。
+# 一般保持 true。
+use_itn = true
+
+# ASR 推理线程数。
+# 线程越多不一定越快，默认 4。
+num_threads = 4
+
+[learning]
+# 自动学习从“候选”变成“正式生效”所需的最小次数。
+# 例如 2 表示同一纠错出现两次后自动激活。
+auto_activate_threshold = 2
+
+[logging]
+# 日志级别。
+# 常用：info / debug / warn / error
+level = "info"
+
+# 主日志文件名。
+file_name = "ainput.log"

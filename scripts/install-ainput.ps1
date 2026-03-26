@@ -16,8 +16,13 @@ $startMenuFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs
 $tempRoot = Join-Path $env:TEMP ("ainput-install-" + [guid]::NewGuid().ToString("N"))
 $stagingDir = Join-Path $tempRoot "payload"
 $installedExe = Join-Path $InstallDir "ainput-desktop.exe"
-$installedConfig = Join-Path $InstallDir "config\ainput.config.json"
-$backupConfig = Join-Path $tempRoot "ainput.config.json"
+$installedConfig = Join-Path $InstallDir "config\ainput.toml"
+$legacyInstalledConfig = Join-Path $InstallDir "config\ainput.config.json"
+$backupConfig = Join-Path $tempRoot "ainput.toml"
+$installedUserTerms = Join-Path $InstallDir "data\terms\user_terms.json"
+$installedLearnedTerms = Join-Path $InstallDir "data\terms\learned_terms.json"
+$backupUserTerms = Join-Path $tempRoot "user_terms.json"
+$backupLearnedTerms = Join-Path $tempRoot "learned_terms.json"
 $scriptSourceDir = Split-Path -Parent $PSCommandPath
 $installedScriptsDir = Join-Path $InstallDir "scripts"
 $installedUninstallScript = Join-Path $installedScriptsDir "uninstall-ainput.ps1"
@@ -67,7 +72,7 @@ function Set-UninstallMetadata {
 
     New-Item -Path $uninstallRegistryKey -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayName" -Value "ainput" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayVersion" -Value "1.0.2" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayVersion" -Value "1.0.4" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "Publisher" -Value "sai" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "InstallLocation" -Value $InstallDir -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayIcon" -Value $DisplayIconPath -PropertyType String -Force | Out-Null
@@ -86,6 +91,17 @@ try {
     if (Test-Path $installedConfig) {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupConfig) | Out-Null
         Copy-Item $installedConfig $backupConfig -Force
+    } elseif (Test-Path $legacyInstalledConfig) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupConfig) | Out-Null
+        Copy-Item $legacyInstalledConfig $backupConfig -Force
+    }
+
+    if (Test-Path $installedUserTerms) {
+        Copy-Item $installedUserTerms $backupUserTerms -Force
+    }
+
+    if (Test-Path $installedLearnedTerms) {
+        Copy-Item $installedLearnedTerms $backupLearnedTerms -Force
     }
 
     Stop-InstalledProcess -ExecutablePath $installedExe
@@ -101,6 +117,16 @@ try {
 
     if (Test-Path $backupConfig) {
         Copy-Item $backupConfig $installedConfig -Force
+    }
+
+    if (Test-Path $backupUserTerms) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $installedUserTerms) | Out-Null
+        Copy-Item $backupUserTerms $installedUserTerms -Force
+    }
+
+    if (Test-Path $backupLearnedTerms) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $installedLearnedTerms) | Out-Null
+        Copy-Item $backupLearnedTerms $installedLearnedTerms -Force
     }
 
     New-Item -ItemType Directory -Force -Path $installedScriptsDir | Out-Null

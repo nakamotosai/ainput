@@ -8,9 +8,7 @@ const LEADING_FILLERS: &[&str] = &[
     "额额",
     "额",
     "那个那个",
-    "那个",
     "就是就是",
-    "就是",
 ];
 
 const DUPLICATE_PHRASES: &[&str] = &[
@@ -121,7 +119,14 @@ mod tests {
     #[test]
     fn removes_leading_fillers() {
         assert_eq!(normalize_transcription("嗯，帮我看一下"), "帮我看一下");
-        assert_eq!(normalize_transcription("那个就是这个问题"), "这个问题");
+        assert_eq!(normalize_transcription("那个那个这个问题"), "这个问题");
+        assert_eq!(normalize_transcription("就是就是这个问题"), "这个问题");
+    }
+
+    #[test]
+    fn keeps_single_leading_words_that_can_be_semantic() {
+        assert_eq!(normalize_transcription("那个问题要改"), "那个问题要改");
+        assert_eq!(normalize_transcription("就是这个问题"), "就是这个问题");
     }
 
     #[test]

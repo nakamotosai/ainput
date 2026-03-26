@@ -2,6 +2,7 @@
 setlocal
 
 cd /d "%~dp0"
+set "AINPUT_ROOT=%~dp0"
 
 echo [ainput] Stopping old process...
 taskkill /IM ainput-desktop.exe /F >nul 2>nul

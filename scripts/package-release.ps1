@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.2"
+    [string]$Version = "1.0.4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,10 +42,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "assets") | Out
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") | Out-Null
 
 Copy-Item (Join-Path $repoRoot "target\release\ainput-desktop.exe") (Join-Path $packageDir "ainput-desktop.exe") -Force
-Copy-Item (Join-Path $repoRoot "config\ainput.config.json") (Join-Path $packageDir "config\ainput.config.json") -Force
+Copy-Item (Join-Path $repoRoot "config\ainput.toml") (Join-Path $packageDir "config\ainput.toml") -Force
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $packageDir "README.md") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "assets\app-icon.ico") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
+Copy-Item (Join-Path $repoRoot "data\terms\base_terms.json") (Join-Path $packageDir "data\terms\base_terms.json") -Force
 Copy-Item $modelSource $modelTarget -Recurse -Force
 
 Set-Content -Path (Join-Path $packageDir "run-ainput.bat") -Encoding ASCII -Value @(
@@ -62,21 +63,22 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "Start:",
     "1. Double-click run-ainput.bat",
     "2. The app will stay in the system tray",
-    "3. Hold Ctrl+Win to talk; mouse middle hold is off by default and can be enabled in the tray menu",
+    "3. Hold Alt+Z to talk; press Alt+X to capture; mouse middle hold is off by default and can be enabled in the tray menu",
     "",
     "Files:",
     "- ainput-desktop.exe: main app",
     "- run-ainput.bat: launcher",
     "- README.md: full guide",
-    "- config\ainput.config.json: default config",
+    "- config\ainput.toml: default config",
     "- models\: offline speech model",
     "- assets\app-icon.ico: tray icon resource",
+    "- data\terms\base_terms.json: built-in AI terms",
     "- logs\: runtime logs",
     "",
     "Notes:",
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
-    "- data\terms\user_terms.txt will be created on first use",
+    "- data\terms\user_terms.json and learned_terms.json will be created on first use",
     "- Clipboard fallback is used when direct paste fails"
 )
 

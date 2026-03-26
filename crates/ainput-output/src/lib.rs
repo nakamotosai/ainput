@@ -1,25 +1,39 @@
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::time::Instant;
 
+use ainput_data::{LearningStatus, TermCatalog};
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings,
 };
-use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Foundation::{CloseHandle, HWND, MAX_PATH};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationTextPattern2,
     IUIAutomationTextRange, TextPatternRangeEndpoint_End, UIA_TextPattern2Id, UIA_TextPatternId,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::core::PWSTR;
 
-const AUTO_ACTIVATE_THRESHOLD: u32 = 2;
-const AUTO_SECTION_MARKER: &str = "# --- auto learned mappings ---";
+const SENTENCE_FINAL_EMOJI_RULES: &[(&str, &str)] = &[
+    ("笑死", "[破涕为笑]"),
+    ("偷笑", "[偷笑]"),
+    ("哭死", "[流泪]"),
+    ("震惊", "[震惊]"),
+    ("点赞", "[强]"),
+    ("抱拳", "[抱拳]"),
+    ("狗头", "[狗头]"),
+    ("捂脸", "[捂脸]"),
+];
 
 #[derive(Debug, Clone, Copy)]
 pub enum OutputDelivery {
@@ -32,55 +46,171 @@ pub struct LearnOutcome {
     pub spoken: String,
     pub canonical: String,
     pub count: u32,
-    pub activated: bool,
+    pub status: LearningStatus,
+    pub auto_activated: bool,
 }
 
-pub fn deliver_text(
-    text: &str,
-    prefer_direct_paste: bool,
-    root_dir: &Path,
-) -> Result<OutputDelivery> {
-    let started_at = Instant::now();
-    let correction_started_at = Instant::now();
-    let corrected_text = apply_user_term_corrections(text, root_dir);
-    let correction_elapsed_ms = correction_started_at.elapsed().as_millis();
-    let prepare_started_at = Instant::now();
-    let prepared_text = prepare_text_for_delivery(&corrected_text);
-    let prepare_elapsed_ms = prepare_started_at.elapsed().as_millis();
+#[derive(Debug, Clone)]
+pub struct OutputConfig {
+    pub prefer_direct_paste: bool,
+    pub fallback_to_clipboard: bool,
+}
 
-    if prepared_text != text {
-        tracing::info!(original = %text, adjusted = %prepared_text, "adjusted output text before delivery");
+#[derive(Debug, Clone)]
+pub struct OutputContextSnapshot {
+    pub process_name: Option<String>,
+    pub kind: OutputContextKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputContextKind {
+    EditableWithContentOnRight,
+    EditableAtEnd,
+    Unknown,
+}
+
+pub struct OutputController {
+    root_dir: PathBuf,
+    term_catalog: RwLock<TermCatalog>,
+}
+
+impl OutputController {
+    pub fn new(root_dir: &Path) -> Result<Self> {
+        let term_catalog = TermCatalog::load(root_dir)?;
+        Ok(Self {
+            root_dir: root_dir.to_path_buf(),
+            term_catalog: RwLock::new(term_catalog),
+        })
     }
 
-    if prefer_direct_paste {
-        let direct_paste_started_at = Instant::now();
-        match paste_via_clipboard(&prepared_text) {
-            Ok(()) => {
-                tracing::info!(
-                    correction_elapsed_ms,
-                    prepare_elapsed_ms,
-                    direct_paste_elapsed_ms = direct_paste_started_at.elapsed().as_millis(),
-                    deliver_text_elapsed_ms = started_at.elapsed().as_millis(),
-                    "output delivery timing"
-                );
-                return Ok(OutputDelivery::DirectPaste);
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "direct paste failed, fallback to clipboard");
+    pub fn builtin_terms_path(&self) -> Result<PathBuf> {
+        let catalog = self
+            .term_catalog
+            .read()
+            .map_err(|_| anyhow!("term catalog read lock poisoned"))?;
+        Ok(catalog.builtin_terms_path().to_path_buf())
+    }
+
+    pub fn user_terms_path(&self) -> Result<PathBuf> {
+        let catalog = self
+            .term_catalog
+            .read()
+            .map_err(|_| anyhow!("term catalog read lock poisoned"))?;
+        Ok(catalog.user_terms_path().to_path_buf())
+    }
+
+    pub fn learning_state_path(&self) -> Result<PathBuf> {
+        let catalog = self
+            .term_catalog
+            .read()
+            .map_err(|_| anyhow!("term catalog read lock poisoned"))?;
+        Ok(catalog.learning_state_path().to_path_buf())
+    }
+
+    pub fn latest_learning_entries(&self, limit: usize) -> Result<Vec<ainput_data::LearningEntry>> {
+        let catalog = self
+            .term_catalog
+            .read()
+            .map_err(|_| anyhow!("term catalog read lock poisoned"))?;
+        Ok(catalog.latest_learning_entries(limit))
+    }
+
+    pub fn deliver_text(&self, text: &str, config: &OutputConfig) -> Result<OutputDelivery> {
+        let started_at = Instant::now();
+        let correction_started_at = Instant::now();
+        let corrected_text = {
+            let catalog = self
+                .term_catalog
+                .read()
+                .map_err(|_| anyhow!("term catalog read lock poisoned"))?;
+            catalog.apply_to_text(text)
+        };
+        let correction_elapsed_ms = correction_started_at.elapsed().as_millis();
+
+        let prepare_started_at = Instant::now();
+        let (prepared_text, context) = prepare_text_for_delivery(&corrected_text);
+        let prepare_elapsed_ms = prepare_started_at.elapsed().as_millis();
+
+        if prepared_text != text {
+            tracing::info!(
+                original = %text,
+                adjusted = %prepared_text,
+                context = ?context.kind,
+                process_name = context.process_name.as_deref().unwrap_or("unknown"),
+                "adjusted output text before delivery"
+            );
+        }
+
+        if config.prefer_direct_paste {
+            let direct_paste_started_at = Instant::now();
+            match paste_via_clipboard(&prepared_text) {
+                Ok(()) => {
+                    tracing::info!(
+                        correction_elapsed_ms,
+                        prepare_elapsed_ms,
+                        direct_paste_elapsed_ms = direct_paste_started_at.elapsed().as_millis(),
+                        deliver_text_elapsed_ms = started_at.elapsed().as_millis(),
+                        context = ?context.kind,
+                        process_name = context.process_name.as_deref().unwrap_or("unknown"),
+                        "output delivery timing"
+                    );
+                    return Ok(OutputDelivery::DirectPaste);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "direct paste failed");
+                    if !config.fallback_to_clipboard {
+                        return Err(error);
+                    }
+                }
             }
         }
+
+        if !config.fallback_to_clipboard {
+            return Err(anyhow!("clipboard fallback disabled"));
+        }
+
+        let clipboard_started_at = Instant::now();
+        copy_to_clipboard(&prepared_text)?;
+        tracing::info!(
+            correction_elapsed_ms,
+            prepare_elapsed_ms,
+            clipboard_only_elapsed_ms = clipboard_started_at.elapsed().as_millis(),
+            deliver_text_elapsed_ms = started_at.elapsed().as_millis(),
+            context = ?context.kind,
+            process_name = context.process_name.as_deref().unwrap_or("unknown"),
+            "output delivery timing"
+        );
+        Ok(OutputDelivery::ClipboardOnly)
     }
 
-    let clipboard_started_at = Instant::now();
-    copy_to_clipboard(&prepared_text)?;
-    tracing::info!(
-        correction_elapsed_ms,
-        prepare_elapsed_ms,
-        clipboard_only_elapsed_ms = clipboard_started_at.elapsed().as_millis(),
-        deliver_text_elapsed_ms = started_at.elapsed().as_millis(),
-        "output delivery timing"
-    );
-    Ok(OutputDelivery::ClipboardOnly)
+    pub fn learn_from_recent_correction(
+        &self,
+        original_text: &str,
+        corrected_text: &str,
+        auto_activate_threshold: u32,
+    ) -> Result<Option<LearnOutcome>> {
+        let mut catalog = self
+            .term_catalog
+            .write()
+            .map_err(|_| anyhow!("term catalog write lock poisoned"))?;
+        let outcome = catalog.record_recent_correction(
+            original_text,
+            corrected_text,
+            Some(auto_activate_threshold),
+        )?;
+
+        Ok(outcome.map(|outcome| LearnOutcome {
+            spoken: outcome.spoken,
+            canonical: outcome.canonical,
+            count: outcome.count,
+            status: outcome.status,
+            auto_activated: outcome.auto_activated,
+        }))
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
 }
 
 pub fn copy_to_clipboard(text: &str) -> Result<()> {
@@ -89,60 +219,6 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
         .set_text(text.to_string())
         .context("write text into clipboard")?;
     Ok(())
-}
-
-pub fn ensure_user_terms_document(root_dir: &Path) -> Result<PathBuf> {
-    let path = user_terms_path(root_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create user terms directory {}", parent.display()))?;
-    }
-
-    if !path.exists() {
-        let document = if legacy_user_terms_json_path(root_dir).exists() {
-            migrate_legacy_json_terms(&legacy_user_terms_json_path(root_dir))?
-        } else {
-            UserTermsDocument::default()
-        };
-        save_user_terms_document(&path, &document)?;
-    }
-
-    Ok(path)
-}
-
-pub fn learn_from_recent_correction(
-    root_dir: &Path,
-    logs_dir: &Path,
-) -> Result<Option<LearnOutcome>> {
-    let user_terms_path = ensure_user_terms_document(root_dir)?;
-    let original_text = fs::read_to_string(logs_dir.join("last_result.txt"))
-        .context("read last_result.txt for learning")?;
-
-    let corrected_text = {
-        let mut clipboard = Clipboard::new().context("open clipboard")?;
-        clipboard
-            .get_text()
-            .context("read corrected text from clipboard")?
-    };
-
-    let Some((spoken, canonical)) = infer_single_word_correction(&original_text, &corrected_text)
-    else {
-        return Ok(None);
-    };
-
-    let mut document = load_user_terms_document(&user_terms_path)?;
-    let (count, activated) = {
-        let mapping = document.record_mapping(&spoken, &canonical);
-        (mapping.count, mapping.count >= AUTO_ACTIVATE_THRESHOLD)
-    };
-    save_user_terms_document(&user_terms_path, &document)?;
-
-    Ok(Some(LearnOutcome {
-        spoken,
-        canonical,
-        count,
-        activated,
-    }))
 }
 
 fn paste_via_clipboard(text: &str) -> Result<()> {
@@ -163,7 +239,6 @@ fn paste_via_clipboard(text: &str) -> Result<()> {
         clipboard_elapsed_ms,
         controller_elapsed_ms,
         key_send_elapsed_ms,
-        settle_elapsed_ms = 0,
         paste_via_clipboard_elapsed_ms = clipboard_started_at.elapsed().as_millis(),
         "paste timing"
     );
@@ -171,111 +246,70 @@ fn paste_via_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn prepare_text_for_delivery(text: &str) -> String {
+fn prepare_text_for_delivery(text: &str) -> (String, OutputContextSnapshot) {
     if text.is_empty() {
-        return String::new();
+        return (
+            String::new(),
+            OutputContextSnapshot {
+                process_name: None,
+                kind: OutputContextKind::Unknown,
+            },
+        );
     }
 
-    match focused_has_content_on_right() {
-        Ok(Some(true)) => strip_trailing_period(text),
-        Ok(Some(false)) => ensure_trailing_period(text),
-        Ok(None) => text.to_string(),
+    match inspect_output_context() {
+        Ok(snapshot) => (
+            prepare_text_for_delivery_in_context(text, snapshot.kind),
+            snapshot,
+        ),
         Err(error) => {
-            tracing::warn!(error = %error, "failed to inspect caret context, keep original punctuation");
+            tracing::warn!(error = %error, "failed to inspect caret context");
+            (
+                text.to_string(),
+                OutputContextSnapshot {
+                    process_name: None,
+                    kind: OutputContextKind::Unknown,
+                },
+            )
+        }
+    }
+}
+
+fn prepare_text_for_delivery_in_context(text: &str, context: OutputContextKind) -> String {
+    let rewritten = apply_voice_actions(text, context);
+
+    match context {
+        OutputContextKind::EditableWithContentOnRight => strip_trailing_period(&rewritten),
+        OutputContextKind::EditableAtEnd => ensure_trailing_period(&rewritten),
+        OutputContextKind::Unknown => ensure_trailing_period(&rewritten),
+    }
+}
+
+fn apply_voice_actions(text: &str, context: OutputContextKind) -> String {
+    match context {
+        OutputContextKind::EditableAtEnd => replace_sentence_final_emoji_trigger(text),
+        OutputContextKind::EditableWithContentOnRight | OutputContextKind::Unknown => {
             text.to_string()
         }
     }
 }
 
-fn apply_user_term_corrections(text: &str, root_dir: &Path) -> String {
-    let path = match ensure_user_terms_document(root_dir) {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to prepare user terms document");
-            return text.to_string();
-        }
-    };
+fn replace_sentence_final_emoji_trigger(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return text.to_string();
+    }
 
-    let document = match load_user_terms_document(&path) {
-        Ok(document) => document,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to load user terms document");
-            return text.to_string();
-        }
-    };
-
-    correct_ascii_terms(text, &document)
-}
-
-fn correct_ascii_terms(text: &str, document: &UserTermsDocument) -> String {
-    let mut result = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        if is_term_char(chars[index]) {
-            let start = index;
-            while index < chars.len() && is_term_char(chars[index]) {
-                index += 1;
-            }
-
-            let token: String = chars[start..index].iter().collect();
-            let replacement = correct_ascii_token(&token, document).unwrap_or(token);
-            result.push_str(&replacement);
-        } else {
-            result.push(chars[index]);
-            index += 1;
+    let without_terminal_punctuation = trimmed.trim_end_matches(is_terminal_punctuation_char);
+    for (trigger, emoji) in SENTENCE_FINAL_EMOJI_RULES {
+        if without_terminal_punctuation.ends_with(trigger) {
+            let prefix =
+                &without_terminal_punctuation[..without_terminal_punctuation.len() - trigger.len()];
+            return format!("{prefix}{emoji}");
         }
     }
 
-    result
-}
-
-fn correct_ascii_token(token: &str, document: &UserTermsDocument) -> Option<String> {
-    if !token.is_ascii() || token.chars().count() < 4 {
-        return None;
-    }
-
-    let lowered = token.to_ascii_lowercase();
-
-    for mapping in &document.mappings {
-        if mapping.count < AUTO_ACTIVATE_THRESHOLD {
-            continue;
-        }
-
-        if mapping
-            .spoken
-            .iter()
-            .any(|spoken| spoken.eq_ignore_ascii_case(&lowered))
-        {
-            return Some(mapping.canonical.clone());
-        }
-    }
-
-    for canonical in &document.glossary {
-        if canonical.eq_ignore_ascii_case(token) {
-            return Some(canonical.clone());
-        }
-    }
-
-    let mut best: Option<(&str, usize)> = None;
-    for canonical in &document.glossary {
-        if !canonical.is_ascii() || canonical.chars().count() < 4 {
-            continue;
-        }
-
-        let distance = levenshtein(&lowered, &canonical.to_ascii_lowercase());
-        if distance > 2 {
-            continue;
-        }
-
-        match best {
-            Some((_, best_distance)) if distance >= best_distance => {}
-            _ => best = Some((canonical.as_str(), distance)),
-        }
-    }
-
-    best.map(|(canonical, _)| canonical.to_string())
+    text.to_string()
 }
 
 fn strip_trailing_period(text: &str) -> String {
@@ -294,10 +328,72 @@ fn ensure_trailing_period(text: &str) -> String {
 }
 
 fn has_terminal_punctuation(text: &str) -> bool {
-    matches!(
-        text.chars().last(),
-        Some('。' | '！' | '？' | '!' | '?' | '.')
-    )
+    matches!(text.chars().last(), Some(ch) if is_terminal_punctuation_char(ch))
+        || is_emoji_token(text)
+}
+
+fn is_terminal_punctuation_char(ch: char) -> bool {
+    matches!(ch, '。' | '！' | '？' | '!' | '?' | '.')
+}
+
+fn is_emoji_token(text: &str) -> bool {
+    SENTENCE_FINAL_EMOJI_RULES
+        .iter()
+        .any(|(_, emoji)| text.ends_with(emoji))
+}
+
+fn inspect_output_context() -> Result<OutputContextSnapshot> {
+    let process_name = foreground_process_name()?;
+
+    match focused_has_content_on_right() {
+        Ok(Some(true)) => Ok(OutputContextSnapshot {
+            process_name,
+            kind: OutputContextKind::EditableWithContentOnRight,
+        }),
+        Ok(Some(false)) => Ok(OutputContextSnapshot {
+            process_name,
+            kind: OutputContextKind::EditableAtEnd,
+        }),
+        Ok(None) => Ok(OutputContextSnapshot {
+            process_name,
+            kind: OutputContextKind::Unknown,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn foreground_process_name() -> Result<Option<String>> {
+    unsafe {
+        let hwnd: HWND = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return Ok(None);
+        }
+
+        let mut process_id = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        if process_id == 0 {
+            return Ok(None);
+        }
+
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)?;
+        let mut buffer = vec![0u16; MAX_PATH as usize];
+        let mut len = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(process);
+        if result.is_err() {
+            return Ok(None);
+        }
+
+        let full_path = String::from_utf16_lossy(&buffer[..len as usize]);
+        Ok(Path::new(&full_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string()))
+    }
 }
 
 fn focused_has_content_on_right() -> Result<Option<bool>> {
@@ -370,205 +466,6 @@ fn compare_range_end_with_document_end(
     Ok(comparison < 0)
 }
 
-fn infer_single_word_correction(
-    original_text: &str,
-    corrected_text: &str,
-) -> Option<(String, String)> {
-    let original_tokens = extract_ascii_word_tokens(original_text);
-    let corrected_tokens = extract_ascii_word_tokens(corrected_text);
-
-    if original_tokens.len() != corrected_tokens.len() {
-        return None;
-    }
-
-    let mut diff: Option<(String, String)> = None;
-    for (original, corrected) in original_tokens.iter().zip(corrected_tokens.iter()) {
-        if original.eq_ignore_ascii_case(corrected) {
-            continue;
-        }
-
-        if diff.is_some() {
-            return None;
-        }
-
-        diff = Some((original.to_ascii_lowercase(), corrected.clone()));
-    }
-
-    diff.filter(|(spoken, canonical)| spoken != &canonical.to_ascii_lowercase())
-}
-
-fn extract_ascii_word_tokens(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        if is_term_char(chars[index]) {
-            let start = index;
-            while index < chars.len() && is_term_char(chars[index]) {
-                index += 1;
-            }
-
-            let token: String = chars[start..index].iter().collect();
-            if token.is_ascii() && token.chars().count() >= 2 {
-                tokens.push(token);
-            }
-        } else {
-            index += 1;
-        }
-    }
-
-    tokens
-}
-
-fn is_term_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+')
-}
-
-fn user_terms_path(root_dir: &Path) -> PathBuf {
-    root_dir.join("data").join("terms").join("user_terms.txt")
-}
-
-fn load_user_terms_document(path: &Path) -> Result<UserTermsDocument> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read user terms file {}", path.display()))?;
-
-    Ok(parse_text_terms_document(&raw))
-}
-
-fn save_user_terms_document(path: &Path, document: &UserTermsDocument) -> Result<()> {
-    let payload = render_text_terms_document(document);
-    fs::write(path, payload).with_context(|| format!("write user terms file {}", path.display()))
-}
-
-fn levenshtein(left: &str, right: &str) -> usize {
-    let left_chars: Vec<char> = left.chars().collect();
-    let right_chars: Vec<char> = right.chars().collect();
-
-    let mut prev: Vec<usize> = (0..=right_chars.len()).collect();
-    let mut curr = vec![0usize; right_chars.len() + 1];
-
-    for (i, left_char) in left_chars.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, right_char) in right_chars.iter().enumerate() {
-            let substitution_cost = if left_char == right_char { 0 } else { 1 };
-            curr[j + 1] = (prev[j + 1] + 1)
-                .min(curr[j] + 1)
-                .min(prev[j] + substitution_cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    prev[right_chars.len()]
-}
-
-struct UserTermsDocument {
-    glossary: Vec<String>,
-    mappings: Vec<UserTermMapping>,
-}
-
-impl Default for UserTermsDocument {
-    fn default() -> Self {
-        Self {
-            glossary: vec![
-                "skill".to_string(),
-                "emoji".to_string(),
-                "OpenAI".to_string(),
-                "Codex".to_string(),
-            ],
-            mappings: Vec::new(),
-        }
-    }
-}
-
-fn legacy_user_terms_json_path(root_dir: &Path) -> PathBuf {
-    root_dir.join("data").join("terms").join("user_terms.json")
-}
-
-fn migrate_legacy_json_terms(path: &Path) -> Result<UserTermsDocument> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read legacy user terms file {}", path.display()))?;
-    let mut glossary = Vec::new();
-
-    for line in raw.lines() {
-        let trimmed = line.trim().trim_end_matches(',');
-        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-            let entry = trimmed.trim_matches('"');
-            if !entry.is_empty()
-                && entry != "version"
-                && entry != "notes"
-                && entry != "glossary"
-                && entry != "mappings"
-            {
-                glossary.push(entry.to_string());
-            }
-        }
-    }
-
-    glossary.sort_by_key(|entry| entry.to_ascii_lowercase());
-    glossary.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-
-    if glossary.is_empty() {
-        return Ok(UserTermsDocument::default());
-    }
-
-    Ok(UserTermsDocument {
-        glossary,
-        mappings: Vec::new(),
-    })
-}
-
-impl UserTermsDocument {
-    fn record_mapping(&mut self, spoken: &str, canonical: &str) -> &UserTermMapping {
-        if !self
-            .glossary
-            .iter()
-            .any(|entry| entry.eq_ignore_ascii_case(canonical))
-        {
-            self.glossary.push(canonical.to_string());
-            self.glossary
-                .sort_by_key(|entry| entry.to_ascii_lowercase());
-            self.glossary
-                .dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-        }
-
-        if let Some(index) = self
-            .mappings
-            .iter()
-            .position(|entry| entry.canonical.eq_ignore_ascii_case(canonical))
-        {
-            let mapping = &mut self.mappings[index];
-            if !mapping
-                .spoken
-                .iter()
-                .any(|entry| entry.eq_ignore_ascii_case(spoken))
-            {
-                mapping.spoken.push(spoken.to_ascii_lowercase());
-            }
-            mapping.count += 1;
-            mapping.spoken.sort();
-            mapping.spoken.dedup();
-            return mapping;
-        }
-
-        self.mappings.push(UserTermMapping {
-            spoken: vec![spoken.to_ascii_lowercase()],
-            canonical: canonical.to_string(),
-            count: 1,
-        });
-        self.mappings
-            .last()
-            .expect("newly pushed mapping should exist")
-    }
-}
-
-#[derive(Debug, Clone)]
-struct UserTermMapping {
-    spoken: Vec<String>,
-    canonical: String,
-    count: u32,
-}
-
 struct ComApartment {
     should_uninitialize: bool,
 }
@@ -583,7 +480,7 @@ impl ComApartment {
             });
         }
 
-        if hr == RPC_E_CHANGED_MODE {
+        if hr == windows::Win32::Foundation::RPC_E_CHANGED_MODE {
             return Ok(Self {
                 should_uninitialize: false,
             });
@@ -601,105 +498,11 @@ impl Drop for ComApartment {
     }
 }
 
-fn parse_text_terms_document(raw: &str) -> UserTermsDocument {
-    let mut glossary = Vec::new();
-    let mut mappings = Vec::new();
-    let mut in_auto_section = false;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed == AUTO_SECTION_MARKER {
-            in_auto_section = true;
-            continue;
-        }
-
-        if trimmed.starts_with('#') {
-            continue;
-        }
-
-        if in_auto_section {
-            if let Some(mapping) = parse_mapping_line(trimmed) {
-                mappings.push(mapping);
-            }
-        } else {
-            glossary.push(trimmed.to_string());
-        }
-    }
-
-    glossary.sort_by_key(|entry| entry.to_ascii_lowercase());
-    glossary.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-
-    UserTermsDocument { glossary, mappings }
-}
-
-fn parse_mapping_line(line: &str) -> Option<UserTermMapping> {
-    let (left, rest) = line.split_once("=>")?;
-    let spoken = left.trim().to_ascii_lowercase();
-    let (canonical, count) = if let Some((canonical, suffix)) = rest.split_once("|") {
-        let canonical = canonical.trim().to_string();
-        let count = suffix
-            .trim()
-            .strip_prefix("count=")
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(1);
-        (canonical, count)
-    } else {
-        (rest.trim().to_string(), 1)
-    };
-
-    if spoken.is_empty() || canonical.is_empty() {
-        return None;
-    }
-
-    Some(UserTermMapping {
-        spoken: vec![spoken],
-        canonical,
-        count,
-    })
-}
-
-fn render_text_terms_document(document: &UserTermsDocument) -> String {
-    let mut lines = vec![
-        "# ainput 用户术语词表".to_string(),
-        "# 下面直接一行写一个正确词；不要写 JSON，不要加引号".to_string(),
-        "# 例如：skill  emoji  OpenAI  Codex".to_string(),
-        String::new(),
-    ];
-
-    for entry in &document.glossary {
-        lines.push(entry.clone());
-    }
-
-    lines.push(String::new());
-    lines.push(AUTO_SECTION_MARKER.to_string());
-    lines.push("# 以下由程序自动维护；你不用手改".to_string());
-
-    if document.mappings.is_empty() {
-        lines.push("# 例子：scale => skill | count=2".to_string());
-    } else {
-        for mapping in &document.mappings {
-            for spoken in &mapping.spoken {
-                lines.push(format!(
-                    "{} => {} | count={}",
-                    spoken, mapping.canonical, mapping.count
-                ));
-            }
-        }
-    }
-
-    lines.push(String::new());
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_ACTIVATE_THRESHOLD, UserTermMapping, UserTermsDocument, correct_ascii_terms,
-        ensure_trailing_period, has_terminal_punctuation, infer_single_word_correction,
+        OutputContextKind, apply_voice_actions, ensure_trailing_period, has_terminal_punctuation,
+        prepare_text_for_delivery_in_context, replace_sentence_final_emoji_trigger,
         strip_trailing_period,
     };
 
@@ -725,38 +528,89 @@ mod tests {
     }
 
     #[test]
-    fn infers_single_ascii_word_correction() {
-        let result = infer_single_word_correction("please add scale here", "please add skill here");
-        assert_eq!(result, Some(("scale".to_string(), "skill".to_string())));
-    }
-
-    #[test]
-    fn learned_mapping_activates_after_two_corrections() {
-        let document = UserTermsDocument {
-            glossary: vec!["skill".to_string()],
-            mappings: vec![UserTermMapping {
-                spoken: vec!["scale".to_string()],
-                canonical: "skill".to_string(),
-                count: AUTO_ACTIVATE_THRESHOLD,
-            }],
-        };
-
+    fn replaces_sentence_final_emoji_trigger_with_matching_token() {
         assert_eq!(
-            correct_ascii_terms("add scale now", &document),
-            "add skill now".to_string()
+            replace_sentence_final_emoji_trigger("这个功能太离谱了笑死"),
+            "这个功能太离谱了[破涕为笑]"
+        );
+        assert_eq!(
+            replace_sentence_final_emoji_trigger("别这样偷笑。"),
+            "别这样[偷笑]"
+        );
+        assert_eq!(
+            replace_sentence_final_emoji_trigger("我直接震惊！"),
+            "我直接[震惊]"
+        );
+        assert_eq!(
+            replace_sentence_final_emoji_trigger("先这样抱拳。"),
+            "先这样[抱拳]"
+        );
+        assert_eq!(
+            replace_sentence_final_emoji_trigger("这个功能太离谱了笑死。"),
+            "这个功能太离谱了[破涕为笑]"
         );
     }
 
     #[test]
-    fn glossary_supports_small_fuzzy_corrections() {
-        let document = UserTermsDocument {
-            glossary: vec!["emoji".to_string()],
-            mappings: Vec::new(),
-        };
-
+    fn keeps_mid_sentence_emoji_trigger_unchanged() {
         assert_eq!(
-            correct_ascii_terms("send imoji please", &document),
-            "send emoji please".to_string()
+            replace_sentence_final_emoji_trigger("我都快笑死了但是还没说完"),
+            "我都快笑死了但是还没说完"
+        );
+        assert_eq!(
+            replace_sentence_final_emoji_trigger("我给你点个赞然后继续说"),
+            "我给你点个赞然后继续说"
+        );
+    }
+
+    #[test]
+    fn only_applies_voice_actions_at_editable_end() {
+        assert_eq!(
+            apply_voice_actions("这个功能太离谱了笑死", OutputContextKind::EditableAtEnd),
+            "这个功能太离谱了[破涕为笑]"
+        );
+        assert_eq!(
+            apply_voice_actions(
+                "这个功能太离谱了笑死",
+                OutputContextKind::EditableWithContentOnRight
+            ),
+            "这个功能太离谱了笑死"
+        );
+        assert_eq!(
+            apply_voice_actions("这个功能太离谱了狗头", OutputContextKind::EditableAtEnd),
+            "这个功能太离谱了[狗头]"
+        );
+    }
+
+    #[test]
+    fn does_not_append_period_after_emoji_token() {
+        assert_eq!(
+            ensure_trailing_period("这个功能太离谱了[破涕为笑]"),
+            "这个功能太离谱了[破涕为笑]"
+        );
+        assert_eq!(ensure_trailing_period("收到[抱拳]"), "收到[抱拳]");
+        assert_eq!(ensure_trailing_period("懂了[狗头]"), "懂了[狗头]");
+    }
+
+    #[test]
+    fn prepares_text_with_emoji_rule_before_period_logic() {
+        assert_eq!(
+            prepare_text_for_delivery_in_context(
+                "这个功能太离谱了笑死",
+                OutputContextKind::EditableAtEnd
+            ),
+            "这个功能太离谱了[破涕为笑]"
+        );
+        assert_eq!(
+            prepare_text_for_delivery_in_context(
+                "这个功能太离谱了笑死",
+                OutputContextKind::Unknown
+            ),
+            "这个功能太离谱了笑死。"
+        );
+        assert_eq!(
+            prepare_text_for_delivery_in_context("普通一句话", OutputContextKind::Unknown),
+            "普通一句话。"
         );
     }
 }
