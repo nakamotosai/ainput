@@ -7,6 +7,7 @@ mod overlay;
 mod screenshot;
 mod worker;
 
+use ainput_automation::{AutomationActivity, AutomationService};
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use maintenance::{MaintenanceHandle, SharedRuntimeState};
@@ -23,7 +24,7 @@ use std::thread;
 use std::time::Duration;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -204,6 +205,7 @@ pub(crate) enum AppEvent {
     Worker(WorkerEvent),
     Hotkey(hotkey::HotkeyState),
     Capture(screenshot::CaptureEvent),
+    AutomationUpdated,
     OverlayTick,
     Tray(TrayIconEvent),
     Menu(MenuEvent),
@@ -214,6 +216,7 @@ enum AppMode {
     Idle,
     Voice,
     Capture,
+    Automation,
 }
 
 struct DesktopApp {
@@ -224,6 +227,7 @@ struct DesktopApp {
     overlay_tick_started: bool,
     worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     hotkey_monitor: Option<hotkey::GlobalHotkeyMonitor>,
+    automation_service: Option<AutomationService>,
     tray_icon: Option<TrayIcon>,
     overlay: Option<overlay::RecordingOverlay>,
     overlay_available: bool,
@@ -234,6 +238,11 @@ struct DesktopApp {
     mouse_middle_item: Option<CheckMenuItem>,
     launch_at_login_item: Option<CheckMenuItem>,
     capture_save_item: Option<CheckMenuItem>,
+    automation_status_item: Option<MenuItem>,
+    automation_slot_items: Vec<CheckMenuItem>,
+    automation_repeat_items: Vec<CheckMenuItem>,
+    automation_edit_names_item: Option<MenuItem>,
+    automation_open_dir_item: Option<MenuItem>,
 }
 
 impl DesktopApp {
@@ -246,6 +255,7 @@ impl DesktopApp {
             overlay_tick_started: false,
             worker_tx: None,
             hotkey_monitor: None,
+            automation_service: None,
             tray_icon: None,
             overlay: None,
             overlay_available: true,
@@ -256,6 +266,11 @@ impl DesktopApp {
             mouse_middle_item: None,
             launch_at_login_item: None,
             capture_save_item: None,
+            automation_status_item: None,
+            automation_slot_items: Vec::new(),
+            automation_repeat_items: Vec::new(),
+            automation_edit_names_item: None,
+            automation_open_dir_item: None,
         }
     }
 
@@ -322,6 +337,21 @@ impl DesktopApp {
             return Ok(());
         }
 
+        if self.automation_service.is_none() {
+            let proxy = self.proxy.clone();
+            self.automation_service = Some(AutomationService::start(
+                automation_storage_dir(&self.runtime),
+                move || {
+                    let _ = proxy.send_event(AppEvent::AutomationUpdated);
+                },
+            )?);
+        }
+        let automation_snapshot = self
+            .automation_service
+            .as_ref()
+            .expect("automation service initialized")
+            .snapshot();
+
         let tray_menu = Menu::new();
         let status_item = MenuItem::with_id("status", "状态：待机中", false, None);
 
@@ -365,6 +395,73 @@ impl DesktopApp {
             true,
             &[&capture_hotkey_hint, &capture_save_item],
         )?;
+
+        let automation_status_item = MenuItem::with_id(
+            "automation_status",
+            automation_snapshot.status_line.clone(),
+            false,
+            None,
+        );
+        let automation_hotkey_hint = MenuItem::with_id(
+            "automation_hotkey_hint",
+            format!(
+                "热键：{} 录制 / {} 保存 / {} 回放 / {} 中止",
+                ainput_automation::RECORD_HOTKEY,
+                ainput_automation::STOP_HOTKEY,
+                ainput_automation::PLAY_HOTKEY,
+                ainput_automation::CANCEL_HOTKEY
+            ),
+            false,
+            None,
+        );
+        let automation_slot_items: Vec<CheckMenuItem> = automation_snapshot
+            .slots
+            .iter()
+            .map(|slot| {
+                CheckMenuItem::with_id(
+                    format!("automation_slot_{}", slot.slot),
+                    format_automation_slot_label(slot),
+                    true,
+                    slot.slot == automation_snapshot.active_slot,
+                    None,
+                )
+            })
+            .collect();
+        let automation_repeat_items: Vec<CheckMenuItem> = (1..=5)
+            .map(|repeat_count| {
+                CheckMenuItem::with_id(
+                    format!("automation_repeat_{repeat_count}"),
+                    format_automation_repeat_label(repeat_count),
+                    true,
+                    repeat_count == automation_snapshot.repeat_count,
+                    None,
+                )
+            })
+            .collect();
+        let automation_edit_names_item =
+            MenuItem::with_id("automation_edit_names", "编辑槽位名称", true, None);
+        let automation_open_dir_item =
+            MenuItem::with_id("automation_open_dir", "打开录制目录", true, None);
+        let automation_sep_1 = PredefinedMenuItem::separator();
+        let automation_sep_2 = PredefinedMenuItem::separator();
+        let automation_sep_3 = PredefinedMenuItem::separator();
+        let mut automation_items: Vec<&dyn IsMenuItem> = vec![
+            &automation_status_item,
+            &automation_hotkey_hint,
+            &automation_sep_1,
+        ];
+        for item in &automation_slot_items {
+            automation_items.push(item);
+        }
+        automation_items.push(&automation_sep_2);
+        for item in &automation_repeat_items {
+            automation_items.push(item);
+        }
+        automation_items.push(&automation_sep_3);
+        automation_items.push(&automation_edit_names_item);
+        automation_items.push(&automation_open_dir_item);
+        let automation_menu =
+            Submenu::with_id_and_items("automation_menu", "按键精灵", true, &automation_items)?;
 
         let learn_terms_item =
             MenuItem::with_id("learn_terms", "从当前剪贴板学习最近一次修正", true, None);
@@ -414,6 +511,7 @@ impl DesktopApp {
         let _ = tray_menu.append(&separator);
         let _ = tray_menu.append(&voice_menu);
         let _ = tray_menu.append(&capture_menu);
+        let _ = tray_menu.append(&automation_menu);
         let _ = tray_menu.append(&learning_menu);
         let _ = tray_menu.append(&general_menu);
         let _ = tray_menu.append(&exit_item);
@@ -440,9 +538,70 @@ impl DesktopApp {
         self.mouse_middle_item = Some(mouse_middle_item);
         self.launch_at_login_item = Some(launch_at_login_item);
         self.capture_save_item = Some(capture_save_item);
+        self.automation_status_item = Some(automation_status_item);
+        self.automation_slot_items = automation_slot_items;
+        self.automation_repeat_items = automation_repeat_items;
+        self.automation_edit_names_item = Some(automation_edit_names_item);
+        self.automation_open_dir_item = Some(automation_open_dir_item);
         self.tray_icon = Some(tray_icon);
         self.overlay = overlay;
+        self.sync_automation_menu();
         Ok(())
+    }
+
+    fn sync_automation_menu(&self) {
+        let Some(service) = &self.automation_service else {
+            return;
+        };
+        let snapshot = service.snapshot();
+
+        if let Some(item) = &self.automation_status_item {
+            item.set_text(&snapshot.status_line);
+        }
+
+        for (index, item) in self.automation_slot_items.iter().enumerate() {
+            if let Some(slot) = snapshot.slots.get(index) {
+                item.set_text(&format_automation_slot_label(slot));
+                item.set_checked(slot.slot == snapshot.active_slot);
+            }
+        }
+
+        for (index, item) in self.automation_repeat_items.iter().enumerate() {
+            let repeat_count = index + 1;
+            item.set_checked(repeat_count == snapshot.repeat_count);
+        }
+    }
+
+    fn handle_automation_update(&mut self) {
+        let Some(service) = &self.automation_service else {
+            return;
+        };
+        let snapshot = service.snapshot();
+        self.sync_automation_menu();
+
+        match snapshot.activity {
+            AutomationActivity::Recording => {
+                self.mode = AppMode::Automation;
+                self.set_tray_status("状态：按键精灵录制中");
+            }
+            AutomationActivity::Playing => {
+                self.mode = AppMode::Automation;
+                self.set_tray_status("状态：按键精灵回放中");
+            }
+            AutomationActivity::Error => {
+                self.mode = AppMode::Idle;
+                self.set_tray_status(&format!(
+                    "状态：按键精灵错误 - {}",
+                    shorten(&snapshot.status_line, 14)
+                ));
+            }
+            AutomationActivity::Idle => {
+                if self.mode == AppMode::Automation {
+                    self.mode = AppMode::Idle;
+                    self.set_tray_status("状态：待机中");
+                }
+            }
+        }
     }
 }
 
@@ -593,6 +752,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.set_tray_status(&format!("状态：错误 - {}", shorten(&message, 18)));
                 }
             },
+            AppEvent::AutomationUpdated => self.handle_automation_update(),
             AppEvent::OverlayTick => {
                 if let Some(overlay) = &mut self.overlay {
                     overlay.tick();
@@ -610,6 +770,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.hotkey_monitor = None;
+        self.automation_service = None;
         if let Some(overlay) = &mut self.overlay {
             overlay.hide();
         }
@@ -620,6 +781,10 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
 
 impl DesktopApp {
     fn handle_menu_event(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
+        if self.handle_automation_menu_event(&event) {
+            return;
+        }
+
         if self
             .exit_item
             .as_ref()
@@ -781,6 +946,70 @@ impl DesktopApp {
                 )),
             }
         }
+    }
+
+    fn handle_automation_menu_event(&mut self, event: &MenuEvent) -> bool {
+        let Some(service) = &self.automation_service else {
+            return false;
+        };
+
+        if self
+            .automation_edit_names_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            self.set_tray_status_from_result(
+                service.open_slot_names_file(),
+                "状态：已打开按键精灵槽位名称",
+            );
+            return true;
+        }
+
+        if self
+            .automation_open_dir_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            self.set_tray_status_from_result(
+                service.open_slots_dir(),
+                "状态：已打开按键精灵录制目录",
+            );
+            return true;
+        }
+
+        if let Some(index) = self
+            .automation_slot_items
+            .iter()
+            .position(|item| event.id == *item.id())
+        {
+            match service.select_slot(index + 1) {
+                Ok(()) => self.sync_automation_menu(),
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：按键精灵切槽失败 - {}",
+                    shorten(&error.to_string(), 14)
+                )),
+            }
+            return true;
+        }
+
+        if let Some(index) = self
+            .automation_repeat_items
+            .iter()
+            .position(|item| event.id == *item.id())
+        {
+            match service.select_repeat_count(index + 1) {
+                Ok(()) => self.sync_automation_menu(),
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：按键精灵轮数失败 - {}",
+                    shorten(&error.to_string(), 14)
+                )),
+            }
+            return true;
+        }
+
+        false
     }
 
     fn set_tray_status_from_result(&self, result: Result<()>, ok_status: &str) {
@@ -960,4 +1189,28 @@ fn hidden_status(command: &mut Command) -> Result<std::process::ExitStatus> {
         .creation_flags(CREATE_NO_WINDOW)
         .status()
         .map_err(Into::into)
+}
+
+fn automation_storage_dir(runtime: &AppRuntime) -> PathBuf {
+    runtime
+        .runtime_paths
+        .root_dir
+        .join("data")
+        .join("automation")
+}
+
+fn format_automation_slot_label(slot: &ainput_automation::SlotSnapshot) -> String {
+    format!(
+        "{}{}",
+        slot.label,
+        if slot.has_recording {
+            " [已录制]"
+        } else {
+            " [空]"
+        }
+    )
+}
+
+fn format_automation_repeat_label(repeat_count: usize) -> String {
+    format!("回放轮数 {repeat_count}")
 }

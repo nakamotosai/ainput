@@ -66,6 +66,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ainput-automation"
+version = "1.0.4"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "ainput-data"
 version = "1.0.4"
 dependencies = [
@@ -80,6 +91,7 @@ version = "1.0.4"
 dependencies = [
  "ainput-asr",
  "ainput-audio",
+ "ainput-automation",
  "ainput-data",
  "ainput-output",
  "ainput-rewrite",

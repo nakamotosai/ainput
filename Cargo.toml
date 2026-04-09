@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/ainput-desktop",
+    "crates/ainput-automation",
     "crates/ainput-shell",
     "crates/ainput-audio",
     "crates/ainput-asr",
