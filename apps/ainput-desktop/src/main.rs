@@ -405,7 +405,8 @@ impl DesktopApp {
         let automation_hotkey_hint = MenuItem::with_id(
             "automation_hotkey_hint",
             format!(
-                "热键：{} 录制 / {} 保存 / {} 回放 / {} 中止",
+                "热键：{} 暂停继续 / {} 录制 / {} 保存 / {} 回放 / {} 停止",
+                ainput_automation::PAUSE_HOTKEY,
                 ainput_automation::RECORD_HOTKEY,
                 ainput_automation::STOP_HOTKEY,
                 ainput_automation::PLAY_HOTKEY,
@@ -587,6 +588,10 @@ impl DesktopApp {
             AutomationActivity::Playing => {
                 self.mode = AppMode::Automation;
                 self.set_tray_status("状态：按键精灵回放中");
+            }
+            AutomationActivity::Paused => {
+                self.mode = AppMode::Automation;
+                self.set_tray_status("状态：按键精灵已暂停");
             }
             AutomationActivity::Error => {
                 self.mode = AppMode::Idle;

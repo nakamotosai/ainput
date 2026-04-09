@@ -17,7 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
     MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEINPUT, SendInput, VK_ESCAPE, VK_F8, VK_F9, VK_F10,
+    MOUSEINPUT, SendInput, VK_ESCAPE, VK_F7, VK_F8, VK_F9, VK_F10,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -30,15 +30,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const PLAYBACK_WAIT_SLICE: Duration = Duration::from_millis(10);
 const SLOT_COUNT: usize = 10;
 const REPEAT_COUNT_MAX: usize = 5;
-const CONTROL_VKEYS: [u32; 4] = [
+const CONTROL_VKEYS: [u32; 5] = [
+    VK_F7.0 as u32,
     VK_F8.0 as u32,
     VK_F9.0 as u32,
     VK_F10.0 as u32,
     VK_ESCAPE.0 as u32,
 ];
 
+pub const PAUSE_HOTKEY: &str = "F7";
 pub const RECORD_HOTKEY: &str = "F8";
 pub const STOP_HOTKEY: &str = "F9";
 pub const PLAY_HOTKEY: &str = "F10";
@@ -51,6 +54,7 @@ pub enum AutomationActivity {
     Idle,
     Recording,
     Playing,
+    Paused,
     Error,
 }
 
@@ -134,6 +138,7 @@ struct AppState {
     activity: Mutex<AutomationActivity>,
     recording: AtomicBool,
     playing: AtomicBool,
+    paused_playback: AtomicBool,
     stop_playback: AtomicBool,
     shutdown_requested: AtomicBool,
     active_slot: AtomicUsize,
@@ -151,6 +156,7 @@ impl AppState {
             activity: Mutex::new(AutomationActivity::Idle),
             recording: AtomicBool::new(false),
             playing: AtomicBool::new(false),
+            paused_playback: AtomicBool::new(false),
             stop_playback: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             active_slot: AtomicUsize::new(1),
@@ -201,10 +207,54 @@ impl AppState {
         Ok(())
     }
 
+    fn stop_recording_or_playback(&self) {
+        if self.recording.load(Ordering::SeqCst) {
+            if let Err(error) = self.stop_recording() {
+                self.set_status(AutomationActivity::Error, format!("按键精灵：{error}"));
+            }
+            return;
+        }
+
+        self.stop_playback();
+    }
+
     fn stop_playback(&self) {
         if self.playing.load(Ordering::SeqCst) {
+            self.paused_playback.store(false, Ordering::SeqCst);
             self.stop_playback.store(true, Ordering::SeqCst);
             self.set_status(AutomationActivity::Idle, "按键精灵：已请求中止回放");
+        }
+    }
+
+    fn toggle_pause_playback(&self) {
+        if !self.playing.load(Ordering::SeqCst) {
+            return;
+        }
+
+        if self.paused_playback.swap(false, Ordering::SeqCst) {
+            self.set_status(
+                AutomationActivity::Playing,
+                format!("按键精灵：继续回放 {}", self.slot_label(self.active_slot())),
+            );
+        } else {
+            self.paused_playback.store(true, Ordering::SeqCst);
+            self.set_status(
+                AutomationActivity::Paused,
+                format!("按键精灵：已暂停 {}", self.slot_label(self.active_slot())),
+            );
+        }
+    }
+
+    fn pause_playback_on_user_input(&self, trigger: &str) {
+        if !self.playing.load(Ordering::SeqCst) {
+            return;
+        }
+
+        if !self.paused_playback.swap(true, Ordering::SeqCst) {
+            self.set_status(
+                AutomationActivity::Paused,
+                format!("按键精灵：检测到{trigger}手动输入，已自动暂停"),
+            );
         }
     }
 
@@ -460,6 +510,7 @@ impl Drop for AutomationService {
 }
 
 fn spawn_hotkey_loop(state: Arc<AppState>) {
+    let mut last_f7 = false;
     let mut last_f8 = false;
     let mut last_f9 = false;
     let mut last_f10 = false;
@@ -470,11 +521,15 @@ fn spawn_hotkey_loop(state: Arc<AppState>) {
             break;
         }
 
+        let f7 = is_virtual_key_down(VK_F7.0 as i32);
         let f8 = is_virtual_key_down(VK_F8.0 as i32);
         let f9 = is_virtual_key_down(VK_F9.0 as i32);
         let f10 = is_virtual_key_down(VK_F10.0 as i32);
         let esc = is_virtual_key_down(VK_ESCAPE.0 as i32);
 
+        if f7 && !last_f7 {
+            state.toggle_pause_playback();
+        }
         if f8 && !last_f8 {
             state.start_recording();
         }
@@ -489,9 +544,10 @@ fn spawn_hotkey_loop(state: Arc<AppState>) {
             }
         }
         if esc && !last_esc {
-            state.stop_playback();
+            state.stop_recording_or_playback();
         }
 
+        last_f7 = f7;
         last_f8 = f8;
         last_f9 = f9;
         last_f10 = f10;
@@ -523,6 +579,7 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
     }
 
     state.stop_playback.store(false, Ordering::SeqCst);
+    state.paused_playback.store(false, Ordering::SeqCst);
     state.set_status(
         AutomationActivity::Playing,
         format!(
@@ -539,6 +596,8 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
             }
 
             let started = Instant::now();
+            let mut paused_started_at: Option<Instant> = None;
+            let mut paused_total = Duration::ZERO;
             for event in &events {
                 if state.stop_playback.load(Ordering::SeqCst) {
                     break;
@@ -546,9 +605,34 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
 
                 let offset = event.offset_ms();
                 let target = Duration::from_millis(offset);
-                let elapsed = started.elapsed();
-                if target > elapsed {
-                    thread::sleep(target - elapsed);
+                loop {
+                    if state.stop_playback.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    if state.paused_playback.load(Ordering::SeqCst) {
+                        if paused_started_at.is_none() {
+                            paused_started_at = Some(Instant::now());
+                        }
+                        thread::sleep(HOTKEY_POLL_INTERVAL);
+                        continue;
+                    }
+
+                    if let Some(paused_started) = paused_started_at.take() {
+                        paused_total += paused_started.elapsed();
+                    }
+
+                    let elapsed = started.elapsed().saturating_sub(paused_total);
+                    if elapsed >= target {
+                        break;
+                    }
+
+                    let wait = target - elapsed;
+                    thread::sleep(wait.min(PLAYBACK_WAIT_SLICE));
+                }
+
+                if state.stop_playback.load(Ordering::SeqCst) {
+                    break;
                 }
 
                 if let Err(error) = unsafe { playback_event(event) } {
@@ -563,6 +647,7 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
             }
         }
 
+        state.paused_playback.store(false, Ordering::SeqCst);
         state.stop_playback.store(false, Ordering::SeqCst);
         state.playing.store(false, Ordering::SeqCst);
         state.set_status(AutomationActivity::Idle, "按键精灵：回放结束");
@@ -698,6 +783,14 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let pressed = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         let released = matches!(message, WM_KEYUP | WM_SYSKEYUP);
 
+        if state.playing.load(Ordering::SeqCst)
+            && !injected
+            && !CONTROL_VKEYS.contains(&info.vkCode)
+            && (pressed || released)
+        {
+            state.pause_playback_on_user_input("键盘");
+        }
+
         if state.recording.load(Ordering::SeqCst)
             && !state.playing.load(Ordering::SeqCst)
             && !injected
@@ -726,6 +819,16 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         let info = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
         let message = wparam.0 as u32;
         let injected = info.flags & 0x01 != 0;
+
+        if state.playing.load(Ordering::SeqCst) && !injected {
+            match message {
+                WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP
+                | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                    state.pause_playback_on_user_input("鼠标");
+                }
+                _ => {}
+            }
+        }
 
         if state.recording.load(Ordering::SeqCst)
             && !state.playing.load(Ordering::SeqCst)
@@ -807,7 +910,7 @@ fn to_wide(value: &str) -> Vec<u16> {
 
 fn default_status_line() -> String {
     format!(
-        "按键精灵：待机（{} 录制 / {} 保存 / {} 回放 / {} 中止）",
-        RECORD_HOTKEY, STOP_HOTKEY, PLAY_HOTKEY, CANCEL_HOTKEY
+        "按键精灵：待机（{} 暂停 / {} 录制 / {} 保存 / {} 回放 / {} 停止）",
+        PAUSE_HOTKEY, RECORD_HOTKEY, STOP_HOTKEY, PLAY_HOTKEY, CANCEL_HOTKEY
     )
 }
