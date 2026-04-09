@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.4"
+    [string]$Version = "1.0.5"
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,7 +63,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "Start:",
     "1. Double-click run-ainput.bat",
     "2. The app will stay in the system tray",
-    "3. Hold Alt+Z to talk; press Alt+X to capture; mouse middle hold is off by default and can be enabled in the tray menu",
+    "3. Hold Alt+Z to talk; press Alt+X to capture; press F8/F9/F10 for automation, F7 to pause or resume, Esc to stop the current automation flow",
     "",
     "Files:",
     "- ainput-desktop.exe: main app",
@@ -79,7 +79,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
-    "- Clipboard fallback is used when direct paste fails"
+    "- Clipboard fallback is used when direct paste fails",
+    "- During automation playback, any manual keyboard or mouse input will auto-pause playback"
 )
 
 Set-Content -Path (Join-Path $packageDir "logs\README.txt") -Encoding UTF8 -Value @(

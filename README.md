@@ -2,6 +2,8 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 按键精灵”工具。
 
+当前正式版本：`1.0.5`
+
 它不做系统级 IME，也不依赖在线模型。当前重点是把三条前台主链路做稳：
 
 1. 按住语音热键开始录音，松开后离线识别并把文本送进当前输入区
@@ -118,7 +120,7 @@ run-latest.bat
 推荐直接使用安装包：
 
 ```text
-dist\ainput-setup-1.0.4.exe
+dist\ainput-setup-1.0.5.exe
 ```
 
 安装后：
@@ -345,9 +347,9 @@ cargo build --release -p ainput-desktop
 
 当前发布目录结构使用：
 
-- `dist\ainput-setup-1.0.4.exe`
-- `dist\ainput-1.0.4\`
-- `dist\ainput-1.0.4.zip`
+- `dist\ainput-setup-1.0.5.exe`
+- `dist\ainput-1.0.5\`
+- `dist\ainput-1.0.5.zip`
 
 ## 项目结构
 

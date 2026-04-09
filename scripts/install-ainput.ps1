@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$appVersion = "1.0.5"
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\ainput"
@@ -72,7 +73,7 @@ function Set-UninstallMetadata {
 
     New-Item -Path $uninstallRegistryKey -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayName" -Value "ainput" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayVersion" -Value "1.0.4" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayVersion" -Value $appVersion -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "Publisher" -Value "sai" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "InstallLocation" -Value $InstallDir -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $uninstallRegistryKey -Name "DisplayIcon" -Value $DisplayIconPath -PropertyType String -Force | Out-Null

@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-asr"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "hound",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-audio"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "cpal",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-automation"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-data"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-desktop"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "ainput-asr",
  "ainput-audio",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-output"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "ainput-data",
  "anyhow",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-rewrite"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "ainput-shell"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "serde",
