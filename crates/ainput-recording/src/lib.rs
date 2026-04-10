@@ -30,11 +30,8 @@ pub const WATERMARK_POSITION_PRESETS: [WatermarkPosition; 6] = [
     WatermarkPosition::MovingFlash,
     WatermarkPosition::RandomWalk,
 ];
-pub const QUALITY_PRESETS: [VideoQuality; 3] = [
-    VideoQuality::Low,
-    VideoQuality::Medium,
-    VideoQuality::High,
-];
+pub const QUALITY_PRESETS: [VideoQuality; 3] =
+    [VideoQuality::Low, VideoQuality::Medium, VideoQuality::High];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -285,6 +282,34 @@ impl RecordingService {
         });
         Ok(())
     }
+
+    pub fn cancel_recording(&self) -> Result<()> {
+        let session = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("录屏状态锁失败"))?;
+            if state.snapshot.activity == RecordingActivity::Selecting {
+                return Err(anyhow!("当前正在框选，请直接按 Esc 或右键取消"));
+            }
+            let Some(session) = state.active.take() else {
+                return Err(anyhow!("当前没有正在录制的视频"));
+            };
+            state.snapshot = RecordingSnapshot {
+                activity: RecordingActivity::Idle,
+                status_line: "录屏：已取消当前录制".to_string(),
+                output_path: None,
+            };
+            session
+        };
+        (self.inner.notify)();
+
+        thread::spawn(move || {
+            session.abort();
+        });
+        Ok(())
+    }
 }
 
 impl Drop for RecordingService {
@@ -321,14 +346,11 @@ fn begin_recording_impl(inner: Arc<ServiceInner>, runtime_config: RecordingConfi
     let output_path = session.output_path.clone();
 
     {
-        let mut state = inner
-            .state
-            .lock()
-            .map_err(|_| anyhow!("录屏状态锁失败"))?;
+        let mut state = inner.state.lock().map_err(|_| anyhow!("录屏状态锁失败"))?;
         state.snapshot = RecordingSnapshot {
             activity: RecordingActivity::Recording,
             status_line: format!(
-                "录屏：录制中 {}x{}，按 {} 停止",
+                "录屏：录制中 {}x{}，按 {} 停止，按 Esc 取消",
                 region.width, region.height, STOP_HOTKEY
             ),
             output_path: Some(output_path.clone()),
@@ -359,7 +381,11 @@ fn stop_recording_impl(inner: Arc<ServiceInner>, session: RecordingSession) -> R
 }
 
 impl RecordingSession {
-    fn start(ffmpeg_path: &Path, region: CaptureRegion, runtime_config: RecordingConfig) -> Result<Self> {
+    fn start(
+        ffmpeg_path: &Path,
+        region: CaptureRegion,
+        runtime_config: RecordingConfig,
+    ) -> Result<Self> {
         let output_path = default_output_path()?;
         let temp_dir = std::env::temp_dir().join(format!("ainput-record-{}", timestamp_millis()));
         fs::create_dir_all(&temp_dir)
@@ -439,7 +465,9 @@ impl RecordingSession {
                 return Err(anyhow!("系统音频文件未生成"));
             }
             let audio_summary = probe_media(&self.ffmpeg_path, &audio_path)?;
-            let audio_file_size = fs::metadata(&audio_path).map(|meta| meta.len()).unwrap_or(0);
+            let audio_file_size = fs::metadata(&audio_path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
             if audio_summary.audio_streams > 0 && audio_file_size > 128 {
                 audio_path_for_output = Some(audio_path);
             }
@@ -551,11 +579,9 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 
 fn default_output_path() -> Result<PathBuf> {
     let desktop = desktop_dir()?;
-    fs::create_dir_all(&desktop).with_context(|| format!("创建桌面目录失败: {}", desktop.display()))?;
-    Ok(desktop.join(format!(
-        "ainput-record-{}.mp4",
-        timestamp_millis()
-    )))
+    fs::create_dir_all(&desktop)
+        .with_context(|| format!("创建桌面目录失败: {}", desktop.display()))?;
+    Ok(desktop.join(format!("ainput-record-{}.mp4", timestamp_millis())))
 }
 
 fn desktop_dir() -> Result<PathBuf> {

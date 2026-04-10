@@ -8,7 +8,7 @@ mod screenshot;
 mod worker;
 
 use ainput_automation::{AutomationActivity, AutomationService, AutomationSnapshot};
-use ainput_recording::{RecordingActivity, RecordingService};
+use ainput_recording::{RecordingActivity, RecordingService, RecordingSnapshot};
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use maintenance::{MaintenanceHandle, SharedRuntimeState};
@@ -816,36 +816,26 @@ impl DesktopApp {
         )
     }
 
+    fn recording_cancel_enabled(snapshot: &RecordingSnapshot) -> bool {
+        snapshot.activity == RecordingActivity::Recording
+    }
+
     fn automation_tray_frame(snapshot: &AutomationSnapshot) -> u8 {
-        ((snapshot.elapsed_ms / 280) % 2) as u8
+        ((snapshot.elapsed_ms / 180) % 4) as u8
     }
 
     fn refresh_automation_overlay(&mut self, snapshot: &AutomationSnapshot) {
         let Some(overlay) = &mut self.overlay else {
             return;
         };
-
-        match snapshot.activity {
-            AutomationActivity::Recording => {
-                overlay.set_pulse_enabled(true);
-                overlay.set_level(0.0);
-                overlay.show();
-            }
-            AutomationActivity::Playing => {
-                overlay.set_pulse_enabled(false);
-                overlay.set_level(snapshot.progress_ratio.unwrap_or(0.0));
-                overlay.show();
-            }
-            AutomationActivity::Paused => {
-                overlay.set_pulse_enabled(false);
-                overlay.set_level(snapshot.progress_ratio.unwrap_or(0.0));
-                overlay.show();
-            }
-            AutomationActivity::Idle | AutomationActivity::Error => {
-                overlay.set_level(0.0);
-                overlay.hide();
-            }
-        }
+        // Automation uses its own HUD/click feedback instead of the bottom bar.
+        overlay.hide();
+        overlay.update_automation_feedback(
+            snapshot.activity,
+            snapshot.overlay_hint.as_ref(),
+            snapshot.last_click.as_ref(),
+            &snapshot.status_line,
+        );
     }
 
     fn handle_automation_update(&mut self) {
@@ -899,6 +889,7 @@ impl DesktopApp {
             return;
         };
         let snapshot = service.snapshot();
+        hotkey::set_recording_cancel_enabled(Self::recording_cancel_enabled(&snapshot));
         self.sync_recording_menu();
 
         match snapshot.activity {
@@ -1102,6 +1093,19 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                         }
                     }
                 }
+                hotkey::HotkeyState::RecordingCancelTriggered => {
+                    if let Some(service) = &self.recording_service {
+                        let snapshot = service.snapshot();
+                        if snapshot.activity == RecordingActivity::Recording
+                            && let Err(error) = service.cancel_recording()
+                        {
+                            self.set_tray_status(&format!(
+                                "状态：录屏取消失败 - {}",
+                                shorten(&error.to_string(), 16)
+                            ));
+                        }
+                    }
+                }
                 hotkey::HotkeyState::AutomationPauseTriggered => {
                     if self.automation_hotkeys_allowed()
                         && let Some(service) = &self.automation_service
@@ -1215,6 +1219,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.hotkey_monitor = None;
+        hotkey::set_recording_cancel_enabled(false);
         hotkey::set_automation_cancel_enabled(false);
         self.automation_service = None;
         self.recording_service = None;
@@ -1741,7 +1746,12 @@ fn fallback_app_icon() -> Icon {
 fn animated_status_icon(state: TrayVisualState, frame: u8) -> Icon {
     let size = 32u32;
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    let pulse = if frame % 2 == 0 { 0.78 } else { 1.0 };
+    let pulse = match frame % 4 {
+        0 => 0.64,
+        1 => 0.82,
+        2 => 1.0,
+        _ => 0.84,
+    };
 
     let (outer_r, outer_g, outer_b, inner_r, inner_g, inner_b) = match state {
         TrayVisualState::Idle => (14, 52, 146, 22, 93, 255),
@@ -1758,6 +1768,14 @@ fn animated_status_icon(state: TrayVisualState, frame: u8) -> Icon {
             let dx = x as f32 - 15.5;
             let dy = y as f32 - 15.5;
             let distance = (dx * dx + dy * dy).sqrt();
+            let halo = matches!(
+                state,
+                TrayVisualState::AutomationRecording
+                    | TrayVisualState::AutomationPlaying
+                    | TrayVisualState::AutomationPaused
+            ) && distance >= 12.8
+                && distance <= 15.3
+                && ((frame as i32 + x as i32 / 4 + y as i32 / 5) % 4 == 0);
 
             let (r, g, b, a) = if distance < 13.5 {
                 (
@@ -1767,7 +1785,11 @@ fn animated_status_icon(state: TrayVisualState, frame: u8) -> Icon {
                     255,
                 )
             } else if distance < 15.5 {
-                (outer_r, outer_g, outer_b, 255)
+                if halo {
+                    (255, 255, 255, 255)
+                } else {
+                    (outer_r, outer_g, outer_b, 255)
+                }
             } else {
                 (0, 0, 0, 0)
             };
@@ -1775,19 +1797,34 @@ fn animated_status_icon(state: TrayVisualState, frame: u8) -> Icon {
             let mut pixel = [r, g, b, a];
             match state {
                 TrayVisualState::AutomationPlaying => {
-                    if x >= 13 && x <= 21 && y >= 10 && y <= 22 && x - 12 >= (y - 10) / 2 {
+                    let shift = (frame % 4) as i32 - 1;
+                    if x as i32 >= 12 + shift
+                        && x as i32 <= 21 + shift
+                        && y >= 9
+                        && y <= 22
+                        && x as i32 - (11 + shift) >= (y as i32 - 9) / 2
+                    {
                         pixel = [255, 255, 255, 255];
                     }
                 }
                 TrayVisualState::AutomationPaused => {
-                    if ((x >= 11 && x <= 13) || (x >= 18 && x <= 20)) && y >= 10 && y <= 22 {
+                    let blink_on = frame % 4 != 1;
+                    if blink_on
+                        && (((x >= 10 && x <= 13) || (x >= 18 && x <= 21)) && y >= 9 && y <= 22)
+                    {
                         pixel = [255, 255, 255, 255];
                     }
                 }
                 TrayVisualState::AutomationRecording | TrayVisualState::ScreenRecording => {
                     let badge_dx = x as f32 - 16.0;
                     let badge_dy = y as f32 - 16.0;
-                    if (badge_dx * badge_dx + badge_dy * badge_dy).sqrt() < 5.0 {
+                    let badge_radius = match frame % 4 {
+                        0 => 4.0,
+                        1 => 5.0,
+                        2 => 6.0,
+                        _ => 5.0,
+                    };
+                    if (badge_dx * badge_dx + badge_dy * badge_dy).sqrt() < badge_radius {
                         pixel = [255, 255, 255, 255];
                     }
                 }
@@ -1897,11 +1934,124 @@ fn hidden_status(command: &mut Command) -> Result<std::process::ExitStatus> {
 }
 
 fn automation_storage_dir(runtime: &AppRuntime) -> PathBuf {
-    runtime
+    let legacy_dir = runtime
         .runtime_paths
         .root_dir
         .join("data")
-        .join("automation")
+        .join("automation");
+
+    let persistent_dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|base| base.join("ainput").join("data").join("automation"))
+        .unwrap_or_else(|| legacy_dir.clone());
+
+    if let Err(error) = migrate_automation_storage_if_needed(
+        &runtime.runtime_paths.root_dir,
+        &legacy_dir,
+        &persistent_dir,
+    ) {
+        tracing::warn!(error = %error, target = %persistent_dir.display(), "failed to prepare persistent automation storage");
+    }
+
+    persistent_dir
+}
+
+fn migrate_automation_storage_if_needed(
+    root_dir: &std::path::Path,
+    legacy_dir: &std::path::Path,
+    persistent_dir: &std::path::Path,
+) -> Result<()> {
+    if persistent_dir == legacy_dir {
+        fs::create_dir_all(persistent_dir)?;
+        return Ok(());
+    }
+
+    fs::create_dir_all(persistent_dir)?;
+    if automation_dir_has_any_data(persistent_dir) {
+        return Ok(());
+    }
+
+    if automation_dir_has_any_data(legacy_dir) {
+        copy_dir_contents(legacy_dir, persistent_dir)?;
+        return Ok(());
+    }
+
+    if let Some(previous_dir) = latest_sibling_automation_dir(root_dir) {
+        copy_dir_contents(&previous_dir, persistent_dir)?;
+    }
+
+    Ok(())
+}
+
+fn latest_sibling_automation_dir(root_dir: &std::path::Path) -> Option<PathBuf> {
+    let parent = root_dir.parent()?;
+    let current_name = root_dir.file_name()?.to_string_lossy().to_string();
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+
+    for entry in fs::read_dir(parent).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if file_name == current_name || !file_name.starts_with("ainput-") {
+            continue;
+        }
+
+        let automation_dir = path.join("data").join("automation");
+        if !automation_dir_has_any_data(&automation_dir) {
+            continue;
+        }
+
+        let modified = fs::metadata(&automation_dir)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((modified, automation_dir));
+    }
+
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.into_iter().map(|(_, path)| path).next()
+}
+
+fn automation_dir_has_any_data(path: &std::path::Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+
+    let slot_names_path = path.join("slot-names.json");
+    if slot_names_path.exists() {
+        return true;
+    }
+
+    let slots_dir = path.join("slots");
+    match fs::read_dir(&slots_dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    }
+}
+
+fn copy_dir_contents(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let target_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            copy_dir_contents(&entry_path, &target_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&entry_path, &target_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn format_automation_slot_label(slot: &ainput_automation::SlotSnapshot) -> String {
@@ -1942,5 +2092,110 @@ fn prompt_for_recording_watermark_text(current: &str) -> Result<Option<String>> 
         Ok(None)
     } else {
         Ok(Some(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automation_cancel_enabled_only_during_active_automation_states() {
+        for activity in [
+            AutomationActivity::Recording,
+            AutomationActivity::Playing,
+            AutomationActivity::Paused,
+        ] {
+            assert!(DesktopApp::automation_cancel_enabled(&AutomationSnapshot {
+                activity,
+                status_line: String::new(),
+                active_slot: 1,
+                repeat_count: 1,
+                slots: Vec::new(),
+                overlay_hint: None,
+                last_click: None,
+                elapsed_ms: 0,
+            }));
+        }
+
+        for activity in [AutomationActivity::Idle, AutomationActivity::Error] {
+            assert!(!DesktopApp::automation_cancel_enabled(
+                &AutomationSnapshot {
+                    activity,
+                    status_line: String::new(),
+                    active_slot: 1,
+                    repeat_count: 1,
+                    slots: Vec::new(),
+                    overlay_hint: None,
+                    last_click: None,
+                    elapsed_ms: 0,
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn recording_cancel_enabled_only_while_recording_is_live() {
+        assert!(DesktopApp::recording_cancel_enabled(&RecordingSnapshot {
+            activity: RecordingActivity::Recording,
+            status_line: String::new(),
+            output_path: None,
+        }));
+
+        for activity in [
+            RecordingActivity::Idle,
+            RecordingActivity::Selecting,
+            RecordingActivity::Stopping,
+            RecordingActivity::Error,
+        ] {
+            assert!(!DesktopApp::recording_cancel_enabled(&RecordingSnapshot {
+                activity,
+                status_line: String::new(),
+                output_path: None,
+            }));
+        }
+    }
+
+    #[test]
+    fn automation_tray_frame_advances_every_180ms_and_wraps() {
+        assert_eq!(
+            DesktopApp::automation_tray_frame(&AutomationSnapshot {
+                activity: AutomationActivity::Playing,
+                status_line: String::new(),
+                active_slot: 1,
+                repeat_count: 1,
+                slots: Vec::new(),
+                overlay_hint: None,
+                last_click: None,
+                elapsed_ms: 0,
+            }),
+            0
+        );
+        assert_eq!(
+            DesktopApp::automation_tray_frame(&AutomationSnapshot {
+                activity: AutomationActivity::Playing,
+                status_line: String::new(),
+                active_slot: 1,
+                repeat_count: 1,
+                slots: Vec::new(),
+                overlay_hint: None,
+                last_click: None,
+                elapsed_ms: 180,
+            }),
+            1
+        );
+        assert_eq!(
+            DesktopApp::automation_tray_frame(&AutomationSnapshot {
+                activity: AutomationActivity::Playing,
+                status_line: String::new(),
+                active_slot: 1,
+                repeat_count: 1,
+                slots: Vec::new(),
+                overlay_hint: None,
+                last_click: None,
+                elapsed_ms: 720,
+            }),
+            0
+        );
     }
 }

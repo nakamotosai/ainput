@@ -1,18 +1,21 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use ainput_automation::{AutomationActivity, AutomationClickSnapshot, AutomationOverlayHint};
 use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, CreateSolidBrush, DeleteObject, HBRUSH};
+use windows::Win32::Graphics::Gdi::{
+    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, HBRUSH, SetWindowRgn,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics,
     HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW, SET_WINDOW_POS_FLAGS,
     SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, WINDOW_STYLE,
-    WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
+    WINDOW_STYLE, WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
-use windows::core::w;
+use windows::core::{HSTRING, w};
 
 const TRACK_WIDTH_PX: i32 = 136;
 const TRACK_HEIGHT_PX: i32 = 24;
@@ -25,23 +28,65 @@ const FILL_ALPHA_MAX: u8 = 245;
 const TRACK_COLOR: COLORREF = COLORREF(0x00404040);
 const FILL_COLOR: COLORREF = COLORREF(0x00F4F4F4);
 
+const HUD_WIDTH_PX: i32 = 340;
+const HUD_HEIGHT_PX: i32 = 54;
+const HUD_RADIUS_PX: i32 = 18;
+const HUD_MARGIN_LEFT_PX: i32 = 18;
+const HUD_MARGIN_BOTTOM_PX: i32 = 24;
+const HUD_ALPHA_MAX: u8 = 212;
+const HUD_DISPLAY_MIN: Duration = Duration::from_millis(1000);
+const HUD_BG_COLOR: COLORREF = COLORREF(0x00F3F3F3);
+
+const CLICK_OUTER_SIZE_PX: i32 = 58;
+const CLICK_INNER_SIZE_PX: i32 = 18;
+const CLICK_ALPHA_MAX: u8 = 208;
+const CLICK_LIFETIME: Duration = Duration::from_millis(420);
+const CLICK_OUTER_COLOR: COLORREF = COLORREF(0x001A8CFF);
+const CLICK_INNER_COLOR: COLORREF = COLORREF(0x00FFFFFF);
+
 pub struct RecordingOverlay {
     base_x: i32,
     base_y: i32,
-    track_window: OverlayWindow,
-    fill_window: OverlayWindow,
-    shown: bool,
-    visible_target: bool,
-    pulse_enabled: bool,
-    current_visibility: f32,
-    level_target: f32,
-    current_level: f32,
+    track_window: ShapeWindow,
+    fill_window: ShapeWindow,
+    voice_shown: bool,
+    voice_visible_target: bool,
+    voice_pulse_enabled: bool,
+    voice_progress_mode: bool,
+    voice_visibility: f32,
+    voice_level_target: f32,
+    voice_level_current: f32,
+
+    hud_window: HudWindow,
+    hud_message: String,
+    hud_persistent: bool,
+    hud_hold_until: Option<Instant>,
+    hud_visibility: f32,
+    hud_shown: bool,
+
+    click_outer_window: ShapeWindow,
+    click_inner_window: ShapeWindow,
+    active_click: Option<ActiveClick>,
+    last_click_serial: u64,
+
     started_at: Instant,
 }
 
-struct OverlayWindow {
+struct ShapeWindow {
     hwnd: HWND,
     brush: HBRUSH,
+}
+
+struct HudWindow {
+    hwnd: HWND,
+    text_hwnd: HWND,
+    brush: HBRUSH,
+}
+
+struct ActiveClick {
+    x: i32,
+    y: i32,
+    started_at: Instant,
 }
 
 impl RecordingOverlay {
@@ -49,30 +94,59 @@ impl RecordingOverlay {
         unsafe {
             let instance = GetModuleHandleW(None)
                 .map_err(|error| anyhow!("resolve module handle: {error}"))?;
+            let instance = HINSTANCE(instance.0);
+
             let track_brush = CreateSolidBrush(TRACK_COLOR);
-            if track_brush.is_invalid() {
-                return Err(anyhow!("create track overlay brush failed"));
-            }
             let fill_brush = CreateSolidBrush(FILL_COLOR);
-            if fill_brush.is_invalid() {
-                let _ = DeleteObject(track_brush.into());
-                return Err(anyhow!("create fill overlay brush failed"));
+            let hud_brush = CreateSolidBrush(HUD_BG_COLOR);
+            let click_outer_brush = CreateSolidBrush(CLICK_OUTER_COLOR);
+            let click_inner_brush = CreateSolidBrush(CLICK_INNER_COLOR);
+
+            if track_brush.is_invalid()
+                || fill_brush.is_invalid()
+                || hud_brush.is_invalid()
+                || click_outer_brush.is_invalid()
+                || click_inner_brush.is_invalid()
+            {
+                for brush in [
+                    track_brush,
+                    fill_brush,
+                    hud_brush,
+                    click_outer_brush,
+                    click_inner_brush,
+                ] {
+                    if !brush.is_invalid() {
+                        let _ = DeleteObject(brush.into());
+                    }
+                }
+                return Err(anyhow!("create overlay brush failed"));
             }
 
             register_overlay_class(
-                HINSTANCE(instance.0),
+                instance,
                 w!("ainput_recording_overlay_track_surface"),
                 track_brush,
             )?;
             register_overlay_class(
-                HINSTANCE(instance.0),
+                instance,
                 w!("ainput_recording_overlay_fill_surface"),
                 fill_brush,
             )?;
+            register_overlay_class(instance, w!("ainput_automation_hud_surface"), hud_brush)?;
+            register_overlay_class(
+                instance,
+                w!("ainput_automation_click_outer_surface"),
+                click_outer_brush,
+            )?;
+            register_overlay_class(
+                instance,
+                w!("ainput_automation_click_inner_surface"),
+                click_inner_brush,
+            )?;
 
             let (base_x, base_y) = work_area_bottom_center_origin();
-            let track_window = create_overlay_window(
-                HINSTANCE(instance.0),
+            let track_window = create_shape_window(
+                instance,
                 w!("ainput_recording_overlay_track_surface"),
                 track_brush,
                 base_x,
@@ -81,17 +155,42 @@ impl RecordingOverlay {
                 TRACK_HEIGHT_PX,
                 TRACK_RADIUS_PX,
             )?;
-
-            let fill_height = TRACK_HEIGHT_PX - TRACK_PADDING_PX * 2;
-            let fill_window = create_overlay_window(
-                HINSTANCE(instance.0),
+            let fill_window = create_shape_window(
+                instance,
                 w!("ainput_recording_overlay_fill_surface"),
                 fill_brush,
                 base_x + TRACK_PADDING_PX,
                 base_y + TRACK_PADDING_PX + SLIDE_DISTANCE_PX,
-                fill_min_width(),
-                fill_height,
+                fill_min_width(false),
+                TRACK_HEIGHT_PX - TRACK_PADDING_PX * 2,
                 0,
+            )?;
+
+            let hud_window = create_hud_window(
+                instance,
+                hud_brush,
+                HUD_MARGIN_LEFT_PX,
+                work_area_bottom().saturating_sub(HUD_HEIGHT_PX + HUD_MARGIN_BOTTOM_PX),
+            )?;
+            let click_outer_window = create_shape_window(
+                instance,
+                w!("ainput_automation_click_outer_surface"),
+                click_outer_brush,
+                0,
+                0,
+                CLICK_OUTER_SIZE_PX,
+                CLICK_OUTER_SIZE_PX,
+                CLICK_OUTER_SIZE_PX,
+            )?;
+            let click_inner_window = create_shape_window(
+                instance,
+                w!("ainput_automation_click_inner_surface"),
+                click_inner_brush,
+                0,
+                0,
+                CLICK_INNER_SIZE_PX,
+                CLICK_INNER_SIZE_PX,
+                CLICK_INNER_SIZE_PX,
             )?;
 
             Ok(Self {
@@ -99,63 +198,139 @@ impl RecordingOverlay {
                 base_y,
                 track_window,
                 fill_window,
-                shown: false,
-                visible_target: false,
-                pulse_enabled: true,
-                current_visibility: 0.0,
-                level_target: 0.0,
-                current_level: 0.0,
+                voice_shown: false,
+                voice_visible_target: false,
+                voice_pulse_enabled: true,
+                voice_progress_mode: false,
+                voice_visibility: 0.0,
+                voice_level_target: 0.0,
+                voice_level_current: 0.0,
+                hud_window,
+                hud_message: String::new(),
+                hud_persistent: false,
+                hud_hold_until: None,
+                hud_visibility: 0.0,
+                hud_shown: false,
+                click_outer_window,
+                click_inner_window,
+                active_click: None,
+                last_click_serial: 0,
                 started_at: Instant::now(),
             })
         }
     }
 
     pub fn show(&mut self) {
-        self.visible_target = true;
-        self.level_target = 0.0;
+        self.voice_visible_target = true;
+        self.voice_level_target = 0.0;
     }
 
     pub fn hide(&mut self) {
-        self.visible_target = false;
-        self.level_target = 0.0;
-        self.pulse_enabled = true;
+        self.voice_visible_target = false;
+        self.voice_level_target = 0.0;
+        self.voice_pulse_enabled = true;
+        self.voice_progress_mode = false;
     }
 
     pub fn set_level(&mut self, level: f32) {
-        self.level_target = level.clamp(0.0, 1.0);
+        self.voice_level_target = level.clamp(0.0, 1.0);
     }
 
     pub fn set_pulse_enabled(&mut self, enabled: bool) {
-        self.pulse_enabled = enabled;
+        self.voice_pulse_enabled = enabled;
+    }
+
+    pub fn update_automation_feedback(
+        &mut self,
+        activity: AutomationActivity,
+        overlay_hint: Option<&AutomationOverlayHint>,
+        click: Option<&AutomationClickSnapshot>,
+        status_line: &str,
+    ) {
+        self.suppress_voice_bar_immediately();
+        let persistent = matches!(
+            activity,
+            AutomationActivity::Recording
+                | AutomationActivity::Playing
+                | AutomationActivity::Paused
+        );
+        let message = overlay_hint
+            .map(|hint| hint.text.as_str())
+            .unwrap_or(status_line);
+        let should_show = persistent || overlay_hint.is_some();
+
+        if should_show && self.hud_message != message {
+            self.hud_message = message.to_string();
+            self.hud_window.set_text(message);
+        }
+
+        self.hud_persistent = persistent;
+        self.hud_hold_until = Some(if should_show {
+            Instant::now() + HUD_DISPLAY_MIN
+        } else {
+            Instant::now()
+        });
+
+        if let Some(click) = click
+            && click.serial != self.last_click_serial
+        {
+            self.last_click_serial = click.serial;
+            self.active_click = Some(ActiveClick {
+                x: click.x,
+                y: click.y,
+                started_at: Instant::now(),
+            });
+        }
     }
 
     pub fn tick(&mut self) {
-        let visibility_target = if self.visible_target { 1.0 } else { 0.0 };
-        self.current_visibility = smooth_step(self.current_visibility, visibility_target, 0.20);
+        self.tick_voice_bar();
+        self.tick_hud();
+        self.tick_click_effect();
+    }
 
-        let pulse = if self.visible_target && self.pulse_enabled {
+    fn suppress_voice_bar_immediately(&mut self) {
+        self.voice_visible_target = false;
+        self.voice_level_target = 0.0;
+        self.voice_level_current = 0.0;
+        self.voice_visibility = 0.0;
+        self.voice_pulse_enabled = true;
+        self.voice_progress_mode = false;
+        if self.voice_shown {
+            unsafe {
+                let _ = ShowWindow(self.track_window.hwnd, SW_HIDE);
+                let _ = ShowWindow(self.fill_window.hwnd, SW_HIDE);
+            }
+            self.voice_shown = false;
+        }
+    }
+
+    fn tick_voice_bar(&mut self) {
+        let visibility_target = if self.voice_visible_target { 1.0 } else { 0.0 };
+        self.voice_visibility = smooth_step(self.voice_visibility, visibility_target, 0.20);
+
+        let pulse = if self.voice_visible_target && self.voice_pulse_enabled {
             0.07 + 0.03 * ((self.started_at.elapsed().as_secs_f32() * 5.0).sin() * 0.5 + 0.5)
         } else {
             0.0
         };
-        let effective_level = self.level_target.max(pulse).clamp(0.0, 1.0);
-        self.current_level = smooth_step(self.current_level, effective_level, 0.16);
+        let effective_level = self.voice_level_target.max(pulse).clamp(0.0, 1.0);
+        self.voice_level_current = smooth_step(self.voice_level_current, effective_level, 0.16);
 
-        if self.current_visibility > 0.01 && !self.shown {
+        if self.voice_visibility > 0.01 && !self.voice_shown {
             unsafe {
                 let _ = ShowWindow(self.track_window.hwnd, SW_SHOWNOACTIVATE);
                 let _ = ShowWindow(self.fill_window.hwnd, SW_SHOWNOACTIVATE);
             }
-            self.shown = true;
+            self.voice_shown = true;
         }
 
-        if self.shown {
-            let offset =
-                ((1.0 - self.current_visibility) * SLIDE_DISTANCE_PX as f32).round() as i32;
+        if self.voice_shown {
+            let offset = ((1.0 - self.voice_visibility) * SLIDE_DISTANCE_PX as f32).round() as i32;
             let track_y = self.base_y + offset;
-            let track_alpha = (TRACK_ALPHA_MAX as f32 * self.current_visibility).round() as u8;
-            let fill_alpha = (FILL_ALPHA_MAX as f32 * self.current_visibility).round() as u8;
-            let fill_width = current_fill_width(self.current_level);
+            let track_alpha = (TRACK_ALPHA_MAX as f32 * self.voice_visibility).round() as u8;
+            let fill_alpha = (FILL_ALPHA_MAX as f32 * self.voice_visibility).round() as u8;
+            let fill_width = current_fill_width(self.voice_level_current, self.voice_progress_mode);
             let fill_height = TRACK_HEIGHT_PX - TRACK_PADDING_PX * 2;
 
             unsafe {
@@ -192,20 +367,121 @@ impl RecordingOverlay {
             }
         }
 
-        if self.current_visibility < 0.01 && self.shown && !self.visible_target {
+        if self.voice_visibility < 0.01 && self.voice_shown && !self.voice_visible_target {
             unsafe {
                 let _ = ShowWindow(self.track_window.hwnd, SW_HIDE);
                 let _ = ShowWindow(self.fill_window.hwnd, SW_HIDE);
             }
-            self.shown = false;
-            self.current_level = 0.0;
+            self.voice_shown = false;
+            self.voice_level_current = 0.0;
+        }
+    }
+
+    fn tick_hud(&mut self) {
+        let should_show = hud_should_show(self.hud_persistent, self.hud_hold_until, Instant::now());
+        self.hud_visibility = smooth_step(
+            self.hud_visibility,
+            if should_show { 1.0 } else { 0.0 },
+            0.18,
+        );
+
+        if self.hud_visibility > 0.01 && !self.hud_shown {
+            self.hud_window.show();
+            self.hud_shown = true;
+        }
+
+        if self.hud_shown {
+            self.hud_window
+                .set_alpha((HUD_ALPHA_MAX as f32 * self.hud_visibility).round() as u8);
+        }
+
+        if self.hud_visibility < 0.01 && self.hud_shown && !should_show {
+            self.hud_window.hide();
+            self.hud_shown = false;
+        }
+    }
+
+    fn tick_click_effect(&mut self) {
+        let Some(click) = &self.active_click else {
+            self.hide_click_windows();
+            return;
+        };
+
+        let progress = (click.started_at.elapsed().as_secs_f32() / CLICK_LIFETIME.as_secs_f32())
+            .clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            self.active_click = None;
+            self.hide_click_windows();
+            return;
+        }
+
+        let outer_size = (CLICK_INNER_SIZE_PX as f32
+            + (CLICK_OUTER_SIZE_PX - CLICK_INNER_SIZE_PX) as f32 * progress)
+            .round() as i32;
+        let inner_size = (CLICK_INNER_SIZE_PX as f32 + 10.0 * progress).round() as i32;
+        let alpha = (CLICK_ALPHA_MAX as f32 * (1.0 - progress)).round() as u8;
+
+        self.show_click_window(
+            &self.click_outer_window,
+            click.x,
+            click.y,
+            outer_size,
+            alpha / 2,
+        );
+        self.show_click_window(
+            &self.click_inner_window,
+            click.x,
+            click.y,
+            inner_size,
+            alpha,
+        );
+    }
+
+    fn show_click_window(&self, window: &ShapeWindow, x: i32, y: i32, size: i32, alpha: u8) {
+        let left = x - size / 2;
+        let top = y - size / 2;
+        unsafe {
+            let _ = ShowWindow(window.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                window.hwnd,
+                Some(HWND_TOPMOST),
+                left,
+                top,
+                size,
+                size,
+                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0),
+            );
+            let _ = apply_rounded_region(window.hwnd, size, size, size);
+            let _ = SetLayeredWindowAttributes(
+                window.hwnd,
+                COLORREF(0),
+                alpha,
+                LAYERED_WINDOW_ATTRIBUTES_FLAGS(0x00000002),
+            );
+        }
+    }
+
+    fn hide_click_windows(&self) {
+        unsafe {
+            let _ = ShowWindow(self.click_outer_window.hwnd, SW_HIDE);
+            let _ = ShowWindow(self.click_inner_window.hwnd, SW_HIDE);
         }
     }
 }
 
-impl Drop for OverlayWindow {
+impl Drop for ShapeWindow {
     fn drop(&mut self) {
         unsafe {
+            let _ = DestroyWindow(self.hwnd);
+            let _ = DeleteObject(self.brush.into());
+        }
+    }
+}
+
+impl Drop for HudWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.text_hwnd);
             let _ = DestroyWindow(self.hwnd);
             let _ = DeleteObject(self.brush.into());
         }
@@ -225,13 +501,11 @@ unsafe fn register_overlay_class(
         hbrBackground: brush,
         ..Default::default()
     };
-
     let _ = unsafe { RegisterClassW(&class) };
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn create_overlay_window(
+unsafe fn create_shape_window(
     instance: HINSTANCE,
     class_name: windows::core::PCWSTR,
     brush: HBRUSH,
@@ -240,7 +514,7 @@ unsafe fn create_overlay_window(
     width: i32,
     height: i32,
     radius: i32,
-) -> Result<OverlayWindow> {
+) -> Result<ShapeWindow> {
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -259,7 +533,8 @@ unsafe fn create_overlay_window(
     }
     .map_err(|error| anyhow!("create overlay window failed: {error}"))?;
 
-    if unsafe {
+    unsafe { apply_rounded_region(hwnd, width, height, radius)? };
+    unsafe {
         SetLayeredWindowAttributes(
             hwnd,
             COLORREF(0),
@@ -267,19 +542,71 @@ unsafe fn create_overlay_window(
             LAYERED_WINDOW_ATTRIBUTES_FLAGS(0x00000002),
         )
     }
-    .is_err()
-    {
-        unsafe {
-            DestroyWindow(hwnd)?;
-            let _ = DeleteObject(brush.into());
-        }
-        return Err(anyhow!("configure overlay transparency failed"));
-    }
+    .map_err(|_| anyhow!("configure overlay transparency failed"))?;
 
-    unsafe { apply_rounded_region(hwnd, width, height, radius)? };
     let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+    Ok(ShapeWindow { hwnd, brush })
+}
 
-    Ok(OverlayWindow { hwnd, brush })
+unsafe fn create_hud_window(
+    instance: HINSTANCE,
+    brush: HBRUSH,
+    x: i32,
+    y: i32,
+) -> Result<HudWindow> {
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("ainput_automation_hud_surface"),
+            w!(""),
+            WINDOW_STYLE(WS_POPUP.0),
+            x,
+            y,
+            HUD_WIDTH_PX,
+            HUD_HEIGHT_PX,
+            None,
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .map_err(|error| anyhow!("create automation hud window failed: {error}"))?;
+
+    unsafe { apply_rounded_region(hwnd, HUD_WIDTH_PX, HUD_HEIGHT_PX, HUD_RADIUS_PX)? };
+    unsafe {
+        SetLayeredWindowAttributes(
+            hwnd,
+            COLORREF(0),
+            0,
+            LAYERED_WINDOW_ATTRIBUTES_FLAGS(0x00000002),
+        )
+    }
+    .map_err(|_| anyhow!("configure automation hud transparency failed"))?;
+
+    let text_hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TRANSPARENT,
+            w!("STATIC"),
+            w!(""),
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0),
+            16,
+            12,
+            HUD_WIDTH_PX - 32,
+            HUD_HEIGHT_PX - 20,
+            Some(hwnd),
+            None,
+            Some(instance),
+            None,
+        )
+    }
+    .map_err(|error| anyhow!("create automation hud text failed: {error}"))?;
+
+    let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+    Ok(HudWindow {
+        hwnd,
+        text_hwnd,
+        brush,
+    })
 }
 
 unsafe fn apply_rounded_region(hwnd: HWND, width: i32, height: i32, radius: i32) -> Result<()> {
@@ -292,8 +619,7 @@ unsafe fn apply_rounded_region(hwnd: HWND, width: i32, height: i32, radius: i32)
         return Err(anyhow!("create rounded overlay region failed"));
     }
 
-    let applied = unsafe { windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(region), true) };
-    if applied != 1 {
+    if unsafe { SetWindowRgn(hwnd, Some(region), true) } != 1 {
         let _ = unsafe { DeleteObject(region.into()) };
         return Err(anyhow!("apply overlay region failed"));
     }
@@ -326,19 +652,77 @@ fn work_area_bottom_center_origin() -> (i32, i32) {
     }
 }
 
-fn fill_min_width() -> i32 {
-    30
+fn work_area_bottom() -> i32 {
+    unsafe {
+        let mut work_area = RECT::default();
+        if SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some((&mut work_area as *mut RECT).cast()),
+            Default::default(),
+        )
+        .is_ok()
+        {
+            return work_area.bottom.max(0);
+        }
+
+        GetSystemMetrics(SM_CYSCREEN).max(0)
+    }
 }
 
-fn current_fill_width(level: f32) -> i32 {
+fn fill_min_width(progress_mode: bool) -> i32 {
+    if progress_mode { 0 } else { 30 }
+}
+
+fn current_fill_width(level: f32, progress_mode: bool) -> i32 {
     let inner_max = TRACK_WIDTH_PX - TRACK_PADDING_PX * 2;
-    let inner_min = fill_min_width();
-    let normalized = level.clamp(0.0, 1.0).powf(0.75);
+    let inner_min = fill_min_width(progress_mode);
+    let normalized = if progress_mode {
+        level.clamp(0.0, 1.0)
+    } else {
+        level.clamp(0.0, 1.0).powf(0.75)
+    };
     inner_min + ((inner_max - inner_min) as f32 * normalized).round() as i32
 }
 
 fn smooth_step(current: f32, target: f32, amount: f32) -> f32 {
     current + (target - current) * amount
+}
+
+fn hud_should_show(hud_persistent: bool, hud_hold_until: Option<Instant>, now: Instant) -> bool {
+    hud_persistent || hud_hold_until.is_some_and(|hold_until| now <= hold_until)
+}
+
+impl HudWindow {
+    fn show(&self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    fn hide(&self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+    }
+
+    fn set_alpha(&self, alpha: u8) {
+        unsafe {
+            let _ = SetLayeredWindowAttributes(
+                self.hwnd,
+                COLORREF(0),
+                alpha,
+                LAYERED_WINDOW_ATTRIBUTES_FLAGS(0x00000002),
+            );
+        }
+    }
+
+    fn set_text(&self, text: &str) {
+        let text = HSTRING::from(text);
+        unsafe {
+            let _ = SetWindowTextW(self.text_hwnd, &text);
+        }
+    }
 }
 
 unsafe extern "system" fn overlay_wnd_proc(
@@ -350,5 +734,43 @@ unsafe extern "system" fn overlay_wnd_proc(
     match msg {
         WM_NCHITTEST => LRESULT(-1),
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_fill_width_keeps_voice_mode_minimum_and_progress_can_empty() {
+        assert_eq!(fill_min_width(false), 30);
+        assert_eq!(fill_min_width(true), 0);
+        assert_eq!(current_fill_width(0.0, false), 30);
+        assert_eq!(current_fill_width(0.0, true), 0);
+    }
+
+    #[test]
+    fn current_fill_width_reaches_full_span_at_max_level() {
+        let inner_max = TRACK_WIDTH_PX - TRACK_PADDING_PX * 2;
+        assert_eq!(current_fill_width(1.0, false), inner_max);
+        assert_eq!(current_fill_width(1.0, true), inner_max);
+    }
+
+    #[test]
+    fn hud_should_show_honors_persistence_and_minimum_display_window() {
+        let now = Instant::now();
+        assert!(hud_should_show(true, None, now));
+        assert!(hud_should_show(
+            false,
+            Some(now + Duration::from_millis(1)),
+            now
+        ));
+        assert!(hud_should_show(false, Some(now), now));
+        assert!(!hud_should_show(
+            false,
+            Some(now - Duration::from_millis(1)),
+            now
+        ));
+        assert!(!hud_should_show(false, None, now));
     }
 }

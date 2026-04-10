@@ -7,7 +7,9 @@ use ainput_output::{OutputConfig, OutputDelivery};
 use anyhow::Result;
 use winit::event_loop::EventLoopProxy;
 
-use crate::{AppEvent, AppRuntime};
+use crate::{AppEvent, AppRuntime, hotkey};
+
+const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
 
 pub(crate) enum WorkerEvent {
     Started,
@@ -164,6 +166,20 @@ pub(crate) fn push_to_talk_worker(
                                             );
                                         }
                                         let output_started_at = Instant::now();
+                                        let hotkey_release_wait_started_at = Instant::now();
+                                        let modifiers_released =
+                                            hotkey::wait_for_voice_hotkey_release(
+                                                VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT,
+                                            );
+                                        let hotkey_release_wait_elapsed_ms =
+                                            hotkey_release_wait_started_at.elapsed().as_millis();
+                                        if !modifiers_released {
+                                            tracing::warn!(
+                                                waited_ms = hotkey_release_wait_elapsed_ms,
+                                                hotkey = %runtime.config.hotkeys.voice_input,
+                                                "voice output started before all modifiers fully released"
+                                            );
+                                        }
                                         let output_config = OutputConfig {
                                             prefer_direct_paste: runtime
                                                 .config
@@ -173,6 +189,7 @@ pub(crate) fn push_to_talk_worker(
                                                 .config
                                                 .voice
                                                 .fallback_to_clipboard,
+                                            voice_hotkey_uses_alt: hotkey::voice_hotkey_uses_alt(),
                                         };
                                         match runtime
                                             .output_controller
@@ -204,6 +221,7 @@ pub(crate) fn push_to_talk_worker(
                                                     text = %text,
                                                     asr_elapsed_ms,
                                                     normalize_elapsed_ms,
+                                                    hotkey_release_wait_elapsed_ms,
                                                     output_elapsed_ms,
                                                     pipeline_elapsed_ms,
                                                     audio_duration_ms,

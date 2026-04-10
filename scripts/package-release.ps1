@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.7"
+    [string]$Version = "1.0.11"
 )
 
 $ErrorActionPreference = "Stop"
@@ -108,8 +108,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
     "- Clipboard fallback is used when direct paste fails",
     "- Recording options are available from the tray: audio, mouse, watermark, FPS, and quality",
-    "- During automation recording, the tray icon and bottom bar show active feedback",
-    "- During automation playback, any manual keyboard or mouse input will auto-pause playback and the bottom bar shows total progress"
+    "- During automation recording and playback, the tray icon, left-bottom HUD, and click feedback show the current state",
+    "- During automation playback, any manual keyboard or mouse input will auto-pause playback"
 )
 
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "logs") | Out-Null

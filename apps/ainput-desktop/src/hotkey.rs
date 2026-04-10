@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
@@ -29,6 +29,7 @@ use winit::event_loop::EventLoopProxy;
 
 const HOTKEY_CONTROL_MESSAGE: u32 = WM_APP + 7;
 const MOUSE_MIDDLE_HOLD_DELAY_MS: u64 = 200;
+const VOICE_HOTKEY_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Copy)]
 pub enum HotkeyState {
@@ -37,6 +38,7 @@ pub enum HotkeyState {
     ScreenshotTriggered,
     RecordingStartTriggered,
     RecordingStopTriggered,
+    RecordingCancelTriggered,
     AutomationPauseTriggered,
     AutomationRecordTriggered,
     AutomationStopTriggered,
@@ -85,6 +87,8 @@ static SCREENSHOT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECORDING_START_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECORDING_STOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECORDING_CANCEL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECORDING_CANCEL_ENABLED: AtomicBool = AtomicBool::new(false);
 static AUTOMATION_PAUSE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AUTOMATION_RECORD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static AUTOMATION_STOP_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -185,6 +189,37 @@ pub fn set_automation_cancel_enabled(enabled: bool) {
     }
 }
 
+pub fn set_recording_cancel_enabled(enabled: bool) {
+    RECORDING_CANCEL_ENABLED.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        RECORDING_CANCEL_ACTIVE.store(false, Ordering::Relaxed);
+    }
+}
+
+pub fn wait_for_voice_hotkey_release(timeout: Duration) -> bool {
+    let Some(config) = current_config() else {
+        return true;
+    };
+
+    if !config.voice.modifiers.any() {
+        return true;
+    }
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if config.voice.modifiers.fully_released() {
+            return true;
+        }
+        thread::sleep(VOICE_HOTKEY_RELEASE_POLL_INTERVAL);
+    }
+
+    config.voice.modifiers.fully_released()
+}
+
+pub fn voice_hotkey_uses_alt() -> bool {
+    current_config().is_some_and(|config| config.voice.modifiers.alt)
+}
+
 pub fn reset_hotkey_state() {
     CTRL_DOWN.store(false, Ordering::Relaxed);
     ALT_DOWN.store(false, Ordering::Relaxed);
@@ -194,6 +229,7 @@ pub fn reset_hotkey_state() {
     VOICE_ACTIVE.store(false, Ordering::Relaxed);
     RECORDING_START_ACTIVE.store(false, Ordering::Relaxed);
     RECORDING_STOP_ACTIVE.store(false, Ordering::Relaxed);
+    RECORDING_CANCEL_ACTIVE.store(false, Ordering::Relaxed);
     AUTOMATION_PAUSE_ACTIVE.store(false, Ordering::Relaxed);
     AUTOMATION_RECORD_ACTIVE.store(false, Ordering::Relaxed);
     AUTOMATION_STOP_ACTIVE.store(false, Ordering::Relaxed);
@@ -257,6 +293,19 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             }
             if vk == VK_F2 && is_up {
                 RECORDING_STOP_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
+            if RECORDING_CANCEL_ENABLED.load(Ordering::Relaxed)
+                && vk == VK_ESCAPE
+                && is_down
+                && !RECORDING_CANCEL_ACTIVE.swap(true, Ordering::Relaxed)
+            {
+                send_hotkey_state(HotkeyState::RecordingCancelTriggered);
+                return LRESULT(1);
+            }
+            if RECORDING_CANCEL_ENABLED.load(Ordering::Relaxed) && vk == VK_ESCAPE && is_up {
+                RECORDING_CANCEL_ACTIVE.store(false, Ordering::Relaxed);
                 return LRESULT(1);
             }
 
@@ -368,6 +417,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 && VOICE_ACTIVE.swap(false, Ordering::Relaxed)
             {
                 send_hotkey_state(HotkeyState::VoiceReleased);
+                return unsafe { CallNextHookEx(None, code, wparam, lparam) };
             }
         }
     }
@@ -467,6 +517,13 @@ impl HotkeyModifiers {
             || (self.alt && !ALT_DOWN.load(Ordering::Relaxed))
             || (self.shift && !SHIFT_DOWN.load(Ordering::Relaxed))
             || (self.win && !WIN_DOWN.load(Ordering::Relaxed))
+    }
+
+    fn fully_released(self) -> bool {
+        (!self.ctrl || !CTRL_DOWN.load(Ordering::Relaxed))
+            && (!self.alt || !ALT_DOWN.load(Ordering::Relaxed))
+            && (!self.shift || !SHIFT_DOWN.load(Ordering::Relaxed))
+            && (!self.win || !WIN_DOWN.load(Ordering::Relaxed))
     }
 }
 
@@ -635,5 +692,77 @@ fn send_hotkey_state(state: HotkeyState) {
 fn send_error(message: String) {
     if let Some(proxy) = HOTKEY_PROXY.get() {
         let _ = proxy.send_event(crate::AppEvent::Worker(crate::WorkerEvent::Error(message)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test mutex poisoned")
+    }
+
+    fn install_test_config(voice_input: &str) {
+        let config = HotkeyRuntimeConfig {
+            voice: parse_hotkey(voice_input).expect("voice hotkey should parse"),
+            screenshot: parse_hotkey("Alt+X").expect("screenshot hotkey should parse"),
+        };
+
+        if let Some(lock) = HOTKEY_CONFIG.get() {
+            *lock.write().expect("hotkey config write lock poisoned") = config;
+        } else {
+            let _ = HOTKEY_CONFIG.set(RwLock::new(config));
+        }
+    }
+
+    #[test]
+    fn voice_hotkey_uses_alt_tracks_runtime_config() {
+        let _guard = test_guard();
+        reset_hotkey_state();
+        install_test_config("Alt+Z");
+        assert!(voice_hotkey_uses_alt());
+
+        install_test_config("Ctrl+Shift+Z");
+        assert!(!voice_hotkey_uses_alt());
+    }
+
+    #[test]
+    fn wait_for_voice_hotkey_release_succeeds_after_modifier_clears() {
+        let _guard = test_guard();
+        reset_hotkey_state();
+        install_test_config("Alt+Z");
+        ALT_DOWN.store(true, Ordering::Relaxed);
+
+        let releaser = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(20));
+            ALT_DOWN.store(false, Ordering::Relaxed);
+        });
+
+        let started_at = Instant::now();
+        assert!(wait_for_voice_hotkey_release(Duration::from_millis(100)));
+        assert!(started_at.elapsed() >= Duration::from_millis(16));
+
+        releaser
+            .join()
+            .expect("modifier releaser thread should finish");
+        reset_hotkey_state();
+    }
+
+    #[test]
+    fn wait_for_voice_hotkey_release_times_out_when_modifier_stays_pressed() {
+        let _guard = test_guard();
+        reset_hotkey_state();
+        install_test_config("Alt+Z");
+        ALT_DOWN.store(true, Ordering::Relaxed);
+
+        assert!(!wait_for_voice_hotkey_release(Duration::from_millis(20)));
+
+        reset_hotkey_state();
     }
 }

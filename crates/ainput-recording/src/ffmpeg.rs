@@ -1,12 +1,19 @@
 use std::ffi::OsStr;
 use std::io::Write;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::{VideoQuality, WatermarkConfig, WatermarkPosition};
 use crate::selection::CaptureRegion;
+use crate::{VideoQuality, WatermarkConfig, WatermarkPosition};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 pub struct ActiveVideoCapture {
     child: Child,
@@ -29,6 +36,7 @@ impl ActiveVideoCapture {
         output_path: &Path,
     ) -> Result<Self> {
         let mut command = Command::new(ffmpeg_path);
+        configure_background_process(&mut command);
         command
             .arg("-y")
             .arg("-hide_banner")
@@ -97,6 +105,7 @@ pub fn mux_audio_video(
     output_path: &Path,
 ) -> Result<()> {
     let mut command = Command::new(ffmpeg_path);
+    configure_background_process(&mut command);
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -138,7 +147,9 @@ pub fn mux_audio_video(
 }
 
 pub fn mux_video_only(ffmpeg_path: &Path, video_path: &Path, output_path: &Path) -> Result<()> {
-    let output = Command::new(ffmpeg_path)
+    let mut command = Command::new(ffmpeg_path);
+    configure_background_process(&mut command);
+    let output = command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -174,6 +185,7 @@ pub fn render_with_watermark(
 ) -> Result<()> {
     let filter = build_drawtext_filter(watermark);
     let mut command = Command::new(ffmpeg_path);
+    configure_background_process(&mut command);
     command
         .arg("-y")
         .arg("-hide_banner")
@@ -229,7 +241,9 @@ pub fn render_with_watermark(
 
 pub fn probe_media(ffmpeg_path: &Path, media_path: &Path) -> Result<MediaSummary> {
     let ffprobe_path = resolve_ffprobe_path(ffmpeg_path);
-    let output = Command::new(&ffprobe_path)
+    let mut command = Command::new(&ffprobe_path);
+    configure_background_process(&mut command);
+    let output = command
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
@@ -250,7 +264,11 @@ pub fn probe_media(ffmpeg_path: &Path, media_path: &Path) -> Result<MediaSummary
         video_streams: 0,
         audio_streams: 0,
     };
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         match line {
             "video" => summary.video_streams += 1,
             "audio" => summary.audio_streams += 1,
@@ -344,8 +362,17 @@ fn escape_drawtext_text(text: &str) -> String {
         .replace('%', "\\%")
 }
 
+fn configure_background_process(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+}
+
 fn command_exists(program: &OsStr) -> bool {
-    Command::new(program)
+    let mut command = Command::new(program);
+    configure_background_process(&mut command);
+    command
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ainput_data::{LearningStatus, TermCatalog};
 use anyhow::{Context, Result, anyhow};
@@ -34,6 +35,8 @@ const SENTENCE_FINAL_EMOJI_RULES: &[(&str, &str)] = &[
     ("狗头", "[狗头]"),
     ("捂脸", "[捂脸]"),
 ];
+const PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(35);
+const CHROME_ALT_MENU_DISMISS_DELAY: Duration = Duration::from_millis(30);
 
 #[derive(Debug, Clone, Copy)]
 pub enum OutputDelivery {
@@ -54,6 +57,7 @@ pub struct LearnOutcome {
 pub struct OutputConfig {
     pub prefer_direct_paste: bool,
     pub fallback_to_clipboard: bool,
+    pub voice_hotkey_uses_alt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,7 +147,7 @@ impl OutputController {
 
         if config.prefer_direct_paste {
             let direct_paste_started_at = Instant::now();
-            match paste_via_clipboard(&prepared_text) {
+            match paste_via_clipboard(&prepared_text, &context, config) {
                 Ok(()) => {
                     tracing::info!(
                         correction_elapsed_ms,
@@ -221,15 +225,29 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn paste_via_clipboard(text: &str) -> Result<()> {
+fn paste_via_clipboard(
+    text: &str,
+    context: &OutputContextSnapshot,
+    config: &OutputConfig,
+) -> Result<()> {
     let clipboard_started_at = Instant::now();
     copy_to_clipboard(text)?;
     let clipboard_elapsed_ms = clipboard_started_at.elapsed().as_millis();
+    // Give the foreground app one short frame to settle after the hotkey is released.
+    thread::sleep(PASTE_STABILIZE_DELAY);
 
     let controller_started_at = Instant::now();
     let mut enigo = Enigo::new(&Settings::default())
         .map_err(|error| anyhow!("create enigo output controller: {error}"))?;
     let controller_elapsed_ms = controller_started_at.elapsed().as_millis();
+    let clear_menu_focus_started_at = Instant::now();
+    if should_clear_alt_menu_focus(context, config) {
+        enigo
+            .key(Key::Escape, Click)
+            .context("dismiss chrome alt menu focus")?;
+        thread::sleep(CHROME_ALT_MENU_DISMISS_DELAY);
+    }
+    let clear_menu_focus_elapsed_ms = clear_menu_focus_started_at.elapsed().as_millis();
     let key_send_started_at = Instant::now();
     enigo.key(Key::Control, Press).context("press ctrl")?;
     enigo.key(Key::V, Click).context("send v key")?;
@@ -238,12 +256,21 @@ fn paste_via_clipboard(text: &str) -> Result<()> {
     tracing::info!(
         clipboard_elapsed_ms,
         controller_elapsed_ms,
+        clear_menu_focus_elapsed_ms,
         key_send_elapsed_ms,
         paste_via_clipboard_elapsed_ms = clipboard_started_at.elapsed().as_millis(),
         "paste timing"
     );
 
     Ok(())
+}
+
+fn should_clear_alt_menu_focus(context: &OutputContextSnapshot, config: &OutputConfig) -> bool {
+    config.voice_hotkey_uses_alt
+        && context
+            .process_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("chrome.exe"))
 }
 
 fn prepare_text_for_delivery(text: &str) -> (String, OutputContextSnapshot) {
@@ -501,9 +528,9 @@ impl Drop for ComApartment {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutputContextKind, apply_voice_actions, ensure_trailing_period, has_terminal_punctuation,
-        prepare_text_for_delivery_in_context, replace_sentence_final_emoji_trigger,
-        strip_trailing_period,
+        OutputConfig, OutputContextKind, OutputContextSnapshot, apply_voice_actions,
+        ensure_trailing_period, has_terminal_punctuation, prepare_text_for_delivery_in_context,
+        replace_sentence_final_emoji_trigger, should_clear_alt_menu_focus, strip_trailing_period,
     };
 
     #[test]
@@ -612,5 +639,31 @@ mod tests {
             prepare_text_for_delivery_in_context("普通一句话", OutputContextKind::Unknown),
             "普通一句话。"
         );
+    }
+
+    #[test]
+    fn clears_alt_menu_focus_only_for_chrome_with_alt_voice_hotkey() {
+        let chrome_context = OutputContextSnapshot {
+            process_name: Some("chrome.exe".to_string()),
+            kind: OutputContextKind::EditableAtEnd,
+        };
+        let edge_context = OutputContextSnapshot {
+            process_name: Some("msedge.exe".to_string()),
+            kind: OutputContextKind::EditableAtEnd,
+        };
+        let alt_config = OutputConfig {
+            prefer_direct_paste: true,
+            fallback_to_clipboard: true,
+            voice_hotkey_uses_alt: true,
+        };
+        let ctrl_config = OutputConfig {
+            prefer_direct_paste: true,
+            fallback_to_clipboard: true,
+            voice_hotkey_uses_alt: false,
+        };
+
+        assert!(should_clear_alt_menu_focus(&chrome_context, &alt_config));
+        assert!(!should_clear_alt_menu_focus(&chrome_context, &ctrl_config));
+        assert!(!should_clear_alt_menu_focus(&edge_context, &alt_config));
     }
 }

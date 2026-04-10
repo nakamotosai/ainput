@@ -1,23 +1,9 @@
-const LEADING_FILLERS: &[&str] = &[
-    "嗯嗯",
-    "嗯",
-    "啊啊",
-    "啊",
-    "呃呃",
-    "呃",
-    "额额",
-    "额",
-    "那个那个",
-    "就是就是",
-];
-
 const DUPLICATE_PHRASES: &[&str] = &[
     "我", "我们", "你", "你们", "他", "她", "这个", "那个", "就是", "然后", "所以", "可以",
 ];
 
 pub fn normalize_transcription(text: &str) -> String {
     let mut current = collapse_whitespace(text);
-    current = strip_leading_fillers(&current);
     current = collapse_known_duplicates(&current);
     current = cleanup_punctuation_spacing(&current);
 
@@ -41,28 +27,6 @@ fn collapse_whitespace(text: &str) -> String {
     }
 
     result.trim().to_string()
-}
-
-fn strip_leading_fillers(text: &str) -> String {
-    let mut current = text.trim_start().to_string();
-
-    loop {
-        let mut removed = false;
-        for filler in LEADING_FILLERS {
-            if current.starts_with(filler) {
-                let remainder = current[filler.len()..].trim_start_matches(is_soft_separator);
-                current = remainder.trim_start().to_string();
-                removed = true;
-                break;
-            }
-        }
-
-        if !removed {
-            break;
-        }
-    }
-
-    current
 }
 
 fn collapse_known_duplicates(text: &str) -> String {
@@ -101,10 +65,6 @@ fn cleanup_punctuation_spacing(text: &str) -> String {
     result
 }
 
-fn is_soft_separator(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '，' | ',' | '。' | '.' | '！' | '？')
-}
-
 fn is_cjk_punctuation(ch: char) -> bool {
     matches!(
         ch,
@@ -117,10 +77,12 @@ mod tests {
     use super::normalize_transcription;
 
     #[test]
-    fn removes_leading_fillers() {
-        assert_eq!(normalize_transcription("嗯，帮我看一下"), "帮我看一下");
-        assert_eq!(normalize_transcription("那个那个这个问题"), "这个问题");
-        assert_eq!(normalize_transcription("就是就是这个问题"), "这个问题");
+    fn keeps_leading_fillers_and_original_opening_words() {
+        assert_eq!(normalize_transcription("嗯，帮我看一下"), "嗯，帮我看一下");
+        assert_eq!(normalize_transcription("呃，帮我看一下"), "呃，帮我看一下");
+        assert_eq!(normalize_transcription("额，帮我看一下"), "额，帮我看一下");
+        assert_eq!(normalize_transcription("那个那个这个问题"), "那个这个问题");
+        assert_eq!(normalize_transcription("就是就是这个问题"), "就是这个问题");
     }
 
     #[test]
@@ -142,7 +104,7 @@ mod tests {
     fn keeps_sentence_shape_conservative() {
         assert_eq!(
             normalize_transcription("  嗯  请帮我review一下这个PR  "),
-            "请帮我review一下这个PR"
+            "嗯 请帮我review一下这个PR"
         );
     }
 }

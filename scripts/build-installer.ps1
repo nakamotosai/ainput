@@ -1,8 +1,13 @@
 param(
-    [string]$Version = "1.0.7"
+    [string]$Version = "1.0.11",
+    [switch]$AllowDeprecatedInstaller
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $AllowDeprecatedInstaller) {
+    throw "installer workflow is deprecated for ainput. Use package-release.ps1 and ship the portable dist directory/zip instead. Re-run with -AllowDeprecatedInstaller only if you explicitly want the old installer path."
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $distRoot = Join-Path $repoRoot "dist"
