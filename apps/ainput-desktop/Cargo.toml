@@ -17,6 +17,7 @@ ainput-data = { path = "../../crates/ainput-data" }
 ainput-rewrite = { path = "../../crates/ainput-rewrite" }
 ainput-output = { path = "../../crates/ainput-output" }
 ainput-automation = { path = "../../crates/ainput-automation" }
+ainput-recording = { path = "../../crates/ainput-recording" }
 tray-icon = "0.21.3"
 winit = "0.30.12"
 windows = { version = "0.62.2", features = [

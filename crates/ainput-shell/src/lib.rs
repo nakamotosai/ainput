@@ -20,6 +20,7 @@ pub struct AppConfig {
     pub hotkeys: HotkeyConfig,
     pub voice: VoiceConfig,
     pub capture: CaptureConfig,
+    pub recording: ainput_recording::RecordingConfig,
     pub startup: StartupConfig,
     pub asr: AsrConfig,
     pub learning: LearningConfig,
@@ -352,6 +353,34 @@ enabled = {capture_enabled}
 # 截图完成后，是否额外自动保存 PNG 到桌面。
 auto_save_to_desktop = {auto_save_to_desktop}
 
+[recording]
+# 是否启用录屏主功能。
+enabled = {recording_enabled}
+
+# 是否录制系统播放音频。
+record_audio = {recording_audio}
+
+# 是否录制鼠标移动。
+capture_mouse = {recording_capture_mouse}
+
+# 录屏帧率预设，只支持 30 / 60 / 90。
+fps = {recording_fps}
+
+# 录屏画质预设。
+# low = CRF 28，medium = CRF 20，high = CRF 15
+quality = "{recording_quality}"
+
+[recording.watermark]
+# 是否启用录屏水印。
+enabled = {recording_watermark_enabled}
+
+# 水印文本。
+text = "{recording_watermark_text}"
+
+# 水印位置。
+# 支持：left_top / right_top / left_bottom / right_bottom / moving_flash / random_walk
+position = "{recording_watermark_position}"
+
 [startup]
 # 是否在 Windows 登录后自动启动 ainput。
 launch_at_login = {launch_at_login}
@@ -404,6 +433,26 @@ file_name = "{log_file_name}"
         history_limit = config.voice.history_limit,
         capture_enabled = config.capture.enabled,
         auto_save_to_desktop = config.capture.auto_save_to_desktop,
+        recording_enabled = config.recording.enabled,
+        recording_audio = config.recording.record_audio,
+        recording_capture_mouse = config.recording.capture_mouse,
+        recording_fps = config.recording.fps,
+        recording_quality = match config.recording.quality {
+            ainput_recording::VideoQuality::Low => "low",
+            ainput_recording::VideoQuality::Medium => "medium",
+            ainput_recording::VideoQuality::High => "high",
+        },
+        recording_watermark_enabled = config.recording.watermark.enabled,
+        recording_watermark_text = config.recording.watermark.text.replace('\\', "\\\\").replace('"', "\\\""),
+        recording_watermark_position = match config.recording.watermark.position {
+            ainput_recording::WatermarkPosition::LeftTop => "left_top",
+            ainput_recording::WatermarkPosition::RightTop => "right_top",
+            ainput_recording::WatermarkPosition::LeftBottom => "left_bottom",
+            ainput_recording::WatermarkPosition::RightBottom => "right_bottom",
+            ainput_recording::WatermarkPosition::MovingFlash => "moving_flash",
+            ainput_recording::WatermarkPosition::RandomWalk => "random_walk",
+            ainput_recording::WatermarkPosition::Center => "center",
+        },
         launch_at_login = config.startup.launch_at_login,
         model_dir = config.asr.model_dir,
         provider = config.asr.provider,

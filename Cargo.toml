@@ -2,6 +2,7 @@
 members = [
     "apps/ainput-desktop",
     "crates/ainput-automation",
+    "crates/ainput-recording",
     "crates/ainput-shell",
     "crates/ainput-audio",
     "crates/ainput-asr",
@@ -15,7 +16,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Proprietary"
-version = "1.0.5"
+version = "1.0.6"
 authors = ["sai"]
 
 [workspace.dependencies]

@@ -57,6 +57,34 @@ enabled = true
 # 截图完成后，是否额外自动保存 PNG 到桌面。
 auto_save_to_desktop = false
 
+[recording]
+# 是否启用录屏主功能。
+enabled = true
+
+# 是否录制系统播放音频。
+record_audio = true
+
+# 是否录制鼠标移动。
+capture_mouse = true
+
+# 录屏帧率预设，只支持 30 / 60 / 90。
+fps = 60
+
+# 录屏画质预设。
+# low = CRF 28，medium = CRF 20，high = CRF 15
+quality = "medium"
+
+[recording.watermark]
+# 是否启用录屏水印。
+enabled = true
+
+# 水印文本。
+text = "saaaai.com"
+
+# 水印位置。
+# 支持：left_top / right_top / left_bottom / right_bottom / moving_flash / random_walk
+position = "right_bottom"
+
 [startup]
 # 是否在 Windows 登录后自动启动 ainput。
 launch_at_login = true

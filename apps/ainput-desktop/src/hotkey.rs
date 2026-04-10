@@ -35,6 +35,8 @@ pub enum HotkeyState {
     VoicePressed,
     VoiceReleased,
     ScreenshotTriggered,
+    RecordingStartTriggered,
+    RecordingStopTriggered,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +78,8 @@ static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static SCREENSHOT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECORDING_START_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECORDING_STOP_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_ENABLED: AtomicBool = AtomicBool::new(true);
 static MOUSE_MIDDLE_DOWN: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -170,6 +174,8 @@ pub fn reset_hotkey_state() {
     WIN_DOWN.store(false, Ordering::Relaxed);
     SCREENSHOT_ACTIVE.store(false, Ordering::Relaxed);
     VOICE_ACTIVE.store(false, Ordering::Relaxed);
+    RECORDING_START_ACTIVE.store(false, Ordering::Relaxed);
+    RECORDING_STOP_ACTIVE.store(false, Ordering::Relaxed);
     MOUSE_MIDDLE_DOWN.store(false, Ordering::Relaxed);
     MOUSE_MIDDLE_ACTIVE.store(false, Ordering::Relaxed);
 }
@@ -213,6 +219,24 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         }
 
         if let Some(config) = current_config() {
+            if vk == VK_F1 && is_down && !RECORDING_START_ACTIVE.swap(true, Ordering::Relaxed) {
+                send_hotkey_state(HotkeyState::RecordingStartTriggered);
+                return LRESULT(1);
+            }
+            if vk == VK_F1 && is_up {
+                RECORDING_START_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
+            if vk == VK_F2 && is_down && !RECORDING_STOP_ACTIVE.swap(true, Ordering::Relaxed) {
+                send_hotkey_state(HotkeyState::RecordingStopTriggered);
+                return LRESULT(1);
+            }
+            if vk == VK_F2 && is_up {
+                RECORDING_STOP_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
             if let Some(primary_key) = config.screenshot.key {
                 if vk == primary_key
                     && is_down

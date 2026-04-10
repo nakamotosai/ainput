@@ -6,6 +6,7 @@
 /runtime/
 /models/
 /tmp/
+/labs/
 /~*
 /data/terms/user_terms.txt
 /data/terms/user_terms.json

@@ -8,6 +8,7 @@ mod screenshot;
 mod worker;
 
 use ainput_automation::{AutomationActivity, AutomationService};
+use ainput_recording::{RecordingActivity, RecordingService};
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use maintenance::{MaintenanceHandle, SharedRuntimeState};
@@ -35,6 +36,7 @@ const RUN_REGISTRY_VALUE_NAME: &str = "ainput";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn main() -> Result<()> {
+    ainput_recording::configure_dpi_awareness();
     let bootstrap = ainput_shell::bootstrap()?;
     let args: Vec<String> = std::env::args().collect();
 
@@ -206,6 +208,7 @@ pub(crate) enum AppEvent {
     Hotkey(hotkey::HotkeyState),
     Capture(screenshot::CaptureEvent),
     AutomationUpdated,
+    RecordingUpdated,
     OverlayTick,
     Tray(TrayIconEvent),
     Menu(MenuEvent),
@@ -217,6 +220,7 @@ enum AppMode {
     Voice,
     Capture,
     Automation,
+    Recording,
 }
 
 struct DesktopApp {
@@ -228,6 +232,7 @@ struct DesktopApp {
     worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     hotkey_monitor: Option<hotkey::GlobalHotkeyMonitor>,
     automation_service: Option<AutomationService>,
+    recording_service: Option<RecordingService>,
     tray_icon: Option<TrayIcon>,
     overlay: Option<overlay::RecordingOverlay>,
     overlay_available: bool,
@@ -243,6 +248,14 @@ struct DesktopApp {
     automation_repeat_items: Vec<CheckMenuItem>,
     automation_edit_names_item: Option<MenuItem>,
     automation_open_dir_item: Option<MenuItem>,
+    recording_status_item: Option<MenuItem>,
+    recording_audio_item: Option<CheckMenuItem>,
+    recording_mouse_item: Option<CheckMenuItem>,
+    recording_watermark_item: Option<CheckMenuItem>,
+    recording_set_watermark_text_item: Option<MenuItem>,
+    recording_position_items: Vec<CheckMenuItem>,
+    recording_fps_items: Vec<CheckMenuItem>,
+    recording_quality_items: Vec<CheckMenuItem>,
 }
 
 impl DesktopApp {
@@ -256,6 +269,7 @@ impl DesktopApp {
             worker_tx: None,
             hotkey_monitor: None,
             automation_service: None,
+            recording_service: None,
             tray_icon: None,
             overlay: None,
             overlay_available: true,
@@ -271,6 +285,14 @@ impl DesktopApp {
             automation_repeat_items: Vec::new(),
             automation_edit_names_item: None,
             automation_open_dir_item: None,
+            recording_status_item: None,
+            recording_audio_item: None,
+            recording_mouse_item: None,
+            recording_watermark_item: None,
+            recording_set_watermark_text_item: None,
+            recording_position_items: Vec::new(),
+            recording_fps_items: Vec::new(),
+            recording_quality_items: Vec::new(),
         }
     }
 
@@ -351,6 +373,17 @@ impl DesktopApp {
             .as_ref()
             .expect("automation service initialized")
             .snapshot();
+        if self.recording_service.is_none() {
+            let proxy = self.proxy.clone();
+            self.recording_service = Some(RecordingService::start(move || {
+                let _ = proxy.send_event(AppEvent::RecordingUpdated);
+            })?);
+        }
+        let recording_snapshot = self
+            .recording_service
+            .as_ref()
+            .expect("recording service initialized")
+            .snapshot();
 
         let tray_menu = Menu::new();
         let status_item = MenuItem::with_id("status", "状态：待机中", false, None);
@@ -394,6 +427,124 @@ impl DesktopApp {
             "截图",
             true,
             &[&capture_hotkey_hint, &capture_save_item],
+        )?;
+
+        let recording_status_item = MenuItem::with_id(
+            "recording_status",
+            recording_snapshot.status_line.clone(),
+            false,
+            None,
+        );
+        let recording_hotkey_hint = MenuItem::with_id(
+            "recording_hotkey_hint",
+            format!(
+                "热键：{} 框选并开始 / {} 停止并导出",
+                ainput_recording::START_HOTKEY,
+                ainput_recording::STOP_HOTKEY
+            ),
+            false,
+            None,
+        );
+        let recording_audio_item = CheckMenuItem::with_id(
+            "recording_audio_toggle",
+            "录制系统音频",
+            true,
+            self.runtime.config.recording.record_audio,
+            None,
+        );
+        let recording_mouse_item = CheckMenuItem::with_id(
+            "recording_mouse_toggle",
+            "录制鼠标移动",
+            true,
+            self.runtime.config.recording.capture_mouse,
+            None,
+        );
+        let recording_watermark_item = CheckMenuItem::with_id(
+            "recording_watermark_toggle",
+            "启用水印",
+            true,
+            self.runtime.config.recording.watermark.enabled,
+            None,
+        );
+        let recording_set_watermark_text_item = MenuItem::with_id(
+            "recording_set_watermark_text",
+            "设置水印文本...",
+            true,
+            None,
+        );
+        let recording_position_items: Vec<CheckMenuItem> =
+            ainput_recording::WATERMARK_POSITION_PRESETS
+                .into_iter()
+                .map(|position| {
+                    CheckMenuItem::with_id(
+                        format!("recording_position_{position:?}"),
+                        position.label(),
+                        true,
+                        position == self.runtime.config.recording.watermark.position,
+                        None,
+                    )
+                })
+                .collect();
+        let recording_fps_items: Vec<CheckMenuItem> = ainput_recording::FPS_PRESETS
+            .into_iter()
+            .map(|fps| {
+                CheckMenuItem::with_id(
+                    format!("recording_fps_{fps}"),
+                    format!("{fps} FPS"),
+                    true,
+                    fps == self.runtime.config.recording.fps,
+                    None,
+                )
+            })
+            .collect();
+        let recording_quality_items: Vec<CheckMenuItem> = ainput_recording::QUALITY_PRESETS
+            .into_iter()
+            .map(|quality| {
+                CheckMenuItem::with_id(
+                    format!("recording_quality_{quality:?}"),
+                    quality.label(),
+                    true,
+                    quality == self.runtime.config.recording.quality,
+                    None,
+                )
+            })
+            .collect();
+        let recording_position_menu = {
+            let mut items: Vec<&dyn IsMenuItem> = Vec::new();
+            for item in &recording_position_items {
+                items.push(item);
+            }
+            Submenu::with_id_and_items("recording_position_menu", "水印位置", true, &items)?
+        };
+        let recording_fps_menu = {
+            let mut items: Vec<&dyn IsMenuItem> = Vec::new();
+            for item in &recording_fps_items {
+                items.push(item);
+            }
+            Submenu::with_id_and_items("recording_fps_menu", "帧率", true, &items)?
+        };
+        let recording_quality_menu = {
+            let mut items: Vec<&dyn IsMenuItem> = Vec::new();
+            for item in &recording_quality_items {
+                items.push(item);
+            }
+            Submenu::with_id_and_items("recording_quality_menu", "画质", true, &items)?
+        };
+        let recording_menu = Submenu::with_id_and_items(
+            "recording_menu",
+            "录屏",
+            true,
+            &[
+                &recording_status_item,
+                &recording_hotkey_hint,
+                &recording_audio_item,
+                &recording_mouse_item,
+                &recording_watermark_item,
+                &recording_set_watermark_text_item,
+                &recording_position_menu,
+                &recording_fps_menu,
+                &recording_quality_menu,
+            ],
         )?;
 
         let automation_status_item = MenuItem::with_id(
@@ -512,6 +663,7 @@ impl DesktopApp {
         let _ = tray_menu.append(&separator);
         let _ = tray_menu.append(&voice_menu);
         let _ = tray_menu.append(&capture_menu);
+        let _ = tray_menu.append(&recording_menu);
         let _ = tray_menu.append(&automation_menu);
         let _ = tray_menu.append(&learning_menu);
         let _ = tray_menu.append(&general_menu);
@@ -544,9 +696,18 @@ impl DesktopApp {
         self.automation_repeat_items = automation_repeat_items;
         self.automation_edit_names_item = Some(automation_edit_names_item);
         self.automation_open_dir_item = Some(automation_open_dir_item);
+        self.recording_status_item = Some(recording_status_item);
+        self.recording_audio_item = Some(recording_audio_item);
+        self.recording_mouse_item = Some(recording_mouse_item);
+        self.recording_watermark_item = Some(recording_watermark_item);
+        self.recording_set_watermark_text_item = Some(recording_set_watermark_text_item);
+        self.recording_position_items = recording_position_items;
+        self.recording_fps_items = recording_fps_items;
+        self.recording_quality_items = recording_quality_items;
         self.tray_icon = Some(tray_icon);
         self.overlay = overlay;
         self.sync_automation_menu();
+        self.sync_recording_menu();
         Ok(())
     }
 
@@ -570,6 +731,42 @@ impl DesktopApp {
         for (index, item) in self.automation_repeat_items.iter().enumerate() {
             let repeat_count = index + 1;
             item.set_checked(repeat_count == snapshot.repeat_count);
+        }
+    }
+
+    fn sync_recording_menu(&self) {
+        let Some(service) = &self.recording_service else {
+            return;
+        };
+        let snapshot = service.snapshot();
+
+        if let Some(item) = &self.recording_status_item {
+            item.set_text(&snapshot.status_line);
+        }
+        if let Some(item) = &self.recording_audio_item {
+            item.set_checked(self.runtime.config.recording.record_audio);
+        }
+        if let Some(item) = &self.recording_mouse_item {
+            item.set_checked(self.runtime.config.recording.capture_mouse);
+        }
+        if let Some(item) = &self.recording_watermark_item {
+            item.set_checked(self.runtime.config.recording.watermark.enabled);
+        }
+
+        for (index, item) in self.recording_position_items.iter().enumerate() {
+            if let Some(position) = ainput_recording::WATERMARK_POSITION_PRESETS.get(index) {
+                item.set_checked(*position == self.runtime.config.recording.watermark.position);
+            }
+        }
+        for (index, item) in self.recording_fps_items.iter().enumerate() {
+            if let Some(fps) = ainput_recording::FPS_PRESETS.get(index) {
+                item.set_checked(*fps == self.runtime.config.recording.fps);
+            }
+        }
+        for (index, item) in self.recording_quality_items.iter().enumerate() {
+            if let Some(quality) = ainput_recording::QUALITY_PRESETS.get(index) {
+                item.set_checked(*quality == self.runtime.config.recording.quality);
+            }
         }
     }
 
@@ -605,6 +802,42 @@ impl DesktopApp {
                     self.mode = AppMode::Idle;
                     self.set_tray_status("状态：待机中");
                 }
+            }
+        }
+    }
+
+    fn handle_recording_update(&mut self) {
+        let Some(service) = &self.recording_service else {
+            return;
+        };
+        let snapshot = service.snapshot();
+        self.sync_recording_menu();
+
+        match snapshot.activity {
+            RecordingActivity::Selecting => {
+                self.mode = AppMode::Recording;
+                self.set_tray_status("状态：录屏框选中");
+            }
+            RecordingActivity::Recording => {
+                self.mode = AppMode::Recording;
+                self.set_tray_status("状态：录屏中");
+            }
+            RecordingActivity::Stopping => {
+                self.mode = AppMode::Recording;
+                self.set_tray_status("状态：正在停止录屏");
+            }
+            RecordingActivity::Error => {
+                self.mode = AppMode::Idle;
+                self.set_tray_status(&format!(
+                    "状态：录屏错误 - {}",
+                    shorten(&snapshot.status_line, 16)
+                ));
+            }
+            RecordingActivity::Idle => {
+                if self.mode == AppMode::Recording {
+                    self.mode = AppMode::Idle;
+                }
+                self.set_tray_status_menu_only("状态：待机中");
             }
         }
     }
@@ -737,6 +970,35 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                         screenshot::start_capture_session(self.proxy.clone(), self.runtime.clone());
                     }
                 }
+                hotkey::HotkeyState::RecordingStartTriggered => {
+                    if self.mode == AppMode::Idle && self.runtime.config.recording.enabled {
+                        hotkey::reset_hotkey_state();
+                        self.mode = AppMode::Recording;
+                        if let Some(service) = &self.recording_service
+                            && let Err(error) =
+                                service.begin_recording(self.runtime.config.recording.clone())
+                        {
+                            self.mode = AppMode::Idle;
+                            self.set_tray_status(&format!(
+                                "状态：录屏启动失败 - {}",
+                                shorten(&error.to_string(), 16)
+                            ));
+                        }
+                    }
+                }
+                hotkey::HotkeyState::RecordingStopTriggered => {
+                    if let Some(service) = &self.recording_service {
+                        let snapshot = service.snapshot();
+                        if snapshot.activity == RecordingActivity::Recording
+                            && let Err(error) = service.stop_recording()
+                        {
+                            self.set_tray_status(&format!(
+                                "状态：录屏停止失败 - {}",
+                                shorten(&error.to_string(), 16)
+                            ));
+                        }
+                    }
+                }
             },
             AppEvent::Capture(capture_event) => match capture_event {
                 screenshot::CaptureEvent::Started => {
@@ -758,6 +1020,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 }
             },
             AppEvent::AutomationUpdated => self.handle_automation_update(),
+            AppEvent::RecordingUpdated => self.handle_recording_update(),
             AppEvent::OverlayTick => {
                 if let Some(overlay) = &mut self.overlay {
                     overlay.tick();
@@ -776,6 +1039,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
         self.shutdown.store(true, Ordering::Relaxed);
         self.hotkey_monitor = None;
         self.automation_service = None;
+        self.recording_service = None;
         if let Some(overlay) = &mut self.overlay {
             overlay.hide();
         }
@@ -787,6 +1051,9 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
 impl DesktopApp {
     fn handle_menu_event(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
         if self.handle_automation_menu_event(&event) {
+            return;
+        }
+        if self.handle_recording_menu_event(&event) {
             return;
         }
 
@@ -1017,6 +1284,195 @@ impl DesktopApp {
         false
     }
 
+    fn handle_recording_menu_event(&mut self, event: &MenuEvent) -> bool {
+        if self
+            .recording_set_watermark_text_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            match prompt_for_recording_watermark_text(&self.runtime.config.recording.watermark.text) {
+                Ok(Some(text)) => {
+                    let previous = self.runtime.config.recording.watermark.text.clone();
+                    self.runtime.config.recording.watermark.text = text;
+                    if let Err(error) =
+                        ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+                    {
+                        self.runtime.config.recording.watermark.text = previous;
+                        self.set_tray_status(&format!(
+                            "状态：保存录屏设置失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        ));
+                    } else {
+                        self.sync_recording_menu();
+                        self.set_tray_status("状态：已更新录屏水印文本");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：水印输入失败 - {}",
+                    shorten(&error.to_string(), 16)
+                )),
+            }
+            return true;
+        }
+
+        if self
+            .recording_audio_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            let next_enabled = !self.runtime.config.recording.record_audio;
+            let previous = self.runtime.config.recording.record_audio;
+            self.runtime.config.recording.record_audio = next_enabled;
+            if let Err(error) =
+                ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+            {
+                self.runtime.config.recording.record_audio = previous;
+                self.set_tray_status(&format!(
+                    "状态：保存录屏设置失败 - {}",
+                    shorten(&error.to_string(), 16)
+                ));
+            } else {
+                self.sync_recording_menu();
+                self.set_tray_status(if next_enabled {
+                    "状态：已开启录制系统音频"
+                } else {
+                    "状态：已关闭录制系统音频"
+                });
+            }
+            return true;
+        }
+
+        if self
+            .recording_mouse_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            let next_enabled = !self.runtime.config.recording.capture_mouse;
+            let previous = self.runtime.config.recording.capture_mouse;
+            self.runtime.config.recording.capture_mouse = next_enabled;
+            if let Err(error) =
+                ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+            {
+                self.runtime.config.recording.capture_mouse = previous;
+                self.set_tray_status(&format!(
+                    "状态：保存录屏设置失败 - {}",
+                    shorten(&error.to_string(), 16)
+                ));
+            } else {
+                self.sync_recording_menu();
+                self.set_tray_status(if next_enabled {
+                    "状态：已开启录制鼠标移动"
+                } else {
+                    "状态：已关闭录制鼠标移动"
+                });
+            }
+            return true;
+        }
+
+        if self
+            .recording_watermark_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            let next_enabled = !self.runtime.config.recording.watermark.enabled;
+            let previous = self.runtime.config.recording.watermark.enabled;
+            self.runtime.config.recording.watermark.enabled = next_enabled;
+            if let Err(error) =
+                ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+            {
+                self.runtime.config.recording.watermark.enabled = previous;
+                self.set_tray_status(&format!(
+                    "状态：保存录屏设置失败 - {}",
+                    shorten(&error.to_string(), 16)
+                ));
+            } else {
+                self.sync_recording_menu();
+                self.set_tray_status(if next_enabled {
+                    "状态：已开启录屏水印"
+                } else {
+                    "状态：已关闭录屏水印"
+                });
+            }
+            return true;
+        }
+
+        if let Some(index) = self
+            .recording_position_items
+            .iter()
+            .position(|item| event.id == *item.id())
+            && let Some(position) = ainput_recording::WATERMARK_POSITION_PRESETS.get(index)
+        {
+            let previous = self.runtime.config.recording.watermark.position;
+            self.runtime.config.recording.watermark.position = *position;
+            if let Err(error) =
+                ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+            {
+                self.runtime.config.recording.watermark.position = previous;
+                self.set_tray_status(&format!(
+                    "状态：保存录屏设置失败 - {}",
+                    shorten(&error.to_string(), 16)
+                ));
+            } else {
+                self.sync_recording_menu();
+                self.set_tray_status(&format!("状态：录屏水印已切到{}", position.label()));
+            }
+            return true;
+        }
+
+        if let Some(index) = self
+            .recording_fps_items
+            .iter()
+            .position(|item| event.id == *item.id())
+            && let Some(fps) = ainput_recording::FPS_PRESETS.get(index)
+        {
+            let previous = self.runtime.config.recording.fps;
+            self.runtime.config.recording.fps = *fps;
+            if let Err(error) =
+                ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+            {
+                self.runtime.config.recording.fps = previous;
+                self.set_tray_status(&format!(
+                    "状态：保存录屏设置失败 - {}",
+                    shorten(&error.to_string(), 16)
+                ));
+            } else {
+                self.sync_recording_menu();
+                self.set_tray_status(&format!("状态：录屏帧率已切到 {} FPS", fps));
+            }
+            return true;
+        }
+
+        if let Some(index) = self
+            .recording_quality_items
+            .iter()
+            .position(|item| event.id == *item.id())
+            && let Some(quality) = ainput_recording::QUALITY_PRESETS.get(index)
+        {
+            let previous = self.runtime.config.recording.quality;
+            self.runtime.config.recording.quality = *quality;
+            if let Err(error) =
+                ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+            {
+                self.runtime.config.recording.quality = previous;
+                self.set_tray_status(&format!(
+                    "状态：保存录屏设置失败 - {}",
+                    shorten(&error.to_string(), 16)
+                ));
+            } else {
+                self.sync_recording_menu();
+                self.set_tray_status(&format!("状态：录屏画质已切到{}", quality.label()));
+            }
+            return true;
+        }
+
+        false
+    }
+
     fn set_tray_status_from_result(&self, result: Result<()>, ok_status: &str) {
         match result {
             Ok(()) => self.set_tray_status(ok_status),
@@ -1218,4 +1674,29 @@ fn format_automation_slot_label(slot: &ainput_automation::SlotSnapshot) -> Strin
 
 fn format_automation_repeat_label(repeat_count: usize) -> String {
     format!("回放轮数 {repeat_count}")
+}
+
+fn prompt_for_recording_watermark_text(current: &str) -> Result<Option<String>> {
+    let escaped_default = current.replace('\'', "''");
+    let script = format!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Add-Type -AssemblyName Microsoft.VisualBasic; $v=[Microsoft.VisualBasic.Interaction]::InputBox('请输入录屏水印文本','ainput 录屏水印','{escaped_default}'); Write-Output $v"
+    );
+    let output = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(script)
+        .output()
+        .context("打开录屏水印输入框失败")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("录屏水印输入框失败: {}", stderr.trim()));
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
