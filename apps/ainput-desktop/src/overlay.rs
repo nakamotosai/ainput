@@ -32,6 +32,7 @@ pub struct RecordingOverlay {
     fill_window: OverlayWindow,
     shown: bool,
     visible_target: bool,
+    pulse_enabled: bool,
     current_visibility: f32,
     level_target: f32,
     current_level: f32,
@@ -100,6 +101,7 @@ impl RecordingOverlay {
                 fill_window,
                 shown: false,
                 visible_target: false,
+                pulse_enabled: true,
                 current_visibility: 0.0,
                 level_target: 0.0,
                 current_level: 0.0,
@@ -116,17 +118,22 @@ impl RecordingOverlay {
     pub fn hide(&mut self) {
         self.visible_target = false;
         self.level_target = 0.0;
+        self.pulse_enabled = true;
     }
 
     pub fn set_level(&mut self, level: f32) {
         self.level_target = level.clamp(0.0, 1.0);
     }
 
+    pub fn set_pulse_enabled(&mut self, enabled: bool) {
+        self.pulse_enabled = enabled;
+    }
+
     pub fn tick(&mut self) {
         let visibility_target = if self.visible_target { 1.0 } else { 0.0 };
         self.current_visibility = smooth_step(self.current_visibility, visibility_target, 0.20);
 
-        let pulse = if self.visible_target {
+        let pulse = if self.visible_target && self.pulse_enabled {
             0.07 + 0.03 * ((self.started_at.elapsed().as_secs_f32() * 5.0).sin() * 0.5 + 0.5)
         } else {
             0.0

@@ -7,7 +7,7 @@ mod overlay;
 mod screenshot;
 mod worker;
 
-use ainput_automation::{AutomationActivity, AutomationService};
+use ainput_automation::{AutomationActivity, AutomationService, AutomationSnapshot};
 use ainput_recording::{RecordingActivity, RecordingService};
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
@@ -223,6 +223,17 @@ enum AppMode {
     Recording,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrayVisualState {
+    Idle,
+    Voice,
+    ScreenRecording,
+    AutomationRecording,
+    AutomationPlaying,
+    AutomationPaused,
+    Error,
+}
+
 struct DesktopApp {
     runtime: AppRuntime,
     proxy: EventLoopProxy<AppEvent>,
@@ -237,6 +248,8 @@ struct DesktopApp {
     overlay: Option<overlay::RecordingOverlay>,
     overlay_available: bool,
     mode: AppMode,
+    tray_visual_state: TrayVisualState,
+    tray_visual_frame: u8,
     exit_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
     learn_terms_item: Option<MenuItem>,
@@ -274,6 +287,8 @@ impl DesktopApp {
             overlay: None,
             overlay_available: true,
             mode: AppMode::Idle,
+            tray_visual_state: TrayVisualState::Idle,
+            tray_visual_frame: 0,
             exit_item: None,
             status_item: None,
             learn_terms_item: None,
@@ -340,6 +355,18 @@ impl DesktopApp {
         }
 
         self.set_tray_status_menu_only(status);
+    }
+
+    fn set_tray_visual_state(&mut self, state: TrayVisualState, frame: u8) {
+        if self.tray_visual_state == state && self.tray_visual_frame == frame {
+            return;
+        }
+
+        self.tray_visual_state = state;
+        self.tray_visual_frame = frame;
+        if let Some(tray_icon) = &self.tray_icon {
+            let _ = tray_icon.set_icon(Some(app_status_icon(&self.runtime, state, frame)));
+        }
     }
 
     fn set_tray_status_menu_only(&self, status: &str) {
@@ -671,7 +698,7 @@ impl DesktopApp {
 
         let tray_icon = TrayIconBuilder::new()
             .with_tooltip("ainput\n待机中")
-            .with_icon(app_icon(&self.runtime))
+            .with_icon(app_status_icon(&self.runtime, TrayVisualState::Idle, 0))
             .with_menu(Box::new(tray_menu))
             .build()
             .map_err(|error| anyhow!("create tray icon: {error}"))?;
@@ -706,6 +733,8 @@ impl DesktopApp {
         self.recording_quality_items = recording_quality_items;
         self.tray_icon = Some(tray_icon);
         self.overlay = overlay;
+        self.set_tray_visual_state(TrayVisualState::Idle, 0);
+        hotkey::set_automation_cancel_enabled(false);
         self.sync_automation_menu();
         self.sync_recording_menu();
         Ok(())
@@ -715,6 +744,7 @@ impl DesktopApp {
         let Some(service) = &self.automation_service else {
             return;
         };
+        let _ = service.refresh_slot_names();
         let snapshot = service.snapshot();
 
         if let Some(item) = &self.automation_status_item {
@@ -770,38 +800,96 @@ impl DesktopApp {
         }
     }
 
+    fn automation_hotkeys_allowed(&self) -> bool {
+        !matches!(
+            self.mode,
+            AppMode::Voice | AppMode::Capture | AppMode::Recording
+        )
+    }
+
+    fn automation_cancel_enabled(snapshot: &AutomationSnapshot) -> bool {
+        matches!(
+            snapshot.activity,
+            AutomationActivity::Recording
+                | AutomationActivity::Playing
+                | AutomationActivity::Paused
+        )
+    }
+
+    fn automation_tray_frame(snapshot: &AutomationSnapshot) -> u8 {
+        ((snapshot.elapsed_ms / 280) % 2) as u8
+    }
+
+    fn refresh_automation_overlay(&mut self, snapshot: &AutomationSnapshot) {
+        let Some(overlay) = &mut self.overlay else {
+            return;
+        };
+
+        match snapshot.activity {
+            AutomationActivity::Recording => {
+                overlay.set_pulse_enabled(true);
+                overlay.set_level(0.0);
+                overlay.show();
+            }
+            AutomationActivity::Playing => {
+                overlay.set_pulse_enabled(false);
+                overlay.set_level(snapshot.progress_ratio.unwrap_or(0.0));
+                overlay.show();
+            }
+            AutomationActivity::Paused => {
+                overlay.set_pulse_enabled(false);
+                overlay.set_level(snapshot.progress_ratio.unwrap_or(0.0));
+                overlay.show();
+            }
+            AutomationActivity::Idle | AutomationActivity::Error => {
+                overlay.set_level(0.0);
+                overlay.hide();
+            }
+        }
+    }
+
     fn handle_automation_update(&mut self) {
         let Some(service) = &self.automation_service else {
             return;
         };
         let snapshot = service.snapshot();
+        hotkey::set_automation_cancel_enabled(Self::automation_cancel_enabled(&snapshot));
         self.sync_automation_menu();
+        self.refresh_automation_overlay(&snapshot);
 
         match snapshot.activity {
             AutomationActivity::Recording => {
                 self.mode = AppMode::Automation;
-                self.set_tray_status("状态：按键精灵录制中");
+                self.set_tray_visual_state(
+                    TrayVisualState::AutomationRecording,
+                    Self::automation_tray_frame(&snapshot),
+                );
+                self.set_tray_status(&snapshot.status_line);
             }
             AutomationActivity::Playing => {
                 self.mode = AppMode::Automation;
-                self.set_tray_status("状态：按键精灵回放中");
+                self.set_tray_visual_state(
+                    TrayVisualState::AutomationPlaying,
+                    Self::automation_tray_frame(&snapshot),
+                );
+                self.set_tray_status(&snapshot.status_line);
             }
             AutomationActivity::Paused => {
                 self.mode = AppMode::Automation;
-                self.set_tray_status("状态：按键精灵已暂停");
+                self.set_tray_visual_state(TrayVisualState::AutomationPaused, 0);
+                self.set_tray_status(&snapshot.status_line);
             }
             AutomationActivity::Error => {
                 self.mode = AppMode::Idle;
-                self.set_tray_status(&format!(
-                    "状态：按键精灵错误 - {}",
-                    shorten(&snapshot.status_line, 14)
-                ));
+                self.set_tray_visual_state(TrayVisualState::Error, 0);
+                self.set_tray_status(&snapshot.status_line);
             }
             AutomationActivity::Idle => {
                 if self.mode == AppMode::Automation {
                     self.mode = AppMode::Idle;
-                    self.set_tray_status("状态：待机中");
                 }
+                self.set_tray_visual_state(TrayVisualState::Idle, 0);
+                self.set_tray_status(&snapshot.status_line);
             }
         }
     }
@@ -816,18 +904,22 @@ impl DesktopApp {
         match snapshot.activity {
             RecordingActivity::Selecting => {
                 self.mode = AppMode::Recording;
+                self.set_tray_visual_state(TrayVisualState::ScreenRecording, 0);
                 self.set_tray_status("状态：录屏框选中");
             }
             RecordingActivity::Recording => {
                 self.mode = AppMode::Recording;
+                self.set_tray_visual_state(TrayVisualState::ScreenRecording, 1);
                 self.set_tray_status("状态：录屏中");
             }
             RecordingActivity::Stopping => {
                 self.mode = AppMode::Recording;
+                self.set_tray_visual_state(TrayVisualState::ScreenRecording, 0);
                 self.set_tray_status("状态：正在停止录屏");
             }
             RecordingActivity::Error => {
                 self.mode = AppMode::Idle;
+                self.set_tray_visual_state(TrayVisualState::Error, 0);
                 self.set_tray_status(&format!(
                     "状态：录屏错误 - {}",
                     shorten(&snapshot.status_line, 16)
@@ -837,6 +929,7 @@ impl DesktopApp {
                 if self.mode == AppMode::Recording {
                     self.mode = AppMode::Idle;
                 }
+                self.set_tray_visual_state(TrayVisualState::Idle, 0);
                 self.set_tray_status_menu_only("状态：待机中");
             }
         }
@@ -897,21 +990,26 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             AppEvent::Worker(worker_event) => match worker_event {
                 WorkerEvent::Started => {
                     self.mode = AppMode::Idle;
+                    self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：待机中");
                 }
                 WorkerEvent::RecordingStarted => {
                     self.mode = AppMode::Voice;
+                    self.set_tray_visual_state(TrayVisualState::Voice, 0);
                     self.set_tray_status("状态：正在录音");
                     if let Some(overlay) = &mut self.overlay {
+                        overlay.set_pulse_enabled(true);
                         overlay.show();
                     }
                 }
                 WorkerEvent::Meter(level) => {
                     if let Some(overlay) = &mut self.overlay {
+                        overlay.set_pulse_enabled(true);
                         overlay.set_level(level);
                     }
                 }
                 WorkerEvent::RecordingStopped => {
+                    self.set_tray_visual_state(TrayVisualState::Voice, 1);
                     self.set_tray_status("状态：录音结束");
                     if let Some(overlay) = &mut self.overlay {
                         overlay.set_level(0.0);
@@ -920,22 +1018,27 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 }
                 WorkerEvent::Transcribing => {
                     self.mode = AppMode::Voice;
+                    self.set_tray_visual_state(TrayVisualState::Voice, 1);
                     self.set_tray_status("状态：正在识别");
                 }
                 WorkerEvent::IgnoredSilence => {
                     self.mode = AppMode::Idle;
+                    self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：待机中");
                 }
                 WorkerEvent::Delivered => {
                     self.mode = AppMode::Idle;
+                    self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：文本已直贴");
                 }
                 WorkerEvent::ClipboardFallback => {
                     self.mode = AppMode::Idle;
+                    self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：已复制到剪贴板");
                 }
                 WorkerEvent::Error(message) => {
                     self.mode = AppMode::Idle;
+                    self.set_tray_visual_state(TrayVisualState::Error, 0);
                     if let Some(overlay) = &mut self.overlay {
                         overlay.set_level(0.0);
                         overlay.hide();
@@ -999,6 +1102,60 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                         }
                     }
                 }
+                hotkey::HotkeyState::AutomationPauseTriggered => {
+                    if self.automation_hotkeys_allowed()
+                        && let Some(service) = &self.automation_service
+                    {
+                        service.toggle_pause_playback();
+                    }
+                }
+                hotkey::HotkeyState::AutomationRecordTriggered => {
+                    if self.automation_hotkeys_allowed()
+                        && let Some(service) = &self.automation_service
+                        && let Err(error) = service.start_recording()
+                    {
+                        self.set_tray_visual_state(TrayVisualState::Error, 0);
+                        self.set_tray_status(&format!(
+                            "状态：按键精灵录制失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        ));
+                    }
+                }
+                hotkey::HotkeyState::AutomationStopTriggered => {
+                    if self.automation_hotkeys_allowed()
+                        && let Some(service) = &self.automation_service
+                        && let Err(error) = service.stop_recording()
+                    {
+                        self.set_tray_visual_state(TrayVisualState::Error, 0);
+                        self.set_tray_status(&format!(
+                            "状态：按键精灵保存失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        ));
+                    }
+                }
+                hotkey::HotkeyState::AutomationPlayTriggered => {
+                    if self.automation_hotkeys_allowed()
+                        && let Some(service) = &self.automation_service
+                        && let Err(error) = service.start_playback()
+                    {
+                        self.set_tray_visual_state(TrayVisualState::Error, 0);
+                        self.set_tray_status(&format!(
+                            "状态：按键精灵回放失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        ));
+                    }
+                }
+                hotkey::HotkeyState::AutomationCancelTriggered => {
+                    if let Some(service) = &self.automation_service
+                        && let Err(error) = service.stop_active()
+                    {
+                        self.set_tray_visual_state(TrayVisualState::Error, 0);
+                        self.set_tray_status(&format!(
+                            "状态：按键精灵停止失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        ));
+                    }
+                }
             },
             AppEvent::Capture(capture_event) => match capture_event {
                 screenshot::CaptureEvent::Started => {
@@ -1022,6 +1179,26 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             AppEvent::AutomationUpdated => self.handle_automation_update(),
             AppEvent::RecordingUpdated => self.handle_recording_update(),
             AppEvent::OverlayTick => {
+                if self.mode == AppMode::Automation
+                    && let Some(service) = &self.automation_service
+                {
+                    let snapshot = service.snapshot();
+                    self.refresh_automation_overlay(&snapshot);
+                    match snapshot.activity {
+                        AutomationActivity::Recording => self.set_tray_visual_state(
+                            TrayVisualState::AutomationRecording,
+                            Self::automation_tray_frame(&snapshot),
+                        ),
+                        AutomationActivity::Playing => self.set_tray_visual_state(
+                            TrayVisualState::AutomationPlaying,
+                            Self::automation_tray_frame(&snapshot),
+                        ),
+                        AutomationActivity::Paused => {
+                            self.set_tray_visual_state(TrayVisualState::AutomationPaused, 0)
+                        }
+                        AutomationActivity::Idle | AutomationActivity::Error => {}
+                    }
+                }
                 if let Some(overlay) = &mut self.overlay {
                     overlay.tick();
                 }
@@ -1038,6 +1215,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.hotkey_monitor = None;
+        hotkey::set_automation_cancel_enabled(false);
         self.automation_service = None;
         self.recording_service = None;
         if let Some(overlay) = &mut self.overlay {
@@ -1231,6 +1409,7 @@ impl DesktopApp {
             .map(|item| event.id == *item.id())
             .unwrap_or(false)
         {
+            let _ = service.refresh_slot_names();
             self.set_tray_status_from_result(
                 service.open_slot_names_file(),
                 "状态：已打开按键精灵槽位名称",
@@ -1291,7 +1470,8 @@ impl DesktopApp {
             .map(|item| event.id == *item.id())
             .unwrap_or(false)
         {
-            match prompt_for_recording_watermark_text(&self.runtime.config.recording.watermark.text) {
+            match prompt_for_recording_watermark_text(&self.runtime.config.recording.watermark.text)
+            {
                 Ok(Some(text)) => {
                     let previous = self.runtime.config.recording.watermark.text.clone();
                     self.runtime.config.recording.watermark.text = text;
@@ -1529,6 +1709,13 @@ impl DesktopApp {
     }
 }
 
+fn app_status_icon(runtime: &AppRuntime, state: TrayVisualState, frame: u8) -> Icon {
+    if state == TrayVisualState::Idle {
+        return app_icon(runtime);
+    }
+    animated_status_icon(state, frame)
+}
+
 fn app_icon(runtime: &AppRuntime) -> Icon {
     let icon_path = runtime
         .runtime_paths
@@ -1548,8 +1735,23 @@ fn app_icon(runtime: &AppRuntime) -> Icon {
 }
 
 fn fallback_app_icon() -> Icon {
+    animated_status_icon(TrayVisualState::Idle, 0)
+}
+
+fn animated_status_icon(state: TrayVisualState, frame: u8) -> Icon {
     let size = 32u32;
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    let pulse = if frame % 2 == 0 { 0.78 } else { 1.0 };
+
+    let (outer_r, outer_g, outer_b, inner_r, inner_g, inner_b) = match state {
+        TrayVisualState::Idle => (14, 52, 146, 22, 93, 255),
+        TrayVisualState::Voice => (18, 87, 214, 91, 184, 255),
+        TrayVisualState::ScreenRecording => (120, 26, 26, 239, 68, 68),
+        TrayVisualState::AutomationRecording => (128, 29, 29, 255, 92, 92),
+        TrayVisualState::AutomationPlaying => (20, 92, 42, 56, 196, 96),
+        TrayVisualState::AutomationPaused => (140, 90, 18, 247, 189, 49),
+        TrayVisualState::Error => (113, 57, 10, 245, 125, 39),
+    };
 
     for y in 0..size {
         for x in 0..size {
@@ -1558,14 +1760,56 @@ fn fallback_app_icon() -> Icon {
             let distance = (dx * dx + dy * dy).sqrt();
 
             let (r, g, b, a) = if distance < 13.5 {
-                (22, 93, 255, 255)
+                (
+                    (inner_r as f32 * pulse).round() as u8,
+                    (inner_g as f32 * pulse).round() as u8,
+                    (inner_b as f32 * pulse).round() as u8,
+                    255,
+                )
             } else if distance < 15.5 {
-                (14, 52, 146, 255)
+                (outer_r, outer_g, outer_b, 255)
             } else {
                 (0, 0, 0, 0)
             };
 
-            rgba.extend_from_slice(&[r, g, b, a]);
+            let mut pixel = [r, g, b, a];
+            match state {
+                TrayVisualState::AutomationPlaying => {
+                    if x >= 13 && x <= 21 && y >= 10 && y <= 22 && x - 12 >= (y - 10) / 2 {
+                        pixel = [255, 255, 255, 255];
+                    }
+                }
+                TrayVisualState::AutomationPaused => {
+                    if ((x >= 11 && x <= 13) || (x >= 18 && x <= 20)) && y >= 10 && y <= 22 {
+                        pixel = [255, 255, 255, 255];
+                    }
+                }
+                TrayVisualState::AutomationRecording | TrayVisualState::ScreenRecording => {
+                    let badge_dx = x as f32 - 16.0;
+                    let badge_dy = y as f32 - 16.0;
+                    if (badge_dx * badge_dx + badge_dy * badge_dy).sqrt() < 5.0 {
+                        pixel = [255, 255, 255, 255];
+                    }
+                }
+                TrayVisualState::Error => {
+                    if (x >= 10 && x <= 21 && y >= 10 && y <= 21)
+                        && ((x as i32 - y as i32).abs() <= 1 || ((x + y) as i32 - 31).abs() <= 1)
+                    {
+                        pixel = [255, 255, 255, 255];
+                    }
+                }
+                TrayVisualState::Voice => {
+                    if x >= 14 && x <= 18 && y >= 9 && y <= 18 {
+                        pixel = [255, 255, 255, 255];
+                    }
+                    if x >= 12 && x <= 20 && y >= 18 && y <= 20 {
+                        pixel = [255, 255, 255, 255];
+                    }
+                }
+                TrayVisualState::Idle => {}
+            }
+
+            rgba.extend_from_slice(&pixel);
         }
     }
 

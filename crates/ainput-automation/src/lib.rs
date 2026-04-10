@@ -1,10 +1,10 @@
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -13,11 +13,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{PROCESS_PER_MONITOR_DPI_AWARE, SetProcessDpiAwareness};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEINPUT, SendInput, VK_ESCAPE, VK_F7, VK_F8, VK_F9, VK_F10,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+    VK_ESCAPE, VK_F7, VK_F8, VK_F9, VK_F10,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -29,8 +29,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-const HOTKEY_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const SLOT_NAME_WATCH_INTERVAL: Duration = Duration::from_millis(400);
 const PLAYBACK_WAIT_SLICE: Duration = Duration::from_millis(10);
+const PLAYBACK_PAUSE_SLICE: Duration = Duration::from_millis(30);
 const SLOT_COUNT: usize = 10;
 const REPEAT_COUNT_MAX: usize = 5;
 const CONTROL_VKEYS: [u32; 5] = [
@@ -70,7 +71,11 @@ pub struct AutomationSnapshot {
     pub activity: AutomationActivity,
     pub status_line: String,
     pub active_slot: usize,
+    pub active_slot_label: String,
     pub repeat_count: usize,
+    pub elapsed_ms: u64,
+    pub total_ms: Option<u64>,
+    pub progress_ratio: Option<f32>,
     pub slots: Vec<SlotSnapshot>,
 }
 
@@ -143,6 +148,8 @@ struct AppState {
     shutdown_requested: AtomicBool,
     active_slot: AtomicUsize,
     repeat_count: AtomicUsize,
+    playback_elapsed_ms: AtomicU64,
+    playback_total_ms: AtomicU64,
     base_dir: PathBuf,
     notify: Arc<UpdateCallback>,
 }
@@ -161,26 +168,44 @@ impl AppState {
             shutdown_requested: AtomicBool::new(false),
             active_slot: AtomicUsize::new(1),
             repeat_count: AtomicUsize::new(1),
+            playback_elapsed_ms: AtomicU64::new(0),
+            playback_total_ms: AtomicU64::new(0),
             base_dir,
             notify,
         }
     }
 
-    fn start_recording(&self) {
+    fn start_recording(&self) -> Result<()> {
+        self.ensure_slot_names_loaded()?;
+
         if self.playing.load(Ordering::SeqCst) {
-            self.set_status(AutomationActivity::Error, "按键精灵：回放中，不能开始录制");
-            return;
+            let message = "按键精灵：回放中，不能开始录制";
+            self.set_status(AutomationActivity::Error, message);
+            return Err(anyhow!(message));
+        }
+        if self.recording.load(Ordering::SeqCst) {
+            self.set_status(
+                AutomationActivity::Recording,
+                format!("按键精灵：正在录制 {}", self.slot_label(self.active_slot())),
+            );
+            return Ok(());
         }
 
+        let slot = self.active_slot();
         let mut recorder = self.recorder.lock().expect("recorder lock poisoned");
         recorder.events.clear();
         recorder.started_at = Some(Instant::now());
-        recorder.slot = self.active_slot();
+        recorder.slot = slot;
+        drop(recorder);
+
+        self.playback_elapsed_ms.store(0, Ordering::SeqCst);
+        self.playback_total_ms.store(0, Ordering::SeqCst);
         self.recording.store(true, Ordering::SeqCst);
         self.set_status(
             AutomationActivity::Recording,
-            format!("按键精灵：开始录制 {}", self.slot_label(recorder.slot)),
+            format!("按键精灵：开始录制 {}", self.slot_label(slot)),
         );
+        Ok(())
     }
 
     fn stop_recording(&self) -> Result<()> {
@@ -188,41 +213,47 @@ impl AppState {
             return Ok(());
         }
 
-        let recorder = self.recorder.lock().expect("recorder lock poisoned");
-        let path = self.slot_path(recorder.slot);
+        let (slot, event_count, payload) = {
+            let mut recorder = self.recorder.lock().expect("recorder lock poisoned");
+            recorder.started_at = None;
+            let slot = recorder.slot;
+            let event_count = recorder.events.len();
+            let payload = serde_json::to_string_pretty(&recorder.events)?;
+            (slot, event_count, payload)
+        };
+
+        let path = self.slot_path(slot);
         fs::create_dir_all(self.slots_dir()).with_context(|| {
             format!("create automation slots dir {}", self.slots_dir().display())
         })?;
-        let payload = serde_json::to_string_pretty(&recorder.events)?;
         fs::write(&path, payload)
             .with_context(|| format!("write automation slot {}", path.display()))?;
         self.set_status(
             AutomationActivity::Idle,
             format!(
                 "按键精灵：已保存 {}（{} 条事件）",
-                self.slot_label(recorder.slot),
-                recorder.events.len()
+                self.slot_label(slot),
+                event_count
             ),
         );
         Ok(())
     }
 
-    fn stop_recording_or_playback(&self) {
+    fn stop_active(&self) -> Result<()> {
         if self.recording.load(Ordering::SeqCst) {
-            if let Err(error) = self.stop_recording() {
-                self.set_status(AutomationActivity::Error, format!("按键精灵：{error}"));
-            }
-            return;
+            self.stop_recording()?;
+            return Ok(());
         }
 
         self.stop_playback();
+        Ok(())
     }
 
     fn stop_playback(&self) {
         if self.playing.load(Ordering::SeqCst) {
             self.paused_playback.store(false, Ordering::SeqCst);
             self.stop_playback.store(true, Ordering::SeqCst);
-            self.set_status(AutomationActivity::Idle, "按键精灵：已请求中止回放");
+            self.set_status(AutomationActivity::Idle, "按键精灵：已请求停止回放");
         }
     }
 
@@ -231,16 +262,17 @@ impl AppState {
             return;
         }
 
+        let slot_label = self.slot_label(self.active_slot());
         if self.paused_playback.swap(false, Ordering::SeqCst) {
             self.set_status(
                 AutomationActivity::Playing,
-                format!("按键精灵：继续回放 {}", self.slot_label(self.active_slot())),
+                format!("按键精灵：继续回放 {}", slot_label),
             );
         } else {
             self.paused_playback.store(true, Ordering::SeqCst);
             self.set_status(
                 AutomationActivity::Paused,
-                format!("按键精灵：已暂停 {}", self.slot_label(self.active_slot())),
+                format!("按键精灵：已暂停 {}", slot_label),
             );
         }
     }
@@ -278,12 +310,14 @@ impl AppState {
         self.repeat_count.load(Ordering::SeqCst)
     }
 
-    fn select_slot(&self, slot: usize) {
+    fn select_slot(&self, slot: usize) -> Result<()> {
+        self.ensure_slot_names_loaded()?;
         self.active_slot.store(slot, Ordering::SeqCst);
         self.set_status(
             AutomationActivity::Idle,
             format!("按键精灵：已切换到 {}", self.slot_label(slot)),
         );
+        Ok(())
     }
 
     fn select_repeat_count(&self, repeat_count: usize) {
@@ -311,6 +345,25 @@ impl AppState {
     }
 
     fn ensure_slot_names_loaded(&self) -> Result<()> {
+        let names = self.read_slot_names_from_disk()?;
+        let mut guard = self.slot_names.lock().expect("slot names lock poisoned");
+        *guard = names;
+        Ok(())
+    }
+
+    fn refresh_slot_names(&self) -> Result<bool> {
+        let names = self.read_slot_names_from_disk()?;
+        let mut guard = self.slot_names.lock().expect("slot names lock poisoned");
+        if *guard == names {
+            return Ok(false);
+        }
+        *guard = names;
+        drop(guard);
+        self.notify_only();
+        Ok(true)
+    }
+
+    fn read_slot_names_from_disk(&self) -> Result<Vec<String>> {
         fs::create_dir_all(&self.base_dir)
             .with_context(|| format!("create automation base dir {}", self.base_dir.display()))?;
 
@@ -335,10 +388,7 @@ impl AppState {
         } else if names.len() > SLOT_COUNT {
             names.truncate(SLOT_COUNT);
         }
-
-        let mut guard = self.slot_names.lock().expect("slot names lock poisoned");
-        *guard = names;
-        Ok(())
+        Ok(names)
     }
 
     fn slot_label(&self, slot: usize) -> String {
@@ -361,9 +411,21 @@ impl AppState {
         open_path(&self.slots_dir())
     }
 
+    fn set_playback_progress(&self, elapsed_ms: u64, total_ms: u64) {
+        self.playback_elapsed_ms.store(elapsed_ms, Ordering::SeqCst);
+        self.playback_total_ms.store(total_ms, Ordering::SeqCst);
+    }
+
+    fn clear_playback_progress(&self) {
+        self.playback_elapsed_ms.store(0, Ordering::SeqCst);
+        self.playback_total_ms.store(0, Ordering::SeqCst);
+    }
+
     fn snapshot(&self) -> AutomationSnapshot {
+        let activity = *self.activity.lock().expect("activity lock poisoned");
         let active_slot = self.active_slot();
         let repeat_count = self.repeat_count();
+        let active_slot_label = self.slot_label(active_slot);
         let slots = (1..=SLOT_COUNT)
             .map(|slot| SlotSnapshot {
                 slot,
@@ -372,15 +434,32 @@ impl AppState {
             })
             .collect();
 
+        let (elapsed_ms, total_ms, progress_ratio) = match activity {
+            AutomationActivity::Recording => (self.current_offset_ms().unwrap_or(0), None, None),
+            AutomationActivity::Playing | AutomationActivity::Paused => {
+                let elapsed_ms = self.playback_elapsed_ms.load(Ordering::SeqCst);
+                let total_ms = self.playback_total_ms.load(Ordering::SeqCst);
+                let total_ms = (total_ms > 0).then_some(total_ms);
+                let progress_ratio =
+                    total_ms.map(|total| (elapsed_ms as f32 / total as f32).clamp(0.0, 1.0));
+                (elapsed_ms, total_ms, progress_ratio)
+            }
+            AutomationActivity::Idle | AutomationActivity::Error => (0, None, None),
+        };
+
         AutomationSnapshot {
-            activity: *self.activity.lock().expect("activity lock poisoned"),
+            activity,
             status_line: self
                 .status_line
                 .lock()
                 .expect("status lock poisoned")
                 .clone(),
             active_slot,
+            active_slot_label,
             repeat_count,
+            elapsed_ms,
+            total_ms,
+            progress_ratio,
             slots,
         }
     }
@@ -388,6 +467,10 @@ impl AppState {
     fn set_status<S: Into<String>>(&self, activity: AutomationActivity, status_line: S) {
         *self.activity.lock().expect("activity lock poisoned") = activity;
         *self.status_line.lock().expect("status lock poisoned") = status_line.into();
+        self.notify_only();
+    }
+
+    fn notify_only(&self) {
         (self.notify)();
     }
 }
@@ -396,7 +479,7 @@ pub struct AutomationService {
     state: Arc<AppState>,
     hook_thread_id: u32,
     hook_join_handle: Option<thread::JoinHandle<()>>,
-    hotkey_join_handle: Option<thread::JoinHandle<()>>,
+    slot_name_watch_join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl AutomationService {
@@ -453,8 +536,9 @@ impl AutomationService {
             .recv()
             .map_err(|_| anyhow!("read automation hook thread id failed"))?;
 
-        let poll_state = state.clone();
-        let hotkey_join_handle = thread::spawn(move || spawn_hotkey_loop(poll_state));
+        let watch_state = state.clone();
+        let slot_name_watch_join_handle =
+            thread::spawn(move || spawn_slot_name_watch_loop(watch_state));
 
         state.set_status(AutomationActivity::Idle, default_status_line());
 
@@ -462,7 +546,7 @@ impl AutomationService {
             state,
             hook_thread_id,
             hook_join_handle: Some(hook_join_handle),
-            hotkey_join_handle: Some(hotkey_join_handle),
+            slot_name_watch_join_handle: Some(slot_name_watch_join_handle),
         })
     }
 
@@ -470,12 +554,31 @@ impl AutomationService {
         self.state.snapshot()
     }
 
+    pub fn start_recording(&self) -> Result<()> {
+        self.state.start_recording()
+    }
+
+    pub fn stop_recording(&self) -> Result<()> {
+        self.state.stop_recording()
+    }
+
+    pub fn start_playback(&self) -> Result<()> {
+        start_playback(self.state.clone())
+    }
+
+    pub fn toggle_pause_playback(&self) {
+        self.state.toggle_pause_playback();
+    }
+
+    pub fn stop_active(&self) -> Result<()> {
+        self.state.stop_active()
+    }
+
     pub fn select_slot(&self, slot: usize) -> Result<()> {
         if !(1..=SLOT_COUNT).contains(&slot) {
             return Err(anyhow!("invalid automation slot {slot}"));
         }
-        self.state.select_slot(slot);
-        Ok(())
+        self.state.select_slot(slot)
     }
 
     pub fn select_repeat_count(&self, repeat_count: usize) -> Result<()> {
@@ -493,6 +596,11 @@ impl AutomationService {
     pub fn open_slots_dir(&self) -> Result<()> {
         self.state.open_slots_dir()
     }
+
+    pub fn refresh_slot_names(&self) -> Result<()> {
+        let _ = self.state.refresh_slot_names()?;
+        Ok(())
+    }
 }
 
 impl Drop for AutomationService {
@@ -500,7 +608,7 @@ impl Drop for AutomationService {
         self.state.shutdown_requested.store(true, Ordering::SeqCst);
         self.state.stop_playback.store(true, Ordering::SeqCst);
         let _ = unsafe { PostThreadMessageW(self.hook_thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
-        if let Some(handle) = self.hotkey_join_handle.take() {
+        if let Some(handle) = self.slot_name_watch_join_handle.take() {
             let _ = handle.join();
         }
         if let Some(handle) = self.hook_join_handle.take() {
@@ -509,52 +617,27 @@ impl Drop for AutomationService {
     }
 }
 
-fn spawn_hotkey_loop(state: Arc<AppState>) {
-    let mut last_f7 = false;
-    let mut last_f8 = false;
-    let mut last_f9 = false;
-    let mut last_f10 = false;
-    let mut last_esc = false;
-
+fn spawn_slot_name_watch_loop(state: Arc<AppState>) {
+    let mut last_modified = slot_names_modified_at(&state.slot_names_path());
     loop {
         if state.shutdown_requested.load(Ordering::SeqCst) {
             break;
         }
 
-        let f7 = is_virtual_key_down(VK_F7.0 as i32);
-        let f8 = is_virtual_key_down(VK_F8.0 as i32);
-        let f9 = is_virtual_key_down(VK_F9.0 as i32);
-        let f10 = is_virtual_key_down(VK_F10.0 as i32);
-        let esc = is_virtual_key_down(VK_ESCAPE.0 as i32);
-
-        if f7 && !last_f7 {
-            state.toggle_pause_playback();
-        }
-        if f8 && !last_f8 {
-            state.start_recording();
-        }
-        if f9 && !last_f9 {
-            if let Err(error) = state.stop_recording() {
+        let current_modified = slot_names_modified_at(&state.slot_names_path());
+        if current_modified != last_modified {
+            last_modified = current_modified;
+            if let Err(error) = state.refresh_slot_names() {
                 state.set_status(AutomationActivity::Error, format!("按键精灵：{error}"));
             }
         }
-        if f10 && !last_f10 {
-            if let Err(error) = start_playback(state.clone()) {
-                state.set_status(AutomationActivity::Error, format!("按键精灵：{error}"));
-            }
-        }
-        if esc && !last_esc {
-            state.stop_recording_or_playback();
-        }
 
-        last_f7 = f7;
-        last_f8 = f8;
-        last_f9 = f9;
-        last_f10 = f10;
-        last_esc = esc;
-
-        thread::sleep(HOTKEY_POLL_INTERVAL);
+        thread::sleep(SLOT_NAME_WATCH_INTERVAL);
     }
+}
+
+fn slot_names_modified_at(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
 }
 
 fn start_playback(state: Arc<AppState>) -> Result<()> {
@@ -562,24 +645,61 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
         return Err(anyhow!("录制中，不能开始回放"));
     }
     if state.playing.swap(true, Ordering::SeqCst) {
+        state.set_status(
+            if state.paused_playback.load(Ordering::SeqCst) {
+                AutomationActivity::Paused
+            } else {
+                AutomationActivity::Playing
+            },
+            format!(
+                "按键精灵：正在回放 {}",
+                state.slot_label(state.active_slot())
+            ),
+        );
         return Ok(());
+    }
+
+    if let Err(error) = state.ensure_slot_names_loaded() {
+        state.playing.store(false, Ordering::SeqCst);
+        return Err(error);
     }
 
     let slot = state.active_slot();
     let repeat_count = state.repeat_count();
     let path = state.slot_path(slot);
-    let payload = fs::read_to_string(&path)
-        .with_context(|| format!("read automation slot {}", path.display()))?;
-    let events: Vec<RecordedEvent> = serde_json::from_str(&payload)
-        .with_context(|| format!("parse automation slot {}", path.display()))?;
+    let payload = match fs::read_to_string(&path)
+        .with_context(|| format!("read automation slot {}", path.display()))
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            state.playing.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    let events: Vec<RecordedEvent> = match serde_json::from_str(&payload)
+        .with_context(|| format!("parse automation slot {}", path.display()))
+    {
+        Ok(events) => events,
+        Err(error) => {
+            state.playing.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
 
     if events.is_empty() {
         state.playing.store(false, Ordering::SeqCst);
         return Err(anyhow!("录制文件为空，无法回放"));
     }
 
+    let single_total_ms = events
+        .iter()
+        .map(RecordedEvent::offset_ms)
+        .max()
+        .unwrap_or(0);
+    let total_ms = single_total_ms.saturating_mul(repeat_count as u64).max(1);
     state.stop_playback.store(false, Ordering::SeqCst);
     state.paused_playback.store(false, Ordering::SeqCst);
+    state.set_playback_progress(0, total_ms);
     state.set_status(
         AutomationActivity::Playing,
         format!(
@@ -590,16 +710,22 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
     );
 
     thread::spawn(move || {
-        for _ in 1..=repeat_count {
+        let mut finished_normally = true;
+
+        for cycle_index in 0..repeat_count {
             if state.stop_playback.load(Ordering::SeqCst) {
+                finished_normally = false;
                 break;
             }
 
             let started = Instant::now();
             let mut paused_started_at: Option<Instant> = None;
             let mut paused_total = Duration::ZERO;
+            let completed_before_cycle_ms = single_total_ms.saturating_mul(cycle_index as u64);
+
             for event in &events {
                 if state.stop_playback.load(Ordering::SeqCst) {
+                    finished_normally = false;
                     break;
                 }
 
@@ -607,6 +733,7 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
                 let target = Duration::from_millis(offset);
                 loop {
                     if state.stop_playback.load(Ordering::SeqCst) {
+                        finished_normally = false;
                         break;
                     }
 
@@ -614,7 +741,7 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
                         if paused_started_at.is_none() {
                             paused_started_at = Some(Instant::now());
                         }
-                        thread::sleep(HOTKEY_POLL_INTERVAL);
+                        thread::sleep(PLAYBACK_PAUSE_SLICE);
                         continue;
                     }
 
@@ -623,6 +750,13 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
                     }
 
                     let elapsed = started.elapsed().saturating_sub(paused_total);
+                    let cycle_elapsed_ms = elapsed.as_millis() as u64;
+                    state.set_playback_progress(
+                        completed_before_cycle_ms
+                            .saturating_add(cycle_elapsed_ms.min(single_total_ms)),
+                        total_ms,
+                    );
+
                     if elapsed >= target {
                         break;
                     }
@@ -632,6 +766,7 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
                 }
 
                 if state.stop_playback.load(Ordering::SeqCst) {
+                    finished_normally = false;
                     break;
                 }
 
@@ -642,15 +777,26 @@ fn start_playback(state: Arc<AppState>) -> Result<()> {
                     );
                     state.stop_playback.store(true, Ordering::SeqCst);
                     state.playing.store(false, Ordering::SeqCst);
+                    state.clear_playback_progress();
                     return;
                 }
             }
+
+            state.set_playback_progress(
+                completed_before_cycle_ms.saturating_add(single_total_ms),
+                total_ms,
+            );
         }
 
         state.paused_playback.store(false, Ordering::SeqCst);
         state.stop_playback.store(false, Ordering::SeqCst);
         state.playing.store(false, Ordering::SeqCst);
-        state.set_status(AutomationActivity::Idle, "按键精灵：回放结束");
+        state.clear_playback_progress();
+        if finished_normally {
+            state.set_status(AutomationActivity::Idle, "按键精灵：回放结束");
+        } else {
+            state.set_status(AutomationActivity::Idle, "按键精灵：已停止当前回放");
+        }
     });
 
     Ok(())
@@ -880,10 +1026,6 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-fn is_virtual_key_down(vk: i32) -> bool {
-    unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
-}
-
 fn open_path(path: &Path) -> Result<()> {
     let operation = to_wide("open");
     let target = to_wide(&path.to_string_lossy());
@@ -910,7 +1052,7 @@ fn to_wide(value: &str) -> Vec<u16> {
 
 fn default_status_line() -> String {
     format!(
-        "按键精灵：待机（{} 暂停 / {} 录制 / {} 保存 / {} 回放 / {} 停止）",
+        "按键精灵：待机（{} 仅暂停回放 / {} 录制 / {} 保存 / {} 回放 / {} 停止）",
         PAUSE_HOTKEY, RECORD_HOTKEY, STOP_HOTKEY, PLAY_HOTKEY, CANCEL_HOTKEY
     )
 }

@@ -37,6 +37,11 @@ pub enum HotkeyState {
     ScreenshotTriggered,
     RecordingStartTriggered,
     RecordingStopTriggered,
+    AutomationPauseTriggered,
+    AutomationRecordTriggered,
+    AutomationStopTriggered,
+    AutomationPlayTriggered,
+    AutomationCancelTriggered,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +85,12 @@ static SCREENSHOT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VOICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECORDING_START_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RECORDING_STOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AUTOMATION_PAUSE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AUTOMATION_RECORD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AUTOMATION_STOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AUTOMATION_PLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AUTOMATION_CANCEL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static AUTOMATION_CANCEL_ENABLED: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_ENABLED: AtomicBool = AtomicBool::new(true);
 static MOUSE_MIDDLE_DOWN: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -167,6 +178,13 @@ pub fn set_mouse_middle_enabled(enabled: bool) {
     }
 }
 
+pub fn set_automation_cancel_enabled(enabled: bool) {
+    AUTOMATION_CANCEL_ENABLED.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        AUTOMATION_CANCEL_ACTIVE.store(false, Ordering::Relaxed);
+    }
+}
+
 pub fn reset_hotkey_state() {
     CTRL_DOWN.store(false, Ordering::Relaxed);
     ALT_DOWN.store(false, Ordering::Relaxed);
@@ -176,6 +194,11 @@ pub fn reset_hotkey_state() {
     VOICE_ACTIVE.store(false, Ordering::Relaxed);
     RECORDING_START_ACTIVE.store(false, Ordering::Relaxed);
     RECORDING_STOP_ACTIVE.store(false, Ordering::Relaxed);
+    AUTOMATION_PAUSE_ACTIVE.store(false, Ordering::Relaxed);
+    AUTOMATION_RECORD_ACTIVE.store(false, Ordering::Relaxed);
+    AUTOMATION_STOP_ACTIVE.store(false, Ordering::Relaxed);
+    AUTOMATION_PLAY_ACTIVE.store(false, Ordering::Relaxed);
+    AUTOMATION_CANCEL_ACTIVE.store(false, Ordering::Relaxed);
     MOUSE_MIDDLE_DOWN.store(false, Ordering::Relaxed);
     MOUSE_MIDDLE_ACTIVE.store(false, Ordering::Relaxed);
 }
@@ -234,6 +257,55 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             }
             if vk == VK_F2 && is_up {
                 RECORDING_STOP_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
+            if vk == VK_F7 && is_down && !AUTOMATION_PAUSE_ACTIVE.swap(true, Ordering::Relaxed) {
+                send_hotkey_state(HotkeyState::AutomationPauseTriggered);
+                return LRESULT(1);
+            }
+            if vk == VK_F7 && is_up {
+                AUTOMATION_PAUSE_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
+            if vk == VK_F8 && is_down && !AUTOMATION_RECORD_ACTIVE.swap(true, Ordering::Relaxed) {
+                send_hotkey_state(HotkeyState::AutomationRecordTriggered);
+                return LRESULT(1);
+            }
+            if vk == VK_F8 && is_up {
+                AUTOMATION_RECORD_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
+            if vk == VK_F9 && is_down && !AUTOMATION_STOP_ACTIVE.swap(true, Ordering::Relaxed) {
+                send_hotkey_state(HotkeyState::AutomationStopTriggered);
+                return LRESULT(1);
+            }
+            if vk == VK_F9 && is_up {
+                AUTOMATION_STOP_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
+            if vk == VK_F10 && is_down && !AUTOMATION_PLAY_ACTIVE.swap(true, Ordering::Relaxed) {
+                send_hotkey_state(HotkeyState::AutomationPlayTriggered);
+                return LRESULT(1);
+            }
+            if vk == VK_F10 && is_up {
+                AUTOMATION_PLAY_ACTIVE.store(false, Ordering::Relaxed);
+                return LRESULT(1);
+            }
+
+            if AUTOMATION_CANCEL_ENABLED.load(Ordering::Relaxed)
+                && vk == VK_ESCAPE
+                && is_down
+                && !AUTOMATION_CANCEL_ACTIVE.swap(true, Ordering::Relaxed)
+            {
+                send_hotkey_state(HotkeyState::AutomationCancelTriggered);
+                return LRESULT(1);
+            }
+            if AUTOMATION_CANCEL_ENABLED.load(Ordering::Relaxed) && vk == VK_ESCAPE && is_up {
+                AUTOMATION_CANCEL_ACTIVE.store(false, Ordering::Relaxed);
                 return LRESULT(1);
             }
 

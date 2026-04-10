@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.6"
+    [string]$Version = "1.0.7"
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,7 +90,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "Start:",
     "1. Double-click run-ainput.bat",
     "2. The app will stay in the system tray",
-    "3. Hold Alt+Z to talk; press Alt+X to capture; press F1/F2 to record video; press F8/F9/F10 for automation, F7 to pause or resume, Esc to stop the current automation flow",
+    "3. Hold Alt+Z to talk; press Alt+X to capture; press F1/F2 to record video; press F8/F9/F10 for automation, F7 to pause or resume playback, Esc to stop the current automation flow",
     "",
     "Files:",
     "- ainput-desktop.exe: main app",
@@ -108,7 +108,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
     "- Clipboard fallback is used when direct paste fails",
     "- Recording options are available from the tray: audio, mouse, watermark, FPS, and quality",
-    "- During automation playback, any manual keyboard or mouse input will auto-pause playback"
+    "- During automation recording, the tray icon and bottom bar show active feedback",
+    "- During automation playback, any manual keyboard or mouse input will auto-pause playback and the bottom bar shows total progress"
 )
 
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "logs") | Out-Null
