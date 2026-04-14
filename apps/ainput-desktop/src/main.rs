@@ -12,6 +12,7 @@ use ainput_recording::{RecordingActivity, RecordingService, RecordingSnapshot};
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use maintenance::{MaintenanceHandle, SharedRuntimeState};
+use std::any::Any;
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -238,7 +239,6 @@ struct DesktopApp {
     runtime: AppRuntime,
     proxy: EventLoopProxy<AppEvent>,
     shutdown: Arc<AtomicBool>,
-    worker_started: bool,
     overlay_tick_started: bool,
     worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     hotkey_monitor: Option<hotkey::GlobalHotkeyMonitor>,
@@ -251,6 +251,7 @@ struct DesktopApp {
     tray_visual_state: TrayVisualState,
     tray_visual_frame: u8,
     exit_item: Option<MenuItem>,
+    restart_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
     learn_terms_item: Option<MenuItem>,
     mouse_middle_item: Option<CheckMenuItem>,
@@ -277,7 +278,6 @@ impl DesktopApp {
             runtime,
             proxy,
             shutdown: Arc::new(AtomicBool::new(false)),
-            worker_started: false,
             overlay_tick_started: false,
             worker_tx: None,
             hotkey_monitor: None,
@@ -290,6 +290,7 @@ impl DesktopApp {
             tray_visual_state: TrayVisualState::Idle,
             tray_visual_frame: 0,
             exit_item: None,
+            restart_item: None,
             status_item: None,
             learn_terms_item: None,
             mouse_middle_item: None,
@@ -312,18 +313,31 @@ impl DesktopApp {
     }
 
     fn start_worker_once(&mut self) {
-        if self.worker_started {
+        if self.worker_tx.is_some() {
             return;
         }
 
-        self.worker_started = true;
         let runtime = self.runtime.clone();
         let proxy = self.proxy.clone();
         let shutdown = self.shutdown.clone();
         let (worker_tx, worker_rx) = mpsc::channel();
         self.worker_tx = Some(worker_tx);
 
-        thread::spawn(move || worker::push_to_talk_worker(runtime, proxy, shutdown, worker_rx));
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker::push_to_talk_worker(runtime, proxy.clone(), shutdown.clone(), worker_rx);
+            }));
+
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let message = match result {
+                Ok(()) => "语音线程已退出，下次按快捷键会自动重试".to_string(),
+                Err(payload) => format!("语音线程异常退出：{}", panic_message(payload.as_ref())),
+            };
+            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Unavailable(message)));
+        });
     }
 
     fn start_overlay_tick_once(&mut self) {
@@ -379,6 +393,44 @@ impl DesktopApp {
         if let Some(status_item) = &self.status_item {
             status_item.set_text(&rendered_status);
         }
+    }
+
+    fn try_send_worker_command(&self, command: WorkerCommand) -> bool {
+        self.worker_tx
+            .as_ref()
+            .is_some_and(|worker_tx| worker_tx.send(command).is_ok())
+    }
+
+    fn send_worker_command(&mut self, command: WorkerCommand) -> bool {
+        self.start_worker_once();
+        if self.try_send_worker_command(command) {
+            return true;
+        }
+
+        tracing::warn!(?command, "voice worker channel unavailable, restarting worker");
+        self.worker_tx = None;
+        self.start_worker_once();
+        if self.try_send_worker_command(command) {
+            return true;
+        }
+
+        self.handle_worker_unavailable("语音线程不可用，请重试或用托盘菜单重新启动");
+        false
+    }
+
+    fn handle_worker_unavailable(&mut self, message: &str) {
+        self.worker_tx = None;
+        self.handle_worker_error(message);
+    }
+
+    fn handle_worker_error(&mut self, message: &str) {
+        self.mode = AppMode::Idle;
+        self.set_tray_visual_state(TrayVisualState::Error, 0);
+        if let Some(overlay) = &mut self.overlay {
+            overlay.set_level(0.0);
+            overlay.hide();
+        }
+        self.set_tray_status(&format!("状态：错误 - {}", shorten(message, 18)));
     }
 
     fn build_tray_once(&mut self) -> Result<()> {
@@ -671,6 +723,7 @@ impl DesktopApp {
         );
         let open_config_item = MenuItem::with_id("open_config", "打开配置文件", true, None);
         let open_logs_item = MenuItem::with_id("open_logs", "打开日志目录", true, None);
+        let restart_item = MenuItem::with_id("restart", "重新启动", true, None);
         let help_item = MenuItem::with_id("help", "使用说明", true, None);
         let exit_item = MenuItem::with_id("exit", "退出", true, None);
         let general_menu = Submenu::with_id_and_items(
@@ -681,6 +734,7 @@ impl DesktopApp {
                 &launch_at_login_item,
                 &open_config_item,
                 &open_logs_item,
+                &restart_item,
                 &help_item,
             ],
         )?;
@@ -714,6 +768,7 @@ impl DesktopApp {
 
         self.status_item = Some(status_item);
         self.exit_item = Some(exit_item);
+        self.restart_item = Some(restart_item);
         self.learn_terms_item = Some(learn_terms_item);
         self.mouse_middle_item = Some(mouse_middle_item);
         self.launch_at_login_item = Some(launch_at_login_item);
@@ -1028,29 +1083,22 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.set_tray_status("状态：已复制到剪贴板");
                 }
                 WorkerEvent::Error(message) => {
-                    self.mode = AppMode::Idle;
-                    self.set_tray_visual_state(TrayVisualState::Error, 0);
-                    if let Some(overlay) = &mut self.overlay {
-                        overlay.set_level(0.0);
-                        overlay.hide();
-                    }
-                    self.set_tray_status(&format!("状态：错误 - {}", shorten(&message, 18)));
+                    self.handle_worker_error(&message);
+                }
+                WorkerEvent::Unavailable(message) => {
+                    self.handle_worker_unavailable(&message);
                 }
             },
             AppEvent::Hotkey(state) => match state {
                 hotkey::HotkeyState::VoicePressed => {
                     if self.mode == AppMode::Idle && self.runtime.config.voice.enabled {
                         self.mode = AppMode::Voice;
-                        if let Some(worker_tx) = &self.worker_tx {
-                            let _ = worker_tx.send(WorkerCommand::HotkeyPressed);
-                        }
+                        let _ = self.send_worker_command(WorkerCommand::HotkeyPressed);
                     }
                 }
                 hotkey::HotkeyState::VoiceReleased => {
-                    if self.mode == AppMode::Voice
-                        && let Some(worker_tx) = &self.worker_tx
-                    {
-                        let _ = worker_tx.send(WorkerCommand::HotkeyReleased);
+                    if self.mode == AppMode::Voice {
+                        let _ = self.send_worker_command(WorkerCommand::HotkeyReleased);
                     }
                 }
                 hotkey::HotkeyState::ScreenshotTriggered => {
@@ -1248,6 +1296,22 @@ impl DesktopApp {
         {
             self.shutdown.store(true, Ordering::Relaxed);
             event_loop.exit();
+        } else if self
+            .restart_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            match restart_application(&self.runtime) {
+                Ok(()) => {
+                    self.shutdown.store(true, Ordering::Relaxed);
+                    event_loop.exit();
+                }
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：重启失败 - {}",
+                    shorten(&error.to_string(), 16)
+                )),
+            }
         } else if event.id.0 == "help" {
             self.set_tray_status_from_result(
                 open_readme_document(&self.runtime),
@@ -1920,6 +1984,29 @@ fn remove_launch_at_login_registry_value() -> Result<()> {
 fn current_exe_for_launch_at_login() -> Result<String> {
     let path = std::env::current_exe()?;
     Ok(quote_command_path(path))
+}
+
+fn restart_application(runtime: &AppRuntime) -> Result<()> {
+    let current_exe = std::env::current_exe().context("resolve current executable path")?;
+    let mut command = Command::new(&current_exe);
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .current_dir(&runtime.runtime_paths.root_dir)
+        .env("AINPUT_ROOT", &runtime.runtime_paths.root_dir);
+    command
+        .spawn()
+        .with_context(|| format!("restart {}", current_exe.display()))?;
+    Ok(())
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "未知 panic".to_string()
 }
 
 fn quote_command_path(path: PathBuf) -> String {

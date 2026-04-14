@@ -21,8 +21,10 @@ pub(crate) enum WorkerEvent {
     Delivered,
     ClipboardFallback,
     Error(String),
+    Unavailable(String),
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum WorkerCommand {
     HotkeyPressed,
     HotkeyReleased,

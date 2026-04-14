@@ -248,8 +248,9 @@ impl RecordingService {
 
         let inner = self.inner.clone();
         thread::spawn(move || {
-            if let Err(error) = begin_recording_impl(inner, config) {
+            if let Err(error) = begin_recording_impl(inner.clone(), config) {
                 tracing::error!(error = %error, "recording start flow failed");
+                inner.fail_flow(format!("录屏启动失败：{error}"));
             }
         });
         Ok(())
@@ -276,8 +277,9 @@ impl RecordingService {
 
         let inner = self.inner.clone();
         thread::spawn(move || {
-            if let Err(error) = stop_recording_impl(inner, session) {
+            if let Err(error) = stop_recording_impl(inner.clone(), session) {
                 tracing::error!(error = %error, "recording stop flow failed");
+                inner.fail_flow(format!("录屏导出失败：{error}"));
             }
         });
         Ok(())
@@ -328,6 +330,14 @@ impl ServiceInner {
             state.snapshot = snapshot;
         }
         (self.notify)();
+    }
+
+    fn fail_flow(&self, status_line: String) {
+        self.update_snapshot(RecordingSnapshot {
+            activity: RecordingActivity::Error,
+            status_line,
+            output_path: None,
+        });
     }
 }
 

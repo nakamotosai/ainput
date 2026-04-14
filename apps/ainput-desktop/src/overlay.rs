@@ -4,16 +4,20 @@ use ainput_automation::{AutomationActivity, AutomationClickSnapshot, AutomationO
 use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, CreateSolidBrush, DeleteObject, HBRUSH, SetWindowRgn,
+    CLIP_DEFAULT_PRECIS, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DEFAULT_QUALITY, DT_CALCRECT, DT_NOPREFIX, DT_WORDBREAK, DeleteObject,
+    DrawTextW, FF_DONTCARE, GetDC, HBRUSH, HFONT, OUT_OUTLINE_PRECIS, ReleaseDC, SelectObject,
+    SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics,
     HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW, SET_WINDOW_POS_FLAGS,
     SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
-    WINDOW_STYLE, WM_NCHITTEST, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW,
+    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_NCHITTEST, WM_SETFONT, WNDCLASSW,
+    WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -28,14 +32,20 @@ const FILL_ALPHA_MAX: u8 = 245;
 const TRACK_COLOR: COLORREF = COLORREF(0x00404040);
 const FILL_COLOR: COLORREF = COLORREF(0x00F4F4F4);
 
-const HUD_WIDTH_PX: i32 = 340;
-const HUD_HEIGHT_PX: i32 = 54;
-const HUD_RADIUS_PX: i32 = 18;
+const HUD_INITIAL_WIDTH_PX: i32 = 320;
+const HUD_INITIAL_HEIGHT_PX: i32 = 132;
+const HUD_MIN_WIDTH_PX: i32 = 220;
+const HUD_MIN_HEIGHT_PX: i32 = 120;
+const HUD_RADIUS_PX: i32 = 28;
 const HUD_MARGIN_LEFT_PX: i32 = 18;
 const HUD_MARGIN_BOTTOM_PX: i32 = 24;
 const HUD_ALPHA_MAX: u8 = 212;
 const HUD_DISPLAY_MIN: Duration = Duration::from_millis(1000);
 const HUD_BG_COLOR: COLORREF = COLORREF(0x00F3F3F3);
+const HUD_TEXT_PADDING_X_PX: i32 = 24;
+const HUD_TEXT_PADDING_Y_PX: i32 = 18;
+const HUD_FONT_HEIGHT_PX: i32 = 84;
+const HUD_MIN_TEXT_WIDTH_PX: i32 = 120;
 
 const CLICK_OUTER_SIZE_PX: i32 = 58;
 const CLICK_INNER_SIZE_PX: i32 = 18;
@@ -81,6 +91,7 @@ struct HudWindow {
     hwnd: HWND,
     text_hwnd: HWND,
     brush: HBRUSH,
+    font: HFONT,
 }
 
 struct ActiveClick {
@@ -170,7 +181,7 @@ impl RecordingOverlay {
                 instance,
                 hud_brush,
                 HUD_MARGIN_LEFT_PX,
-                work_area_bottom().saturating_sub(HUD_HEIGHT_PX + HUD_MARGIN_BOTTOM_PX),
+                work_area_bottom().saturating_sub(HUD_INITIAL_HEIGHT_PX + HUD_MARGIN_BOTTOM_PX),
             )?;
             let click_outer_window = create_shape_window(
                 instance,
@@ -483,6 +494,7 @@ impl Drop for HudWindow {
         unsafe {
             let _ = DestroyWindow(self.text_hwnd);
             let _ = DestroyWindow(self.hwnd);
+            let _ = DeleteObject(self.font.into());
             let _ = DeleteObject(self.brush.into());
         }
     }
@@ -562,8 +574,8 @@ unsafe fn create_hud_window(
             WINDOW_STYLE(WS_POPUP.0),
             x,
             y,
-            HUD_WIDTH_PX,
-            HUD_HEIGHT_PX,
+            HUD_INITIAL_WIDTH_PX,
+            HUD_INITIAL_HEIGHT_PX,
             None,
             None,
             Some(instance),
@@ -572,7 +584,9 @@ unsafe fn create_hud_window(
     }
     .map_err(|error| anyhow!("create automation hud window failed: {error}"))?;
 
-    unsafe { apply_rounded_region(hwnd, HUD_WIDTH_PX, HUD_HEIGHT_PX, HUD_RADIUS_PX)? };
+    unsafe {
+        apply_rounded_region(hwnd, HUD_INITIAL_WIDTH_PX, HUD_INITIAL_HEIGHT_PX, HUD_RADIUS_PX)?
+    };
     unsafe {
         SetLayeredWindowAttributes(
             hwnd,
@@ -589,10 +603,10 @@ unsafe fn create_hud_window(
             w!("STATIC"),
             w!(""),
             WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0),
-            16,
-            12,
-            HUD_WIDTH_PX - 32,
-            HUD_HEIGHT_PX - 20,
+            HUD_TEXT_PADDING_X_PX,
+            HUD_TEXT_PADDING_Y_PX,
+            HUD_INITIAL_WIDTH_PX - HUD_TEXT_PADDING_X_PX * 2,
+            HUD_INITIAL_HEIGHT_PX - HUD_TEXT_PADDING_Y_PX * 2,
             Some(hwnd),
             None,
             Some(instance),
@@ -601,11 +615,45 @@ unsafe fn create_hud_window(
     }
     .map_err(|error| anyhow!("create automation hud text failed: {error}"))?;
 
+    let font = unsafe {
+        CreateFontW(
+            HUD_FONT_HEIGHT_PX,
+            0,
+            0,
+            0,
+            700,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_OUTLINE_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
+            w!("Microsoft YaHei"),
+        )
+    };
+    if font.is_invalid() {
+        let _ = unsafe { DestroyWindow(text_hwnd) };
+        let _ = unsafe { DestroyWindow(hwnd) };
+        return Err(anyhow!("create automation hud font failed"));
+    }
+
+    unsafe {
+        let _ = SendMessageW(
+            text_hwnd,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+    };
+
     let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
     Ok(HudWindow {
         hwnd,
         text_hwnd,
         brush,
+        font,
     })
 }
 
@@ -652,7 +700,7 @@ fn work_area_bottom_center_origin() -> (i32, i32) {
     }
 }
 
-fn work_area_bottom() -> i32 {
+fn work_area_rect() -> RECT {
     unsafe {
         let mut work_area = RECT::default();
         if SystemParametersInfoW(
@@ -663,11 +711,20 @@ fn work_area_bottom() -> i32 {
         )
         .is_ok()
         {
-            return work_area.bottom.max(0);
+            return work_area;
         }
 
-        GetSystemMetrics(SM_CYSCREEN).max(0)
+        RECT {
+            left: 0,
+            top: 0,
+            right: GetSystemMetrics(SM_CXSCREEN).max(0),
+            bottom: GetSystemMetrics(SM_CYSCREEN).max(0),
+        }
     }
+}
+
+fn work_area_bottom() -> i32 {
+    work_area_rect().bottom.max(0)
 }
 
 fn fill_min_width(progress_mode: bool) -> i32 {
@@ -718,10 +775,77 @@ impl HudWindow {
     }
 
     fn set_text(&self, text: &str) {
+        self.resize_to_fit(text);
         let text = HSTRING::from(text);
         unsafe {
             let _ = SetWindowTextW(self.text_hwnd, &text);
         }
+    }
+
+    fn resize_to_fit(&self, text: &str) {
+        let work_area = work_area_rect();
+        let available_width = (work_area.right - work_area.left - HUD_MARGIN_LEFT_PX * 2).max(
+            HUD_MIN_WIDTH_PX,
+        );
+        let max_text_width = (available_width - HUD_TEXT_PADDING_X_PX * 2).max(1);
+        let (text_width, text_height) = measure_hud_text(self.text_hwnd, self.font, text, max_text_width);
+        let hud_width = (text_width + HUD_TEXT_PADDING_X_PX * 2)
+            .clamp(HUD_MIN_WIDTH_PX, available_width);
+        let hud_height = (text_height + HUD_TEXT_PADDING_Y_PX * 2).max(HUD_MIN_HEIGHT_PX);
+        let hud_x = work_area.left + HUD_MARGIN_LEFT_PX;
+        let hud_y = work_area.bottom - HUD_MARGIN_BOTTOM_PX - hud_height;
+
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                hud_x,
+                hud_y,
+                hud_width,
+                hud_height,
+                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0),
+            );
+            let _ = apply_rounded_region(self.hwnd, hud_width, hud_height, HUD_RADIUS_PX);
+            let _ = SetWindowPos(
+                self.text_hwnd,
+                None,
+                HUD_TEXT_PADDING_X_PX,
+                HUD_TEXT_PADDING_Y_PX,
+                hud_width - HUD_TEXT_PADDING_X_PX * 2,
+                hud_height - HUD_TEXT_PADDING_Y_PX * 2,
+                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOZORDER.0),
+            );
+        }
+    }
+}
+
+fn measure_hud_text(text_hwnd: HWND, font: HFONT, text: &str, max_text_width: i32) -> (i32, i32) {
+    if text.trim().is_empty() {
+        return (HUD_MIN_TEXT_WIDTH_PX, HUD_FONT_HEIGHT_PX);
+    }
+
+    unsafe {
+        let hdc = GetDC(Some(text_hwnd));
+        if hdc.0.is_null() {
+            return (HUD_MIN_TEXT_WIDTH_PX, HUD_FONT_HEIGHT_PX);
+        }
+
+        let old_font = SelectObject(hdc, font.into());
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: max_text_width,
+            bottom: 0,
+        };
+        let mut utf16: Vec<u16> = text.encode_utf16().collect();
+        let _ = DrawTextW(hdc, utf16.as_mut_slice(), &mut rect, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        let _ = SelectObject(hdc, old_font);
+        let _ = ReleaseDC(Some(text_hwnd), hdc);
+
+        (
+            (rect.right - rect.left).max(HUD_MIN_TEXT_WIDTH_PX),
+            (rect.bottom - rect.top).max(HUD_FONT_HEIGHT_PX),
+        )
     }
 }
 
