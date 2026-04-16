@@ -15,9 +15,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW, SET_WINDOW_POS_FLAGS,
     SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_NCHITTEST, WM_SETFONT, WNDCLASSW,
-    WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_NCHITTEST, WM_SETFONT, WNDCLASSW, WS_CHILD,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -585,7 +585,12 @@ unsafe fn create_hud_window(
     .map_err(|error| anyhow!("create automation hud window failed: {error}"))?;
 
     unsafe {
-        apply_rounded_region(hwnd, HUD_INITIAL_WIDTH_PX, HUD_INITIAL_HEIGHT_PX, HUD_RADIUS_PX)?
+        apply_rounded_region(
+            hwnd,
+            HUD_INITIAL_WIDTH_PX,
+            HUD_INITIAL_HEIGHT_PX,
+            HUD_RADIUS_PX,
+        )?
     };
     unsafe {
         SetLayeredWindowAttributes(
@@ -784,13 +789,13 @@ impl HudWindow {
 
     fn resize_to_fit(&self, text: &str) {
         let work_area = work_area_rect();
-        let available_width = (work_area.right - work_area.left - HUD_MARGIN_LEFT_PX * 2).max(
-            HUD_MIN_WIDTH_PX,
-        );
+        let available_width =
+            (work_area.right - work_area.left - HUD_MARGIN_LEFT_PX * 2).max(HUD_MIN_WIDTH_PX);
         let max_text_width = (available_width - HUD_TEXT_PADDING_X_PX * 2).max(1);
-        let (text_width, text_height) = measure_hud_text(self.text_hwnd, self.font, text, max_text_width);
-        let hud_width = (text_width + HUD_TEXT_PADDING_X_PX * 2)
-            .clamp(HUD_MIN_WIDTH_PX, available_width);
+        let (text_width, text_height) =
+            measure_hud_text(self.text_hwnd, self.font, text, max_text_width);
+        let hud_width =
+            (text_width + HUD_TEXT_PADDING_X_PX * 2).clamp(HUD_MIN_WIDTH_PX, available_width);
         let hud_height = (text_height + HUD_TEXT_PADDING_Y_PX * 2).max(HUD_MIN_HEIGHT_PX);
         let hud_x = work_area.left + HUD_MARGIN_LEFT_PX;
         let hud_y = work_area.bottom - HUD_MARGIN_BOTTOM_PX - hud_height;
@@ -838,7 +843,12 @@ fn measure_hud_text(text_hwnd: HWND, font: HFONT, text: &str, max_text_width: i3
             bottom: 0,
         };
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
-        let _ = DrawTextW(hdc, utf16.as_mut_slice(), &mut rect, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        let _ = DrawTextW(
+            hdc,
+            utf16.as_mut_slice(),
+            &mut rect,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+        );
         let _ = SelectObject(hdc, old_font);
         let _ = ReleaseDC(Some(text_hwnd), hdc);
 

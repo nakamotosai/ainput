@@ -57,6 +57,11 @@ enabled = true
 # 截图完成后，是否额外自动保存 PNG 到桌面。
 auto_save_to_desktop = false
 
+[automation]
+# 按键精灵默认回放轮数。
+# 托盘里切换后会立即生效，并在下次启动时继续沿用。
+repeat_count = 1
+
 [recording]
 # 是否启用录屏主功能。
 enabled = true

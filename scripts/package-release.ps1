@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.11"
+    [string]$Version = "1.0.13"
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,7 +109,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Clipboard fallback is used when direct paste fails",
     "- Recording options are available from the tray: audio, mouse, watermark, FPS, and quality",
     "- During automation recording and playback, the tray icon, left-bottom HUD, and click feedback show the current state",
-    "- During automation playback, any manual keyboard or mouse input will auto-pause playback"
+    "- During automation playback, keyboard input, mouse clicks, wheel input, and clear mouse movement will auto-pause playback",
+    "- Automation repeat count supports presets and custom values, and the last used value is written to config\\ainput.toml"
 )
 
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "logs") | Out-Null

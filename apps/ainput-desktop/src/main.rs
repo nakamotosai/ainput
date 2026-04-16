@@ -260,6 +260,8 @@ struct DesktopApp {
     automation_status_item: Option<MenuItem>,
     automation_slot_items: Vec<CheckMenuItem>,
     automation_repeat_items: Vec<CheckMenuItem>,
+    automation_repeat_current_item: Option<MenuItem>,
+    automation_repeat_custom_item: Option<MenuItem>,
     automation_edit_names_item: Option<MenuItem>,
     automation_open_dir_item: Option<MenuItem>,
     recording_status_item: Option<MenuItem>,
@@ -299,6 +301,8 @@ impl DesktopApp {
             automation_status_item: None,
             automation_slot_items: Vec::new(),
             automation_repeat_items: Vec::new(),
+            automation_repeat_current_item: None,
+            automation_repeat_custom_item: None,
             automation_edit_names_item: None,
             automation_open_dir_item: None,
             recording_status_item: None,
@@ -407,7 +411,10 @@ impl DesktopApp {
             return true;
         }
 
-        tracing::warn!(?command, "voice worker channel unavailable, restarting worker");
+        tracing::warn!(
+            ?command,
+            "voice worker channel unavailable, restarting worker"
+        );
         self.worker_tx = None;
         self.start_worker_once();
         if self.try_send_worker_command(command) {
@@ -442,6 +449,7 @@ impl DesktopApp {
             let proxy = self.proxy.clone();
             self.automation_service = Some(AutomationService::start(
                 automation_storage_dir(&self.runtime),
+                self.runtime.config.automation.repeat_count,
                 move || {
                     let _ = proxy.send_event(AppEvent::AutomationUpdated);
                 },
@@ -452,6 +460,14 @@ impl DesktopApp {
             .as_ref()
             .expect("automation service initialized")
             .snapshot();
+        if self.runtime.config.automation.repeat_count != automation_snapshot.repeat_count {
+            self.runtime.config.automation.repeat_count = automation_snapshot.repeat_count;
+            if let Err(error) =
+                ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+            {
+                tracing::warn!(error = %error, "persist sanitized automation repeat count failed");
+            }
+        }
         if self.recording_service.is_none() {
             let proxy = self.proxy.clone();
             self.recording_service = Some(RecordingService::start(move || {
@@ -658,7 +674,8 @@ impl DesktopApp {
                 )
             })
             .collect();
-        let automation_repeat_items: Vec<CheckMenuItem> = (1..=5)
+        let automation_repeat_items: Vec<CheckMenuItem> = (1
+            ..=ainput_automation::REPEAT_COUNT_PRESET_MAX)
             .map(|repeat_count| {
                 CheckMenuItem::with_id(
                     format!("automation_repeat_{repeat_count}"),
@@ -669,6 +686,18 @@ impl DesktopApp {
                 )
             })
             .collect();
+        let automation_repeat_current_item = MenuItem::with_id(
+            "automation_repeat_current",
+            format_current_automation_repeat_label(automation_snapshot.repeat_count),
+            false,
+            None,
+        );
+        let automation_repeat_custom_item = MenuItem::with_id(
+            "automation_repeat_custom",
+            "设置自定义回放轮数...",
+            true,
+            None,
+        );
         let automation_edit_names_item =
             MenuItem::with_id("automation_edit_names", "编辑槽位名称", true, None);
         let automation_open_dir_item =
@@ -688,6 +717,8 @@ impl DesktopApp {
         for item in &automation_repeat_items {
             automation_items.push(item);
         }
+        automation_items.push(&automation_repeat_current_item);
+        automation_items.push(&automation_repeat_custom_item);
         automation_items.push(&automation_sep_3);
         automation_items.push(&automation_edit_names_item);
         automation_items.push(&automation_open_dir_item);
@@ -776,6 +807,8 @@ impl DesktopApp {
         self.automation_status_item = Some(automation_status_item);
         self.automation_slot_items = automation_slot_items;
         self.automation_repeat_items = automation_repeat_items;
+        self.automation_repeat_current_item = Some(automation_repeat_current_item);
+        self.automation_repeat_custom_item = Some(automation_repeat_custom_item);
         self.automation_edit_names_item = Some(automation_edit_names_item);
         self.automation_open_dir_item = Some(automation_open_dir_item);
         self.recording_status_item = Some(recording_status_item);
@@ -816,6 +849,11 @@ impl DesktopApp {
         for (index, item) in self.automation_repeat_items.iter().enumerate() {
             let repeat_count = index + 1;
             item.set_checked(repeat_count == snapshot.repeat_count);
+        }
+        if let Some(item) = &self.automation_repeat_current_item {
+            item.set_text(&format_current_automation_repeat_label(
+                snapshot.repeat_count,
+            ));
         }
     }
 
@@ -1468,9 +1506,9 @@ impl DesktopApp {
     }
 
     fn handle_automation_menu_event(&mut self, event: &MenuEvent) -> bool {
-        let Some(service) = &self.automation_service else {
+        if self.automation_service.is_none() {
             return false;
-        };
+        }
 
         if self
             .automation_edit_names_item
@@ -1478,6 +1516,10 @@ impl DesktopApp {
             .map(|item| event.id == *item.id())
             .unwrap_or(false)
         {
+            let service = self
+                .automation_service
+                .as_ref()
+                .expect("automation service initialized");
             let _ = service.refresh_slot_names();
             self.set_tray_status_from_result(
                 service.open_slot_names_file(),
@@ -1492,10 +1534,38 @@ impl DesktopApp {
             .map(|item| event.id == *item.id())
             .unwrap_or(false)
         {
+            let service = self
+                .automation_service
+                .as_ref()
+                .expect("automation service initialized");
             self.set_tray_status_from_result(
                 service.open_slots_dir(),
                 "状态：已打开按键精灵录制目录",
             );
+            return true;
+        }
+
+        if self
+            .automation_repeat_custom_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            match prompt_for_automation_repeat_count(self.runtime.config.automation.repeat_count) {
+                Ok(Some(repeat_count)) => {
+                    if let Err(error) = self.set_automation_repeat_count(repeat_count) {
+                        self.set_tray_status(&format!(
+                            "状态：按键精灵轮数失败 - {}",
+                            shorten(&error.to_string(), 14)
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：按键精灵轮数失败 - {}",
+                    shorten(&error.to_string(), 14)
+                )),
+            }
             return true;
         }
 
@@ -1504,6 +1574,10 @@ impl DesktopApp {
             .iter()
             .position(|item| event.id == *item.id())
         {
+            let service = self
+                .automation_service
+                .as_ref()
+                .expect("automation service initialized");
             match service.select_slot(index + 1) {
                 Ok(()) => self.sync_automation_menu(),
                 Err(error) => self.set_tray_status(&format!(
@@ -1519,8 +1593,8 @@ impl DesktopApp {
             .iter()
             .position(|item| event.id == *item.id())
         {
-            match service.select_repeat_count(index + 1) {
-                Ok(()) => self.sync_automation_menu(),
+            match self.set_automation_repeat_count(index + 1) {
+                Ok(()) => {}
                 Err(error) => self.set_tray_status(&format!(
                     "状态：按键精灵轮数失败 - {}",
                     shorten(&error.to_string(), 14)
@@ -1530,6 +1604,32 @@ impl DesktopApp {
         }
 
         false
+    }
+
+    fn set_automation_repeat_count(&mut self, repeat_count: usize) -> Result<()> {
+        let previous = self.runtime.config.automation.repeat_count;
+        {
+            let service = self
+                .automation_service
+                .as_ref()
+                .ok_or_else(|| anyhow!("automation service not initialized"))?;
+            service.select_repeat_count(repeat_count)?;
+        }
+        self.runtime.config.automation.repeat_count = repeat_count;
+        if let Err(error) =
+            ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+        {
+            self.runtime.config.automation.repeat_count = previous;
+            if let Some(service) = &self.automation_service {
+                let _ = service.select_repeat_count(previous);
+            }
+            self.sync_automation_menu();
+            return Err(error);
+        }
+
+        self.sync_automation_menu();
+        self.set_tray_status(&format!("状态：按键精灵回放轮数已切到 {repeat_count}"));
+        Ok(())
     }
 
     fn handle_recording_menu_event(&mut self, event: &MenuEvent) -> bool {
@@ -2157,6 +2257,53 @@ fn format_automation_repeat_label(repeat_count: usize) -> String {
     format!("回放轮数 {repeat_count}")
 }
 
+fn format_current_automation_repeat_label(repeat_count: usize) -> String {
+    if repeat_count > ainput_automation::REPEAT_COUNT_PRESET_MAX {
+        format!("当前轮数：{repeat_count}（自定义）")
+    } else {
+        format!("当前轮数：{repeat_count}")
+    }
+}
+
+fn prompt_for_automation_repeat_count(current: usize) -> Result<Option<usize>> {
+    let script = format!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Add-Type -AssemblyName Microsoft.VisualBasic; $v=[Microsoft.VisualBasic.Interaction]::InputBox('请输入按键精灵回放轮数（1 到 {max}）','ainput 按键精灵回放轮数','{current}'); Write-Output $v",
+        max = ainput_automation::REPEAT_COUNT_MAX,
+        current = current
+    );
+    let output = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(script)
+        .output()
+        .context("打开按键精灵回放轮数输入框失败")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("按键精灵回放轮数输入框失败: {}", stderr.trim()));
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let repeat_count = value.parse::<usize>().map_err(|_| {
+        anyhow!(
+            "请输入 1 到 {} 之间的整数",
+            ainput_automation::REPEAT_COUNT_MAX
+        )
+    })?;
+    if !(1..=ainput_automation::REPEAT_COUNT_MAX).contains(&repeat_count) {
+        return Err(anyhow!(
+            "请输入 1 到 {} 之间的整数",
+            ainput_automation::REPEAT_COUNT_MAX
+        ));
+    }
+
+    Ok(Some(repeat_count))
+}
+
 fn prompt_for_recording_watermark_text(current: &str) -> Result<Option<String>> {
     let escaped_default = current.replace('\'', "''");
     let script = format!(
@@ -2197,11 +2344,14 @@ mod tests {
                 activity,
                 status_line: String::new(),
                 active_slot: 1,
+                active_slot_label: String::new(),
                 repeat_count: 1,
-                slots: Vec::new(),
+                elapsed_ms: 0,
+                total_ms: None,
+                progress_ratio: None,
                 overlay_hint: None,
                 last_click: None,
-                elapsed_ms: 0,
+                slots: Vec::new(),
             }));
         }
 
@@ -2211,11 +2361,14 @@ mod tests {
                     activity,
                     status_line: String::new(),
                     active_slot: 1,
+                    active_slot_label: String::new(),
                     repeat_count: 1,
-                    slots: Vec::new(),
+                    elapsed_ms: 0,
+                    total_ms: None,
+                    progress_ratio: None,
                     overlay_hint: None,
                     last_click: None,
-                    elapsed_ms: 0,
+                    slots: Vec::new(),
                 }
             ));
         }
@@ -2250,11 +2403,14 @@ mod tests {
                 activity: AutomationActivity::Playing,
                 status_line: String::new(),
                 active_slot: 1,
+                active_slot_label: String::new(),
                 repeat_count: 1,
-                slots: Vec::new(),
+                elapsed_ms: 0,
+                total_ms: None,
+                progress_ratio: None,
                 overlay_hint: None,
                 last_click: None,
-                elapsed_ms: 0,
+                slots: Vec::new(),
             }),
             0
         );
@@ -2263,11 +2419,14 @@ mod tests {
                 activity: AutomationActivity::Playing,
                 status_line: String::new(),
                 active_slot: 1,
+                active_slot_label: String::new(),
                 repeat_count: 1,
-                slots: Vec::new(),
+                elapsed_ms: 180,
+                total_ms: None,
+                progress_ratio: None,
                 overlay_hint: None,
                 last_click: None,
-                elapsed_ms: 180,
+                slots: Vec::new(),
             }),
             1
         );
@@ -2276,11 +2435,14 @@ mod tests {
                 activity: AutomationActivity::Playing,
                 status_line: String::new(),
                 active_slot: 1,
+                active_slot_label: String::new(),
                 repeat_count: 1,
-                slots: Vec::new(),
+                elapsed_ms: 720,
+                total_ms: None,
+                progress_ratio: None,
                 overlay_hint: None,
                 last_click: None,
-                elapsed_ms: 720,
+                slots: Vec::new(),
             }),
             0
         );

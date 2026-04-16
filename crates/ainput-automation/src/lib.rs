@@ -32,10 +32,12 @@ use windows::core::PCWSTR;
 const SLOT_NAME_WATCH_INTERVAL: Duration = Duration::from_millis(400);
 const PLAYBACK_WAIT_SLICE: Duration = Duration::from_millis(10);
 const PLAYBACK_PAUSE_SLICE: Duration = Duration::from_millis(30);
-const PLAYBACK_INPUT_ECHO_GRACE: Duration = Duration::from_millis(120);
+const PLAYBACK_INPUT_ECHO_GRACE: Duration = Duration::from_millis(180);
 const PLAYBACK_FINISH_ECHO_GRACE: Duration = Duration::from_millis(320);
 const SLOT_COUNT: usize = 10;
-const REPEAT_COUNT_MAX: usize = 5;
+const PLAYBACK_MOUSE_ECHO_TOLERANCE_PX: i32 = 4;
+const PLAYBACK_USER_MOUSE_MOVE_DEBOUNCE_DISTANCE_PX: i32 = 6;
+const PLAYBACK_USER_MOUSE_MOVE_DEBOUNCE_WINDOW_MS: u64 = 120;
 const PLAYBACK_INPUT_MARKER: usize = 0xA1_10_0F_09;
 const CONTROL_VKEYS: [u32; 5] = [
     VK_F7.0 as u32,
@@ -50,6 +52,8 @@ pub const RECORD_HOTKEY: &str = "F8";
 pub const STOP_HOTKEY: &str = "F9";
 pub const PLAY_HOTKEY: &str = "F10";
 pub const CANCEL_HOTKEY: &str = "Esc";
+pub const REPEAT_COUNT_PRESET_MAX: usize = 5;
+pub const REPEAT_COUNT_MAX: usize = 999;
 
 static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
@@ -197,6 +201,9 @@ struct AppState {
     playback_cursor_y: AtomicI32,
     playback_key_vk: AtomicU32,
     playback_key_scan_code: AtomicU32,
+    pending_user_mouse_move_started_ms: AtomicU64,
+    pending_user_mouse_move_x: AtomicI32,
+    pending_user_mouse_move_y: AtomicI32,
     last_click_serial: AtomicU64,
     last_click_x: AtomicI32,
     last_click_y: AtomicI32,
@@ -213,7 +220,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(base_dir: PathBuf, notify: Arc<UpdateCallback>) -> Self {
+    fn new(base_dir: PathBuf, initial_repeat_count: usize, notify: Arc<UpdateCallback>) -> Self {
         Self {
             recorder: Mutex::new(RecorderState::default()),
             slot_names: Mutex::new(Vec::new()),
@@ -229,6 +236,9 @@ impl AppState {
             playback_cursor_y: AtomicI32::new(0),
             playback_key_vk: AtomicU32::new(0),
             playback_key_scan_code: AtomicU32::new(0),
+            pending_user_mouse_move_started_ms: AtomicU64::new(0),
+            pending_user_mouse_move_x: AtomicI32::new(0),
+            pending_user_mouse_move_y: AtomicI32::new(0),
             last_click_serial: AtomicU64::new(0),
             last_click_x: AtomicI32::new(0),
             last_click_y: AtomicI32::new(0),
@@ -236,7 +246,7 @@ impl AppState {
             overlay_hint_serial: AtomicU64::new(0),
             shutdown_requested: AtomicBool::new(false),
             active_slot: AtomicUsize::new(1),
-            repeat_count: AtomicUsize::new(1),
+            repeat_count: AtomicUsize::new(clamp_repeat_count(initial_repeat_count)),
             playback_elapsed_ms: AtomicU64::new(0),
             playback_total_ms: AtomicU64::new(0),
             overlay_hint_text: Mutex::new(String::new()),
@@ -326,6 +336,7 @@ impl AppState {
             self.paused_playback.store(false, Ordering::SeqCst);
             self.stop_playback.store(true, Ordering::SeqCst);
             self.playback_finishing.store(false, Ordering::SeqCst);
+            self.clear_pending_user_mouse_move_pause();
             self.set_status(AutomationActivity::Idle, "按键精灵：已请求停止回放");
             self.publish_overlay_hint("已请求停止回放");
         }
@@ -338,6 +349,7 @@ impl AppState {
 
         let slot_label = self.slot_label(self.active_slot());
         if self.paused_playback.swap(false, Ordering::SeqCst) {
+            self.clear_pending_user_mouse_move_pause();
             self.set_status(
                 AutomationActivity::Playing,
                 format!("按键精灵：继续回放 {}", slot_label),
@@ -517,6 +529,7 @@ impl AppState {
     fn note_playback_cursor_target(&self, x: i32, y: i32) {
         self.playback_cursor_x.store(x, Ordering::SeqCst);
         self.playback_cursor_y.store(y, Ordering::SeqCst);
+        self.clear_pending_user_mouse_move_pause();
         self.note_playback_input_emission();
     }
 
@@ -529,6 +542,11 @@ impl AppState {
 
     fn clear_playback_input_emission(&self) {
         self.playback_ignore_until_ms.store(0, Ordering::SeqCst);
+    }
+
+    fn clear_pending_user_mouse_move_pause(&self) {
+        self.pending_user_mouse_move_started_ms
+            .store(0, Ordering::SeqCst);
     }
 
     fn mark_playback_finishing(&self) {
@@ -546,6 +564,7 @@ impl AppState {
         self.stop_playback.store(false, Ordering::SeqCst);
         self.clear_playback_finishing();
         self.clear_playback_input_emission();
+        self.clear_pending_user_mouse_move_pause();
         self.clear_playback_progress();
     }
 
@@ -595,7 +614,41 @@ impl AppState {
 
         let target_x = self.playback_cursor_x.load(Ordering::SeqCst);
         let target_y = self.playback_cursor_y.load(Ordering::SeqCst);
-        (x - target_x).abs() <= 2 && (y - target_y).abs() <= 2
+        (x - target_x).abs() <= PLAYBACK_MOUSE_ECHO_TOLERANCE_PX
+            && (y - target_y).abs() <= PLAYBACK_MOUSE_ECHO_TOLERANCE_PX
+    }
+
+    fn should_pause_on_user_mouse_move(&self, x: i32, y: i32) -> bool {
+        if self.paused_playback.load(Ordering::SeqCst) {
+            self.clear_pending_user_mouse_move_pause();
+            return false;
+        }
+
+        let now_ms = now_unix_ms();
+        let started_ms = self
+            .pending_user_mouse_move_started_ms
+            .load(Ordering::SeqCst);
+        if started_ms == 0
+            || now_ms.saturating_sub(started_ms) > PLAYBACK_USER_MOUSE_MOVE_DEBOUNCE_WINDOW_MS
+        {
+            self.pending_user_mouse_move_x.store(x, Ordering::SeqCst);
+            self.pending_user_mouse_move_y.store(y, Ordering::SeqCst);
+            self.pending_user_mouse_move_started_ms
+                .store(now_ms, Ordering::SeqCst);
+            return false;
+        }
+
+        let anchor_x = self.pending_user_mouse_move_x.load(Ordering::SeqCst);
+        let anchor_y = self.pending_user_mouse_move_y.load(Ordering::SeqCst);
+        let dx = i64::from(x - anchor_x);
+        let dy = i64::from(y - anchor_y);
+        let threshold = i64::from(PLAYBACK_USER_MOUSE_MOVE_DEBOUNCE_DISTANCE_PX);
+        if dx * dx + dy * dy < threshold * threshold {
+            return false;
+        }
+
+        self.clear_pending_user_mouse_move_pause();
+        true
     }
 
     fn snapshot(&self) -> AutomationSnapshot {
@@ -690,12 +743,12 @@ pub struct AutomationService {
 }
 
 impl AutomationService {
-    pub fn start<F>(base_dir: PathBuf, on_update: F) -> Result<Self>
+    pub fn start<F>(base_dir: PathBuf, initial_repeat_count: usize, on_update: F) -> Result<Self>
     where
         F: Fn() + Send + Sync + 'static,
     {
         let notify = Arc::new(on_update);
-        let state = Arc::new(AppState::new(base_dir, notify));
+        let state = Arc::new(AppState::new(base_dir, initial_repeat_count, notify));
         state.ensure_slot_names_loaded()?;
 
         APP_STATE
@@ -1239,8 +1292,12 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                     state.record_click_feedback(point.x, point.y, button);
                     state.pause_playback_on_user_input("鼠标");
                 }
-                WM_MOUSEMOVE | WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_MOUSEWHEEL
-                | WM_MOUSEHWHEEL => {
+                WM_MOUSEMOVE => {
+                    if state.should_pause_on_user_mouse_move(point.x, point.y) {
+                        state.pause_playback_on_user_input("鼠标");
+                    }
+                }
+                WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
                     state.pause_playback_on_user_input("鼠标");
                 }
                 _ => {}
@@ -1371,6 +1428,10 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn clamp_repeat_count(repeat_count: usize) -> usize {
+    repeat_count.clamp(1, REPEAT_COUNT_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,7 +1442,7 @@ mod tests {
             std::process::id(),
             now_unix_ms()
         );
-        AppState::new(std::env::temp_dir().join(unique), Arc::new(|| {}))
+        AppState::new(std::env::temp_dir().join(unique), 1, Arc::new(|| {}))
     }
 
     #[test]
@@ -1411,5 +1472,40 @@ mod tests {
         assert!(!state.playing.load(Ordering::SeqCst));
         assert!(!state.paused_playback.load(Ordering::SeqCst));
         assert!(!state.playback_finishing.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn user_mouse_move_requires_debounced_distance_before_pause() {
+        let state = make_test_state();
+        state.playing.store(true, Ordering::SeqCst);
+
+        assert!(!state.should_pause_on_user_mouse_move(100, 100));
+        assert!(!state.should_pause_on_user_mouse_move(103, 104));
+        assert!(state.should_pause_on_user_mouse_move(106, 108));
+    }
+
+    #[test]
+    fn user_mouse_move_debounce_window_resets_small_jitter() {
+        let state = make_test_state();
+        state.playing.store(true, Ordering::SeqCst);
+
+        assert!(!state.should_pause_on_user_mouse_move(200, 200));
+        state.pending_user_mouse_move_started_ms.store(
+            now_unix_ms() - PLAYBACK_USER_MOUSE_MOVE_DEBOUNCE_WINDOW_MS - 1,
+            Ordering::SeqCst,
+        );
+
+        assert!(!state.should_pause_on_user_mouse_move(209, 200));
+    }
+
+    #[test]
+    fn playback_cursor_target_clears_pending_mouse_pause_candidate() {
+        let state = make_test_state();
+        state.playing.store(true, Ordering::SeqCst);
+
+        assert!(!state.should_pause_on_user_mouse_move(300, 300));
+        state.note_playback_cursor_target(500, 500);
+
+        assert!(!state.should_pause_on_user_mouse_move(307, 300));
     }
 }

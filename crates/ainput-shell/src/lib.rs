@@ -20,6 +20,7 @@ pub struct AppConfig {
     pub hotkeys: HotkeyConfig,
     pub voice: VoiceConfig,
     pub capture: CaptureConfig,
+    pub automation: AutomationConfig,
     pub recording: ainput_recording::RecordingConfig,
     pub startup: StartupConfig,
     pub asr: AsrConfig,
@@ -50,6 +51,12 @@ pub struct VoiceConfig {
 pub struct CaptureConfig {
     pub enabled: bool,
     pub auto_save_to_desktop: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutomationConfig {
+    pub repeat_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +126,12 @@ impl Default for CaptureConfig {
             enabled: true,
             auto_save_to_desktop: false,
         }
+    }
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self { repeat_count: 1 }
     }
 }
 
@@ -353,6 +366,11 @@ enabled = {capture_enabled}
 # 截图完成后，是否额外自动保存 PNG 到桌面。
 auto_save_to_desktop = {auto_save_to_desktop}
 
+[automation]
+# 按键精灵默认回放轮数。
+# 托盘里切换后会立即生效，并在下次启动时继续沿用。
+repeat_count = {automation_repeat_count}
+
 [recording]
 # 是否启用录屏主功能。
 enabled = {recording_enabled}
@@ -433,6 +451,7 @@ file_name = "{log_file_name}"
         history_limit = config.voice.history_limit,
         capture_enabled = config.capture.enabled,
         auto_save_to_desktop = config.capture.auto_save_to_desktop,
+        automation_repeat_count = config.automation.repeat_count,
         recording_enabled = config.recording.enabled,
         recording_audio = config.recording.record_audio,
         recording_capture_mouse = config.recording.capture_mouse,
@@ -443,7 +462,12 @@ file_name = "{log_file_name}"
             ainput_recording::VideoQuality::High => "high",
         },
         recording_watermark_enabled = config.recording.watermark.enabled,
-        recording_watermark_text = config.recording.watermark.text.replace('\\', "\\\\").replace('"', "\\\""),
+        recording_watermark_text = config
+            .recording
+            .watermark
+            .text
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
         recording_watermark_position = match config.recording.watermark.position {
             ainput_recording::WatermarkPosition::LeftTop => "left_top",
             ainput_recording::WatermarkPosition::RightTop => "right_top",
