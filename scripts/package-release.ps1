@@ -44,6 +44,52 @@ function Get-PreferredConfigSource {
     return $FallbackPath
 }
 
+function Copy-HudOverlayTemplateWithValues {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TemplatePath,
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    $content = Get-Content $TemplatePath -Raw
+    if (Test-Path $SourcePath) {
+        $sourceLines = Get-Content $SourcePath
+        $keys = @(
+            "anchor",
+            "offset_x_px",
+            "offset_y_px",
+            "width_px",
+            "min_width_px",
+            "min_height_px",
+            "min_text_width_px",
+            "padding_x_px",
+            "padding_y_px",
+            "corner_radius_px",
+            "display_hold_ms",
+            "font_height_px",
+            "font_weight",
+            "font_family",
+            "text_align",
+            "text_color",
+            "background_color",
+            "background_alpha"
+        )
+
+        foreach ($key in $keys) {
+            $pattern = '^\s*' + [regex]::Escape($key) + '\s*=.*$'
+            $sourceLine = $sourceLines | Where-Object { $_ -match $pattern } | Select-Object -First 1
+            if ($sourceLine) {
+                $content = [regex]::Replace($content, "(?m)$pattern", $sourceLine, 1)
+            }
+        }
+    }
+
+    Set-Content -Path $DestinationPath -Value $content -Encoding UTF8
+}
+
 function Remove-ItemWithRetry {
     param(
         [Parameter(Mandatory = $true)]
@@ -109,7 +155,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") |
 
 Copy-Item (Join-Path $repoRoot "target\release\ainput-desktop.exe") (Join-Path $packageDir "ainput-desktop.exe") -Force
 Copy-Item $mainConfigSource (Join-Path $packageDir "config\ainput.toml") -Force
-Copy-Item $hudConfigSource (Join-Path $packageDir "config\hud-overlay.toml") -Force
+Copy-HudOverlayTemplateWithValues `
+    -TemplatePath (Join-Path $repoRoot "config\hud-overlay.toml") `
+    -SourcePath $hudConfigSource `
+    -DestinationPath (Join-Path $packageDir "config\hud-overlay.toml")
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $packageDir "README.md") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "assets\app-icon.ico") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
