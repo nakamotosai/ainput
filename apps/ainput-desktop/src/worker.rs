@@ -10,6 +10,7 @@ use winit::event_loop::EventLoopProxy;
 use crate::{AppEvent, AppRuntime, hotkey};
 
 const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
+const STREAMING_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(80);
 
 pub(crate) enum WorkerEvent {
     Started,
@@ -43,6 +44,37 @@ pub(crate) struct VoiceHistoryEntry {
     pub timestamp: String,
     pub delivery_label: &'static str,
     pub text: String,
+}
+
+struct StreamingSession {
+    recording: ainput_audio::ActiveRecording,
+    stream: ainput_asr::StreamingZipformerStream,
+    sample_cursor: usize,
+    captured_samples: Vec<f32>,
+    last_partial: String,
+    last_prepared_preview: String,
+    last_preview_at: Instant,
+    last_preview_sample_count: usize,
+    started_at: Instant,
+}
+
+impl StreamingSession {
+    fn new(
+        recording: ainput_audio::ActiveRecording,
+        stream: ainput_asr::StreamingZipformerStream,
+    ) -> Self {
+        Self {
+            recording,
+            stream,
+            sample_cursor: 0,
+            captured_samples: Vec::new(),
+            last_partial: String::new(),
+            last_prepared_preview: String::new(),
+            last_preview_at: Instant::now(),
+            last_preview_sample_count: 0,
+            started_at: Instant::now(),
+        }
+    }
 }
 
 pub(crate) fn push_to_talk_worker(
@@ -200,6 +232,7 @@ pub(crate) fn push_to_talk_worker(
                                                 .voice
                                                 .fallback_to_clipboard,
                                             voice_hotkey_uses_alt: hotkey::voice_hotkey_uses_alt(),
+                                            paste_stabilize_delay: Duration::from_millis(35),
                                         };
                                         match runtime
                                             .output_controller
@@ -298,7 +331,7 @@ pub(crate) fn streaming_push_to_talk_worker(
     shutdown: Arc<AtomicBool>,
     worker_rx: mpsc::Receiver<WorkerCommand>,
 ) {
-    let recognizer = match build_recognizer(&runtime) {
+    let recognizer = match build_streaming_recognizer(&runtime) {
         Ok(recognizer) => recognizer,
         Err(error) => {
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(format!(
@@ -308,18 +341,16 @@ pub(crate) fn streaming_push_to_talk_worker(
         }
     };
 
-    let mut active_recording: Option<ainput_audio::ActiveRecording> = None;
-    let mut sample_cursor = 0usize;
-    let mut captured_samples = Vec::new();
-    let mut last_partial = String::new();
-    let mut last_prepared_preview = String::new();
-    let mut last_preview_at = Instant::now();
-    let mut last_preview_sample_count = 0usize;
+    let mut active_session: Option<StreamingSession> = None;
     let preview_interval = streaming_preview_interval(&runtime);
 
     tracing::info!(
         shortcut = %runtime.config.hotkeys.voice_input,
-        model_dir = %runtime.runtime_paths.root_dir.join(&runtime.config.asr.model_dir).display(),
+        model_dir = %runtime
+            .runtime_paths
+            .root_dir
+            .join(&runtime.config.voice.streaming.model_dir)
+            .display(),
         preview_interval_ms = preview_interval.as_millis(),
         "ainput streaming worker loop started"
     );
@@ -328,16 +359,11 @@ pub(crate) fn streaming_push_to_talk_worker(
         if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(16)) {
             match command {
                 WorkerCommand::HotkeyPressed => {
-                    if active_recording.is_none() {
+                    if active_session.is_none() {
                         match ainput_audio::ActiveRecording::start_default_input() {
                             Ok(recording) => {
-                                sample_cursor = 0;
-                                captured_samples.clear();
-                                last_partial.clear();
-                                last_prepared_preview.clear();
-                                last_preview_at = Instant::now();
-                                last_preview_sample_count = 0;
-                                active_recording = Some(recording);
+                                let stream = recognizer.create_stream();
+                                active_session = Some(StreamingSession::new(recording, stream));
                                 let _ = proxy
                                     .send_event(AppEvent::Worker(WorkerEvent::StreamingStarted));
                                 tracing::info!("streaming push-to-talk recording started");
@@ -355,27 +381,33 @@ pub(crate) fn streaming_push_to_talk_worker(
                     }
                 }
                 WorkerCommand::HotkeyReleased => {
-                    if let Some(recording) = active_recording.take() {
-                        collect_streaming_audio_chunk(
-                            &recording,
-                            &mut sample_cursor,
-                            &mut captured_samples,
+                    if let Some(mut session) = active_session.take() {
+                        let final_chunk_update = collect_streaming_audio_chunk(
+                            &session.recording,
+                            &mut session.sample_cursor,
+                            &mut session.captured_samples,
+                            &recognizer,
+                            &session.stream,
                         );
 
-                        let audio_duration_ms =
-                            audio_duration_ms(recording.sample_rate_hz(), captured_samples.len());
-                        let activity = analyze_audio_activity(&captured_samples);
+                        let audio_duration_ms = audio_duration_ms(
+                            session.recording.sample_rate_hz(),
+                            session.captured_samples.len(),
+                        );
+                        let activity = analyze_audio_activity(&session.captured_samples);
                         tracing::info!(
-                            sample_rate_hz = recording.sample_rate_hz(),
-                            frames = captured_samples.len(),
+                            sample_rate_hz = session.recording.sample_rate_hz(),
+                            frames = session.captured_samples.len(),
                             audio_duration_ms,
                             peak_abs = format_args!("{:.6}", activity.peak_abs),
                             rms = format_args!("{:.6}", activity.rms),
                             active_ratio = format_args!("{:.4}", activity.active_ratio),
+                            added_samples = final_chunk_update.added_samples,
+                            decoded_steps = final_chunk_update.decoded_steps,
                             "streaming push-to-talk recording captured"
                         );
 
-                        if captured_samples.is_empty() || should_skip_as_silence(&activity) {
+                        if session.captured_samples.is_empty() || should_skip_as_silence(&activity) {
                             tracing::info!(
                                 audio_duration_ms,
                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
@@ -384,63 +416,51 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 "skip streaming transcription because captured audio looks like silence"
                             );
                             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
-                            drop(recording);
                             continue;
                         }
 
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFlushing));
 
-                        let asr_started_at = Instant::now();
-                        let transcription = match recognizer.transcribe_samples(
-                            recording.sample_rate_hz(),
-                            &captured_samples,
-                            "streaming-microphone",
-                        ) {
-                            Ok(transcription) => transcription,
-                            Err(error) => {
-                                tracing::error!(
-                                    error = %error,
-                                    samples = captured_samples.len(),
-                                    audio_duration_ms,
-                                    "failed to transcribe streaming microphone audio"
-                                );
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("流式语音识别失败：{error}"),
-                                )));
-                                drop(recording);
-                                continue;
-                            }
-                        };
-                        let asr_elapsed_ms = asr_started_at.elapsed().as_millis();
-                        let raw_text = transcription.text.trim().to_string();
+                        let final_drain_started_at = Instant::now();
+                        recognizer.input_finished(&session.stream);
+                        let final_decode_steps = recognizer.decode_available(&session.stream);
+                        let final_drain_elapsed_ms = final_drain_started_at.elapsed().as_millis();
+
+                        let raw_text = recognizer
+                            .get_result(&session.stream)
+                            .map(|result| result.text.trim().to_string())
+                            .unwrap_or_default();
                         if raw_text.is_empty()
                             || should_drop_low_signal_result(&raw_text, &activity)
                         {
                             tracing::info!(
                                 raw_text = %raw_text,
                                 audio_duration_ms,
-                                asr_elapsed_ms,
+                                final_drain_elapsed_ms,
+                                final_decode_steps,
                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
                                 rms = format_args!("{:.6}", activity.rms),
                                 active_ratio = format_args!("{:.4}", activity.active_ratio),
                                 "drop empty or low-signal streaming transcription"
                             );
                             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
-                            drop(recording);
                             continue;
                         }
 
+                        let rewrite_started_at = Instant::now();
                         let prepared_full_text = build_streaming_output_text(&runtime, &raw_text);
+                        let rewrite_elapsed_ms = rewrite_started_at.elapsed().as_millis();
                         if prepared_full_text.is_empty() {
                             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
-                            drop(recording);
                             continue;
                         }
 
                         tracing::info!(
-                            samples = captured_samples.len(),
+                            samples = session.captured_samples.len(),
                             audio_duration_ms,
-                            asr_elapsed_ms,
+                            final_decode_steps,
+                            final_drain_elapsed_ms,
+                            rewrite_elapsed_ms,
                             raw_text = %raw_text,
                             prepared_text = %prepared_full_text,
                             "streaming final transcription ready"
@@ -448,7 +468,7 @@ pub(crate) fn streaming_push_to_talk_worker(
 
                         let hotkey_release_wait_started_at = Instant::now();
                         let modifiers_released = hotkey::wait_for_voice_hotkey_release(
-                            VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT,
+                            STREAMING_OUTPUT_HOTKEY_RELEASE_TIMEOUT,
                         );
                         let hotkey_release_wait_elapsed_ms =
                             hotkey_release_wait_started_at.elapsed().as_millis();
@@ -464,8 +484,10 @@ pub(crate) fn streaming_push_to_talk_worker(
                             prefer_direct_paste: runtime.config.voice.prefer_direct_paste,
                             fallback_to_clipboard: runtime.config.voice.fallback_to_clipboard,
                             voice_hotkey_uses_alt: hotkey::voice_hotkey_uses_alt(),
+                            paste_stabilize_delay: Duration::from_millis(10),
                         };
 
+                        let output_started_at = Instant::now();
                         let delivery = match runtime
                             .output_controller
                             .deliver_text(&prepared_full_text, &output_config)
@@ -484,10 +506,10 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
                                     format!("输出流式文本失败：{error}"),
                                 )));
-                                drop(recording);
                                 continue;
                             }
                         };
+                        let output_elapsed_ms = output_started_at.elapsed().as_millis();
 
                         runtime
                             .shared_state
@@ -497,48 +519,74 @@ pub(crate) fn streaming_push_to_talk_worker(
                             delivery_label: streaming_delivery_label(delivery),
                             text: prepared_full_text.clone(),
                         });
+                        let pipeline_elapsed_ms = session.started_at.elapsed().as_millis();
+                        let realtime_factor = if audio_duration_ms > 0 {
+                            pipeline_elapsed_ms as f64 / audio_duration_ms as f64
+                        } else {
+                            0.0
+                        };
+                        tracing::info!(
+                            ?delivery,
+                            text = %prepared_full_text,
+                            audio_duration_ms,
+                            final_decode_steps,
+                            final_drain_elapsed_ms,
+                            rewrite_elapsed_ms,
+                            hotkey_release_wait_elapsed_ms,
+                            output_elapsed_ms,
+                            pipeline_elapsed_ms,
+                            realtime_factor = format_args!("{realtime_factor:.3}"),
+                            "streaming transcription delivered"
+                        );
 
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFinal(
                             prepared_full_text,
                         )));
-                        drop(recording);
                     }
                 }
             }
         }
 
-        if let Some(recording) = &active_recording {
-            let added_samples =
-                collect_streaming_audio_chunk(recording, &mut sample_cursor, &mut captured_samples);
+        if let Some(session) = &mut active_session {
+            let chunk_update = collect_streaming_audio_chunk(
+                &session.recording,
+                &mut session.sample_cursor,
+                &mut session.captured_samples,
+                &recognizer,
+                &session.stream,
+            );
             let now = Instant::now();
             let min_preview_samples = streaming_preview_min_samples(
-                recording.sample_rate_hz(),
+                session.recording.sample_rate_hz(),
                 runtime.config.voice.streaming.chunk_ms as u64,
             );
-            if captured_samples.len() >= min_preview_samples
-                && captured_samples.len() > last_preview_sample_count
-                && (added_samples > 0 || now.duration_since(last_preview_at) >= preview_interval)
+            if session.captured_samples.len() >= min_preview_samples
+                && session.captured_samples.len() > session.last_preview_sample_count
+                && (chunk_update.added_samples > 0
+                    || now.duration_since(session.last_preview_at) >= preview_interval)
             {
                 if let Err(error) = emit_streaming_partial_if_changed(
                     &recognizer,
-                    recording.sample_rate_hz(),
-                    &captured_samples,
+                    &session.stream,
+                    session.recording.sample_rate_hz(),
+                    &session.captured_samples,
                     runtime.config.voice.streaming.rewrite_enabled,
-                    &mut last_partial,
-                    &mut last_prepared_preview,
+                    &mut session.last_partial,
+                    &mut session.last_prepared_preview,
                     &proxy,
                 ) {
                     tracing::warn!(
                         error = %error,
-                        samples = captured_samples.len(),
+                        samples = session.captured_samples.len(),
+                        decoded_steps = chunk_update.decoded_steps,
                         "streaming live preview decode failed"
                     );
                 }
-                last_preview_at = now;
-                last_preview_sample_count = captured_samples.len();
+                session.last_preview_at = now;
+                session.last_preview_sample_count = session.captured_samples.len();
             }
 
-            let level = normalize_audio_level(recording.current_level());
+            let level = normalize_audio_level(session.recording.current_level());
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Meter(level)));
         }
     }
@@ -558,22 +606,58 @@ fn build_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::SenseVoiceRecogn
     })
 }
 
+fn build_streaming_recognizer(
+    runtime: &AppRuntime,
+) -> Result<ainput_asr::StreamingZipformerRecognizer> {
+    ainput_asr::StreamingZipformerRecognizer::create(&ainput_asr::StreamingZipformerConfig {
+        model_dir: runtime
+            .runtime_paths
+            .root_dir
+            .join(&runtime.config.voice.streaming.model_dir),
+        provider: runtime.config.asr.provider.clone(),
+        sample_rate_hz: runtime.config.asr.sample_rate_hz as i32,
+        num_threads: runtime.config.asr.num_threads,
+        decoding_method: "greedy_search".to_string(),
+        enable_endpoint: false,
+        rule1_min_trailing_silence: 2.4,
+        rule2_min_trailing_silence: 1.2,
+        rule3_min_utterance_length: 20.0,
+    })
+}
+
+struct StreamingChunkUpdate {
+    added_samples: usize,
+    decoded_steps: usize,
+}
+
 fn collect_streaming_audio_chunk(
     recording: &ainput_audio::ActiveRecording,
     sample_cursor: &mut usize,
     captured_samples: &mut Vec<f32>,
-) -> usize {
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    stream: &ainput_asr::StreamingZipformerStream,
+) -> StreamingChunkUpdate {
     let chunk = recording.take_new_samples(sample_cursor);
     if chunk.is_empty() {
-        return 0;
+        return StreamingChunkUpdate {
+            added_samples: 0,
+            decoded_steps: 0,
+        };
     }
 
+    recognizer.accept_waveform(stream, recording.sample_rate_hz(), &chunk);
+    let decoded_steps = recognizer.decode_available(stream);
     captured_samples.extend_from_slice(&chunk);
-    chunk.len()
+
+    StreamingChunkUpdate {
+        added_samples: chunk.len(),
+        decoded_steps,
+    }
 }
 
 fn emit_streaming_partial_if_changed(
-    recognizer: &ainput_asr::SenseVoiceRecognizer,
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    stream: &ainput_asr::StreamingZipformerStream,
     sample_rate_hz: i32,
     captured_samples: &[f32],
     rewrite_enabled: bool,
@@ -595,16 +679,17 @@ fn emit_streaming_partial_if_changed(
         return Ok(());
     }
 
-    let asr_started_at = Instant::now();
-    let transcription =
-        recognizer.transcribe_samples(sample_rate_hz, captured_samples, "streaming-preview")?;
-    let asr_elapsed_ms = asr_started_at.elapsed().as_millis();
-    let text = transcription.text.trim().to_string();
+    let result_started_at = Instant::now();
+    let Some(result) = recognizer.get_result(stream) else {
+        return Ok(());
+    };
+    let result_elapsed_ms = result_started_at.elapsed().as_millis();
+    let text = result.text.trim().to_string();
     if text.is_empty() {
         tracing::info!(
             samples = captured_samples.len(),
             audio_duration_ms,
-            asr_elapsed_ms,
+            result_elapsed_ms,
             "streaming preview produced empty text"
         );
         return Ok(());
@@ -614,7 +699,7 @@ fn emit_streaming_partial_if_changed(
         tracing::info!(
             samples = captured_samples.len(),
             audio_duration_ms,
-            asr_elapsed_ms,
+            result_elapsed_ms,
             raw_text = %text,
             peak_abs = format_args!("{:.6}", activity.peak_abs),
             rms = format_args!("{:.6}", activity.rms),
@@ -631,7 +716,8 @@ fn emit_streaming_partial_if_changed(
     tracing::info!(
         samples = captured_samples.len(),
         audio_duration_ms,
-        asr_elapsed_ms,
+        result_elapsed_ms,
+        result_is_final = result.is_final,
         raw_text = %text,
         prepared_text = %prepared_text,
         "streaming partial updated"

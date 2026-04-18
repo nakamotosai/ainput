@@ -35,7 +35,7 @@ const SENTENCE_FINAL_EMOJI_RULES: &[(&str, &str)] = &[
     ("狗头", "[狗头]"),
     ("捂脸", "[捂脸]"),
 ];
-const PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(35);
+const DEFAULT_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(35);
 const CHROME_ALT_MENU_DISMISS_DELAY: Duration = Duration::from_millis(30);
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +58,7 @@ pub struct OutputConfig {
     pub prefer_direct_paste: bool,
     pub fallback_to_clipboard: bool,
     pub voice_hotkey_uses_alt: bool,
+    pub paste_stabilize_delay: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -236,7 +237,7 @@ fn paste_via_clipboard(
     copy_to_clipboard(text)?;
     let clipboard_elapsed_ms = clipboard_started_at.elapsed().as_millis();
     // Give the foreground app one short frame to settle after the hotkey is released.
-    thread::sleep(PASTE_STABILIZE_DELAY);
+    thread::sleep(config.paste_stabilize_delay);
 
     let controller_started_at = Instant::now();
     let mut enigo = Enigo::new(&Settings::default())
@@ -265,6 +266,17 @@ fn paste_via_clipboard(
     );
 
     Ok(())
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            prefer_direct_paste: true,
+            fallback_to_clipboard: true,
+            voice_hotkey_uses_alt: false,
+            paste_stabilize_delay: DEFAULT_PASTE_STABILIZE_DELAY,
+        }
+    }
 }
 
 fn should_clear_alt_menu_focus(context: &OutputContextSnapshot, config: &OutputConfig) -> bool {
@@ -530,7 +542,8 @@ impl Drop for ComApartment {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutputConfig, OutputContextKind, OutputContextSnapshot, apply_voice_actions,
+        DEFAULT_PASTE_STABILIZE_DELAY, OutputConfig, OutputContextKind, OutputContextSnapshot,
+        apply_voice_actions,
         ensure_trailing_period, has_terminal_punctuation, prepare_text_for_delivery_in_context,
         replace_sentence_final_emoji_trigger, should_clear_alt_menu_focus, strip_trailing_period,
     };
@@ -657,11 +670,13 @@ mod tests {
             prefer_direct_paste: true,
             fallback_to_clipboard: true,
             voice_hotkey_uses_alt: true,
+            paste_stabilize_delay: DEFAULT_PASTE_STABILIZE_DELAY,
         };
         let ctrl_config = OutputConfig {
             prefer_direct_paste: true,
             fallback_to_clipboard: true,
             voice_hotkey_uses_alt: false,
+            paste_stabilize_delay: DEFAULT_PASTE_STABILIZE_DELAY,
         };
 
         assert!(should_clear_alt_menu_focus(&chrome_context, &alt_config));

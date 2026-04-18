@@ -2,14 +2,17 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.14-preview.5`
+当前预览版本：`1.0.14-preview.6`
 
 ## 本轮已修复
 
 - `hud-overlay.toml` 现在会按 `[layout] / [font] / [background]` 三个分组正确解析，不会再把大部分参数默默退回默认值。
 - 旧版本遗留的坏格式 HUD 参数文档会在启动时自动迁移；即使键值被挤进注释行，程序也会尽量抢救并重写成正常格式。
 - HUD 热加载改成只读加载，不会再因为程序自己回写文件而每隔约 `250ms` 自激重载一次，减少闪烁。
-- 运行时根目录不再误把 `C:\Users\sai` 这类带 `AGENTS.md` 的目录当成项目根；便携版会稳定读取 `dist\ainput-1.0.14-preview.5\config\` 下自己的配置。
+- 流式 worker 现在改成真正接 `StreamingZipformerRecognizer` 在线解码，按住期间不再反复把累计音频丢回离线 `SenseVoice` 整段重跑。
+- 流式模式松手后不再重新全量识别整段录音，只做在线流 `input_finished + drain` 收尾，最终上屏延迟比之前更短。
+- 流式模式的最终提交链路单独缩短了等待：热键释放等待和粘贴前稳定等待不再沿用之前那套更保守的配置。
+- 运行时根目录不再误把 `C:\Users\sai` 这类带 `AGENTS.md` 的目录当成项目根；便携版会稳定读取 `dist\ainput-1.0.14-preview.6\config\` 下自己的配置。
 - HUD 字号创建改成 Windows 更符合直觉的逻辑高度，`font_height_px` 的视觉变化会比之前明显。
 
 它不做系统级 IME，也不依赖在线模型。当前重点是把四条前台主链路做稳：
@@ -174,8 +177,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.14-preview.5\
-dist\ainput-1.0.14-preview.5.zip
+dist\ainput-1.0.14-preview.6\
+dist\ainput-1.0.14-preview.6.zip
 ```
 
 说明：
@@ -442,8 +445,8 @@ cargo build --release -p ainput-desktop
 
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.14-preview.5\`
-- `dist\ainput-1.0.14-preview.5.zip`
+- `dist\ainput-1.0.14-preview.6\`
+- `dist\ainput-1.0.14-preview.6.zip`
 
 ## 项目结构
 
