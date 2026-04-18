@@ -565,35 +565,33 @@ impl DesktopApp {
     }
 
     fn streaming_listening_message(&self) -> String {
-        let rewrite_status = if self.runtime.config.voice.streaming.rewrite_enabled {
-            "规则整理：已启用"
-        } else {
-            "规则整理：当前关闭"
-        };
-        format!(
-            "流式语音识别\n按住说话，松手整段提交\n{}\n实时：等待语音\n整理：等待语音",
-            rewrite_status
-        )
+        "请说话".to_string()
     }
 
     fn streaming_partial_message(raw_text: &str, prepared_text: &str) -> String {
-        if prepared_text.is_empty() {
-            format!("流式语音识别\n实时：{raw_text}\n整理：等待语音继续")
-        } else {
-            format!("流式语音识别\n实时：{raw_text}\n整理：{prepared_text}")
+        let message = prepared_text.trim();
+        if !message.is_empty() {
+            return message.to_string();
         }
+
+        let fallback = raw_text.trim();
+        if !fallback.is_empty() {
+            return fallback.to_string();
+        }
+
+        "请说话".to_string()
     }
 
     fn streaming_flushing_message() -> &'static str {
-        "流式语音识别\n正在收尾，请稍候"
+        "已识别"
     }
 
-    fn streaming_clipboard_message(text: &str) -> String {
-        format!("流式语音识别\n已复制整理结果：{text}")
+    fn streaming_clipboard_message(_text: &str) -> String {
+        "已识别".to_string()
     }
 
-    fn streaming_final_message(text: &str) -> String {
-        format!("流式语音识别\n最终整理结果：{text}")
+    fn streaming_final_message(_text: &str) -> String {
+        "已识别".to_string()
     }
 
     fn sync_voice_mode_menu(&self) {

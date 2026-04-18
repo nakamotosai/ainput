@@ -68,8 +68,8 @@ panel_enabled = true
 # 是否启用流式短句整理。
 rewrite_enabled = true
 
-# 流式音频切块时长（毫秒）。
-chunk_ms = 160
+# 流式预览刷新间隔（毫秒）。
+chunk_ms = 500
 
 [capture]
 # 是否启用截图主功能。
