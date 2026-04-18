@@ -40,10 +40,30 @@ pub struct HotkeyConfig {
 #[serde(default)]
 pub struct VoiceConfig {
     pub enabled: bool,
+    pub mode: VoiceMode,
+    pub streaming: StreamingVoiceConfig,
     pub prefer_direct_paste: bool,
     pub fallback_to_clipboard: bool,
     pub history_file_name: String,
     pub history_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceMode {
+    #[default]
+    Fast,
+    Streaming,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingVoiceConfig {
+    pub enabled: bool,
+    pub model_dir: String,
+    pub panel_enabled: bool,
+    pub rewrite_enabled: bool,
+    pub chunk_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,10 +132,24 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: VoiceMode::Fast,
+            streaming: StreamingVoiceConfig::default(),
             prefer_direct_paste: true,
             fallback_to_clipboard: true,
             history_file_name: "voice-history.log".to_string(),
             history_limit: 500,
+        }
+    }
+}
+
+impl Default for StreamingVoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_dir: "models/streaming-zipformer-small-bilingual-zh-en".to_string(),
+            panel_enabled: true,
+            rewrite_enabled: true,
+            chunk_ms: 320,
         }
     }
 }
@@ -183,6 +217,7 @@ pub fn bootstrap() -> Result<Bootstrap> {
         logs_dir = %runtime_paths.logs_dir.display(),
         models_dir = %runtime_paths.models_dir.display(),
         voice_hotkey = %config.hotkeys.voice_input,
+        voice_mode = ?config.voice.mode,
         capture_hotkey = %config.hotkeys.screen_capture,
         "ainput shell bootstrap complete"
     );
@@ -344,6 +379,11 @@ mouse_middle_hold_enabled = {mouse_middle_hold_enabled}
 # 是否启用语音输入主功能。
 enabled = {voice_enabled}
 
+# 当前语音模式。
+# fast = 极速语音识别
+# streaming = 流式语音识别
+mode = "{voice_mode}"
+
 # 是否优先尝试“直接粘贴到当前输入框”。
 # true = 先写剪贴板再模拟 Ctrl+V
 # false = 不做直贴，只走剪贴板
@@ -358,6 +398,22 @@ history_file_name = "{history_file_name}"
 
 # 语音历史最多保留多少条。
 history_limit = {history_limit}
+
+[voice.streaming]
+# 是否启用流式语音识别模式。
+enabled = {streaming_enabled}
+
+# 流式 ASR 模型目录。
+model_dir = "{streaming_model_dir}"
+
+# 是否显示流式语音面板。
+panel_enabled = {streaming_panel_enabled}
+
+# 是否启用流式短句整理。
+rewrite_enabled = {streaming_rewrite_enabled}
+
+# 流式音频切块时长（毫秒）。
+chunk_ms = {streaming_chunk_ms}
 
 [capture]
 # 是否启用截图主功能。
@@ -445,10 +501,19 @@ file_name = "{log_file_name}"
         screen_capture = config.hotkeys.screen_capture,
         mouse_middle_hold_enabled = config.hotkeys.mouse_middle_hold_enabled,
         voice_enabled = config.voice.enabled,
+        voice_mode = match config.voice.mode {
+            VoiceMode::Fast => "fast",
+            VoiceMode::Streaming => "streaming",
+        },
         prefer_direct_paste = config.voice.prefer_direct_paste,
         fallback_to_clipboard = config.voice.fallback_to_clipboard,
         history_file_name = config.voice.history_file_name,
         history_limit = config.voice.history_limit,
+        streaming_enabled = config.voice.streaming.enabled,
+        streaming_model_dir = config.voice.streaming.model_dir,
+        streaming_panel_enabled = config.voice.streaming.panel_enabled,
+        streaming_rewrite_enabled = config.voice.streaming.rewrite_enabled,
+        streaming_chunk_ms = config.voice.streaming.chunk_ms,
         capture_enabled = config.capture.enabled,
         auto_save_to_desktop = config.capture.auto_save_to_desktop,
         automation_repeat_count = config.automation.repeat_count,

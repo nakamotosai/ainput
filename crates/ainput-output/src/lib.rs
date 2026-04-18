@@ -187,6 +187,22 @@ impl OutputController {
         Ok(OutputDelivery::ClipboardOnly)
     }
 
+    pub fn prepare_streaming_text(&self, text: &str) -> Result<String> {
+        self.apply_term_corrections(text)
+    }
+
+    pub fn paste_text_verbatim(&self, text: &str, config: &OutputConfig) -> Result<()> {
+        let context = inspect_output_context().unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "failed to inspect caret context for streaming paste");
+            OutputContextSnapshot {
+                process_name: None,
+                kind: OutputContextKind::Unknown,
+            }
+        });
+
+        paste_via_clipboard(text, &context, config)
+    }
+
     pub fn learn_from_recent_correction(
         &self,
         original_text: &str,
@@ -214,6 +230,14 @@ impl OutputController {
 
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
+    }
+
+    fn apply_term_corrections(&self, text: &str) -> Result<String> {
+        let catalog = self
+            .term_catalog
+            .read()
+            .map_err(|_| anyhow!("term catalog read lock poisoned"))?;
+        Ok(catalog.apply_to_text(text))
     }
 }
 

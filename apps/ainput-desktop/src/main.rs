@@ -74,10 +74,29 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.get(1).map(String::as_str) == Some("streaming-transcribe-wav") {
+        let runtime = build_runtime(&bootstrap)?;
+        let wav_path = args.get(2).ok_or_else(|| {
+            anyhow!("usage: ainput-desktop streaming-transcribe-wav <path-to-wav>")
+        })?;
+        let recognizer = build_streaming_recognizer(&runtime)?;
+        let chunk_num_samples = ((runtime.config.voice.streaming.chunk_ms as usize)
+            * (runtime.config.asr.sample_rate_hz as usize))
+            / 1000;
+        let transcription = recognizer.transcribe_wav_file(wav_path, chunk_num_samples)?;
+        cache_recent_text(&bootstrap.runtime_paths.logs_dir, &transcription.text)?;
+        println!("{}", transcription.text);
+        return Ok(());
+    }
+
     if args.get(1).map(String::as_str) == Some("bootstrap") {
         println!(
-            "ainput bootstrap ready: voice_hotkey={}, capture_hotkey={}, config={}",
+            "ainput bootstrap ready: voice_hotkey={}, voice_mode={}, capture_hotkey={}, config={}",
             bootstrap.config.hotkeys.voice_input,
+            match bootstrap.config.voice.mode {
+                ainput_shell::VoiceMode::Fast => "fast",
+                ainput_shell::VoiceMode::Streaming => "streaming",
+            },
             bootstrap.config.hotkeys.screen_capture,
             bootstrap.runtime_paths.config_file.display()
         );
@@ -151,6 +170,23 @@ fn build_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::SenseVoiceRecogn
         language: runtime.config.asr.language.clone(),
         use_itn: runtime.config.asr.use_itn,
         num_threads: runtime.config.asr.num_threads,
+    })
+}
+
+fn build_streaming_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::StreamingZipformerRecognizer> {
+    ainput_asr::StreamingZipformerRecognizer::create(&ainput_asr::StreamingZipformerConfig {
+        model_dir: runtime
+            .runtime_paths
+            .root_dir
+            .join(&runtime.config.voice.streaming.model_dir),
+        provider: runtime.config.asr.provider.clone(),
+        sample_rate_hz: runtime.config.asr.sample_rate_hz as i32,
+        num_threads: runtime.config.asr.num_threads,
+        decoding_method: "greedy_search".to_string(),
+        enable_endpoint: false,
+        rule1_min_trailing_silence: 2.4,
+        rule2_min_trailing_silence: 1.2,
+        rule3_min_utterance_length: 20.0,
     })
 }
 
@@ -240,7 +276,8 @@ struct DesktopApp {
     proxy: EventLoopProxy<AppEvent>,
     shutdown: Arc<AtomicBool>,
     overlay_tick_started: bool,
-    worker_tx: Option<mpsc::Sender<WorkerCommand>>,
+    fast_worker_tx: Option<mpsc::Sender<WorkerCommand>>,
+    streaming_worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     hotkey_monitor: Option<hotkey::GlobalHotkeyMonitor>,
     automation_service: Option<AutomationService>,
     recording_service: Option<RecordingService>,
@@ -253,6 +290,8 @@ struct DesktopApp {
     exit_item: Option<MenuItem>,
     restart_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
+    voice_mode_fast_item: Option<CheckMenuItem>,
+    voice_mode_streaming_item: Option<CheckMenuItem>,
     learn_terms_item: Option<MenuItem>,
     mouse_middle_item: Option<CheckMenuItem>,
     launch_at_login_item: Option<CheckMenuItem>,
@@ -281,7 +320,8 @@ impl DesktopApp {
             proxy,
             shutdown: Arc::new(AtomicBool::new(false)),
             overlay_tick_started: false,
-            worker_tx: None,
+            fast_worker_tx: None,
+            streaming_worker_tx: None,
             hotkey_monitor: None,
             automation_service: None,
             recording_service: None,
@@ -294,6 +334,8 @@ impl DesktopApp {
             exit_item: None,
             restart_item: None,
             status_item: None,
+            voice_mode_fast_item: None,
+            voice_mode_streaming_item: None,
             learn_terms_item: None,
             mouse_middle_item: None,
             launch_at_login_item: None,
@@ -316,8 +358,8 @@ impl DesktopApp {
         }
     }
 
-    fn start_worker_once(&mut self) {
-        if self.worker_tx.is_some() {
+    fn start_fast_worker_once(&mut self) {
+        if self.fast_worker_tx.is_some() {
             return;
         }
 
@@ -325,7 +367,7 @@ impl DesktopApp {
         let proxy = self.proxy.clone();
         let shutdown = self.shutdown.clone();
         let (worker_tx, worker_rx) = mpsc::channel();
-        self.worker_tx = Some(worker_tx);
+        self.fast_worker_tx = Some(worker_tx);
 
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -339,6 +381,39 @@ impl DesktopApp {
             let message = match result {
                 Ok(()) => "语音线程已退出，下次按快捷键会自动重试".to_string(),
                 Err(payload) => format!("语音线程异常退出：{}", panic_message(payload.as_ref())),
+            };
+            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Unavailable(message)));
+        });
+    }
+
+    fn start_streaming_worker_once(&mut self) {
+        if self.streaming_worker_tx.is_some() {
+            return;
+        }
+
+        let runtime = self.runtime.clone();
+        let proxy = self.proxy.clone();
+        let shutdown = self.shutdown.clone();
+        let (worker_tx, worker_rx) = mpsc::channel();
+        self.streaming_worker_tx = Some(worker_tx);
+
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker::streaming_push_to_talk_worker(
+                    runtime,
+                    proxy.clone(),
+                    shutdown.clone(),
+                    worker_rx,
+                );
+            }));
+
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let message = match result {
+                Ok(()) => "流式语音线程已退出，下次按快捷键会自动重试".to_string(),
+                Err(payload) => format!("流式语音线程异常退出：{}", panic_message(payload.as_ref())),
             };
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Unavailable(message)));
         });
@@ -399,34 +474,65 @@ impl DesktopApp {
         }
     }
 
-    fn try_send_worker_command(&self, command: WorkerCommand) -> bool {
-        self.worker_tx
+    fn try_send_fast_worker_command(&self, command: WorkerCommand) -> bool {
+        self.fast_worker_tx
             .as_ref()
             .is_some_and(|worker_tx| worker_tx.send(command).is_ok())
     }
 
-    fn send_worker_command(&mut self, command: WorkerCommand) -> bool {
-        self.start_worker_once();
-        if self.try_send_worker_command(command) {
+    fn send_fast_worker_command(&mut self, command: WorkerCommand) -> bool {
+        self.start_fast_worker_once();
+        if self.try_send_fast_worker_command(command) {
             return true;
         }
 
         tracing::warn!(
             ?command,
-            "voice worker channel unavailable, restarting worker"
+            "fast voice worker channel unavailable, restarting worker"
         );
-        self.worker_tx = None;
-        self.start_worker_once();
-        if self.try_send_worker_command(command) {
+        self.fast_worker_tx = None;
+        self.start_fast_worker_once();
+        if self.try_send_fast_worker_command(command) {
             return true;
         }
 
-        self.handle_worker_unavailable("语音线程不可用，请重试或用托盘菜单重新启动");
+        self.handle_fast_worker_unavailable("极速语音线程不可用，请重试或用托盘菜单重新启动");
         false
     }
 
-    fn handle_worker_unavailable(&mut self, message: &str) {
-        self.worker_tx = None;
+    fn try_send_streaming_worker_command(&self, command: WorkerCommand) -> bool {
+        self.streaming_worker_tx
+            .as_ref()
+            .is_some_and(|worker_tx| worker_tx.send(command).is_ok())
+    }
+
+    fn send_streaming_worker_command(&mut self, command: WorkerCommand) -> bool {
+        self.start_streaming_worker_once();
+        if self.try_send_streaming_worker_command(command) {
+            return true;
+        }
+
+        tracing::warn!(
+            ?command,
+            "streaming voice worker channel unavailable, restarting worker"
+        );
+        self.streaming_worker_tx = None;
+        self.start_streaming_worker_once();
+        if self.try_send_streaming_worker_command(command) {
+            return true;
+        }
+
+        self.handle_streaming_worker_unavailable("流式语音线程不可用，请重试或检查模型目录");
+        false
+    }
+
+    fn handle_fast_worker_unavailable(&mut self, message: &str) {
+        self.fast_worker_tx = None;
+        self.handle_worker_error(message);
+    }
+
+    fn handle_streaming_worker_unavailable(&mut self, message: &str) {
+        self.streaming_worker_tx = None;
         self.handle_worker_error(message);
     }
 
@@ -438,6 +544,108 @@ impl DesktopApp {
             overlay.hide();
         }
         self.set_tray_status(&format!("状态：错误 - {}", shorten(message, 18)));
+    }
+
+    fn voice_mode_label(mode: ainput_shell::VoiceMode) -> &'static str {
+        match mode {
+            ainput_shell::VoiceMode::Fast => "极速语音识别",
+            ainput_shell::VoiceMode::Streaming => "流式语音识别",
+        }
+    }
+
+    fn idle_status_text(&self) -> String {
+        format!(
+            "状态：待机中（{}）",
+            Self::voice_mode_label(self.runtime.config.voice.mode)
+        )
+    }
+
+    fn streaming_status_text(&self) -> &'static str {
+        "状态：流式语音识别中"
+    }
+
+    fn streaming_listening_message(&self) -> String {
+        let rewrite_status = if self.runtime.config.voice.streaming.rewrite_enabled {
+            "规则整理：已启用"
+        } else {
+            "规则整理：当前关闭"
+        };
+        format!(
+            "流式语音识别\n请开始说话\n{}\n待提交整理：等待稳定短句\n模型目录：{}",
+            rewrite_status, self.runtime.config.voice.streaming.model_dir
+        )
+    }
+
+    fn streaming_partial_message(raw_text: &str, prepared_text: &str) -> String {
+        if prepared_text.is_empty() {
+            format!("流式语音识别\n原始识别：{raw_text}\n待提交整理：等待稳定短句")
+        } else {
+            format!(
+                "流式语音识别\n原始识别：{raw_text}\n待提交整理：{prepared_text}"
+            )
+        }
+    }
+
+    fn streaming_flushing_message() -> &'static str {
+        "流式语音识别\n正在收尾，请稍候"
+    }
+
+    fn streaming_committed_message(text: &str) -> String {
+        format!("流式语音识别\n已提交整理：{text}")
+    }
+
+    fn streaming_clipboard_message(text: &str) -> String {
+        format!("流式语音识别\n已复制整理结果：{text}")
+    }
+
+    fn streaming_final_message(text: &str) -> String {
+        format!("流式语音识别\n最终整理结果：{text}")
+    }
+
+    fn sync_voice_mode_menu(&self) {
+        if let Some(item) = &self.voice_mode_fast_item {
+            item.set_checked(self.runtime.config.voice.mode == ainput_shell::VoiceMode::Fast);
+        }
+        if let Some(item) = &self.voice_mode_streaming_item {
+            item.set_checked(self.runtime.config.voice.mode == ainput_shell::VoiceMode::Streaming);
+        }
+    }
+
+    fn set_voice_mode(&mut self, mode: ainput_shell::VoiceMode) -> Result<()> {
+        if self.runtime.config.voice.mode == mode {
+            self.sync_voice_mode_menu();
+            return Ok(());
+        }
+
+        if self.mode != AppMode::Idle {
+            return Err(anyhow!("请先结束当前操作后再切换语音模式"));
+        }
+
+        let previous_mode = self.runtime.config.voice.mode;
+        self.runtime.config.voice.mode = mode;
+        self.sync_voice_mode_menu();
+
+        if let Err(error) = ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+        {
+            self.runtime.config.voice.mode = previous_mode;
+            self.sync_voice_mode_menu();
+            return Err(error);
+        }
+
+        self.set_tray_status(&self.idle_status_text());
+        Ok(())
+    }
+
+    fn show_streaming_status_overlay(&mut self, message: &str, persistent: bool) {
+        if !self.runtime.config.voice.streaming.panel_enabled {
+            if let Some(overlay) = &mut self.overlay {
+                overlay.clear_status_hud();
+            }
+            return;
+        }
+        if let Some(overlay) = &mut self.overlay {
+            overlay.show_status_hud(message, persistent);
+        }
     }
 
     fn build_tray_once(&mut self) -> Result<()> {
@@ -481,7 +689,21 @@ impl DesktopApp {
             .snapshot();
 
         let tray_menu = Menu::new();
-        let status_item = MenuItem::with_id("status", "状态：待机中", false, None);
+        let status_item = MenuItem::with_id("status", self.idle_status_text(), false, None);
+        let voice_mode_fast_item = CheckMenuItem::with_id(
+            "voice_mode_fast",
+            Self::voice_mode_label(ainput_shell::VoiceMode::Fast),
+            true,
+            self.runtime.config.voice.mode == ainput_shell::VoiceMode::Fast,
+            None,
+        );
+        let voice_mode_streaming_item = CheckMenuItem::with_id(
+            "voice_mode_streaming",
+            Self::voice_mode_label(ainput_shell::VoiceMode::Streaming),
+            true,
+            self.runtime.config.voice.mode == ainput_shell::VoiceMode::Streaming,
+            None,
+        );
 
         let voice_hotkey_hint = MenuItem::with_id(
             "voice_hotkey_hint",
@@ -771,8 +993,12 @@ impl DesktopApp {
         )?;
 
         let separator = PredefinedMenuItem::separator();
+        let mode_separator = PredefinedMenuItem::separator();
         let _ = tray_menu.append(&status_item);
         let _ = tray_menu.append(&separator);
+        let _ = tray_menu.append(&voice_mode_fast_item);
+        let _ = tray_menu.append(&voice_mode_streaming_item);
+        let _ = tray_menu.append(&mode_separator);
         let _ = tray_menu.append(&voice_menu);
         let _ = tray_menu.append(&capture_menu);
         let _ = tray_menu.append(&recording_menu);
@@ -782,7 +1008,7 @@ impl DesktopApp {
         let _ = tray_menu.append(&exit_item);
 
         let tray_icon = TrayIconBuilder::new()
-            .with_tooltip("ainput\n待机中")
+            .with_tooltip(format!("ainput\n{}", self.idle_status_text()))
             .with_icon(app_status_icon(&self.runtime, TrayVisualState::Idle, 0))
             .with_menu(Box::new(tray_menu))
             .build()
@@ -798,6 +1024,8 @@ impl DesktopApp {
         self.overlay_available = overlay.is_some();
 
         self.status_item = Some(status_item);
+        self.voice_mode_fast_item = Some(voice_mode_fast_item);
+        self.voice_mode_streaming_item = Some(voice_mode_streaming_item);
         self.exit_item = Some(exit_item);
         self.restart_item = Some(restart_item);
         self.learn_terms_item = Some(learn_terms_item);
@@ -821,6 +1049,7 @@ impl DesktopApp {
         self.recording_quality_items = recording_quality_items;
         self.tray_icon = Some(tray_icon);
         self.overlay = overlay;
+        self.sync_voice_mode_menu();
         self.set_tray_visual_state(TrayVisualState::Idle, 0);
         hotkey::set_automation_cancel_enabled(false);
         self.sync_automation_menu();
@@ -1040,7 +1269,6 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             return;
         }
 
-        self.start_worker_once();
         self.start_overlay_tick_once();
         if self.hotkey_monitor.is_none() {
             self.hotkey_monitor = Some(
@@ -1058,7 +1286,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
         }
 
         match sync_launch_at_login(self.runtime.config.startup.launch_at_login) {
-            Ok(()) => self.set_tray_status("状态：待机中"),
+            Ok(()) => self.set_tray_status(&self.idle_status_text()),
             Err(error) => {
                 tracing::error!(error = %error, "sync launch-at-login setting failed");
                 self.set_tray_status(&format!(
@@ -1075,7 +1303,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 WorkerEvent::Started => {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
-                    self.set_tray_status("状态：待机中");
+                    self.set_tray_status(&self.idle_status_text());
                 }
                 WorkerEvent::RecordingStarted => {
                     self.mode = AppMode::Voice;
@@ -1108,35 +1336,119 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 WorkerEvent::IgnoredSilence => {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
-                    self.set_tray_status("状态：待机中");
+                    self.set_tray_status(&self.idle_status_text());
                 }
                 WorkerEvent::Delivered => {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
-                    self.set_tray_status("状态：文本已直贴");
+                    self.set_tray_status(&format!(
+                        "状态：文本已直贴（{}）",
+                        Self::voice_mode_label(self.runtime.config.voice.mode)
+                    ));
                 }
                 WorkerEvent::ClipboardFallback => {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
-                    self.set_tray_status("状态：已复制到剪贴板");
+                    self.set_tray_status(&format!(
+                        "状态：已复制到剪贴板（{}）",
+                        Self::voice_mode_label(self.runtime.config.voice.mode)
+                    ));
+                }
+                WorkerEvent::StreamingStarted => {
+                    self.mode = AppMode::Voice;
+                    self.set_tray_visual_state(TrayVisualState::Voice, 0);
+                    self.set_tray_status(self.streaming_status_text());
+                    self.show_streaming_status_overlay(&self.streaming_listening_message(), true);
+                }
+                WorkerEvent::StreamingPartial {
+                    raw_text,
+                    prepared_text,
+                } => {
+                    self.mode = AppMode::Voice;
+                    self.set_tray_visual_state(TrayVisualState::Voice, 0);
+                    self.set_tray_status("状态：流式实时识别中");
+                    self.show_streaming_status_overlay(
+                        &Self::streaming_partial_message(&raw_text, &prepared_text),
+                        true,
+                    );
+                }
+                WorkerEvent::StreamingFlushing => {
+                    self.mode = AppMode::Voice;
+                    self.set_tray_visual_state(TrayVisualState::Voice, 1);
+                    self.set_tray_status("状态：流式语音识别收尾中");
+                    self.show_streaming_status_overlay(Self::streaming_flushing_message(), true);
+                }
+                WorkerEvent::StreamingCommitted(text) => {
+                    self.mode = AppMode::Voice;
+                    self.set_tray_visual_state(TrayVisualState::Voice, 1);
+                    self.set_tray_status("状态：流式整理结果已提交");
+                    self.show_streaming_status_overlay(&Self::streaming_committed_message(&text), true);
+                }
+                WorkerEvent::StreamingClipboardFallback(text) => {
+                    self.mode = AppMode::Idle;
+                    self.set_tray_visual_state(TrayVisualState::Idle, 0);
+                    self.set_tray_status("状态：流式整理结果已复制到剪贴板");
+                    self.show_streaming_status_overlay(&Self::streaming_clipboard_message(&text), false);
+                }
+                WorkerEvent::StreamingFinal(text) => {
+                    self.mode = AppMode::Idle;
+                    self.set_tray_visual_state(TrayVisualState::Idle, 0);
+                    self.set_tray_status("状态：流式整理结果已完成");
+                    self.show_streaming_status_overlay(&Self::streaming_final_message(&text), false);
                 }
                 WorkerEvent::Error(message) => {
                     self.handle_worker_error(&message);
                 }
                 WorkerEvent::Unavailable(message) => {
-                    self.handle_worker_unavailable(&message);
+                    self.handle_worker_error(&message);
                 }
             },
             AppEvent::Hotkey(state) => match state {
                 hotkey::HotkeyState::VoicePressed => {
                     if self.mode == AppMode::Idle && self.runtime.config.voice.enabled {
-                        self.mode = AppMode::Voice;
-                        let _ = self.send_worker_command(WorkerCommand::HotkeyPressed);
+                        match self.runtime.config.voice.mode {
+                            ainput_shell::VoiceMode::Fast => {
+                                self.mode = AppMode::Voice;
+                                let _ =
+                                    self.send_fast_worker_command(WorkerCommand::HotkeyPressed);
+                            }
+                            ainput_shell::VoiceMode::Streaming => {
+                                if !self.runtime.config.voice.streaming.enabled {
+                                    self.set_tray_visual_state(TrayVisualState::Error, 0);
+                                    self.set_tray_status("状态：流式语音识别已在配置中关闭");
+                                    return;
+                                }
+                                self.mode = AppMode::Voice;
+                                self.set_tray_visual_state(TrayVisualState::Voice, 0);
+                                self.set_tray_status(self.streaming_status_text());
+                                self.show_streaming_status_overlay(
+                                    &self.streaming_listening_message(),
+                                    true,
+                                );
+                                let _ = self
+                                    .send_streaming_worker_command(WorkerCommand::HotkeyPressed);
+                            }
+                        }
                     }
                 }
                 hotkey::HotkeyState::VoiceReleased => {
                     if self.mode == AppMode::Voice {
-                        let _ = self.send_worker_command(WorkerCommand::HotkeyReleased);
+                        match self.runtime.config.voice.mode {
+                            ainput_shell::VoiceMode::Fast => {
+                                let _ =
+                                    self.send_fast_worker_command(WorkerCommand::HotkeyReleased);
+                            }
+                            ainput_shell::VoiceMode::Streaming => {
+                                self.set_tray_visual_state(TrayVisualState::Voice, 1);
+                                self.set_tray_status("状态：流式语音识别收尾中");
+                                self.show_streaming_status_overlay(
+                                    Self::streaming_flushing_message(),
+                                    true,
+                                );
+                                let _ = self
+                                    .send_streaming_worker_command(WorkerCommand::HotkeyReleased);
+                            }
+                        }
                     }
                 }
                 hotkey::HotkeyState::ScreenshotTriggered => {
@@ -1295,7 +1607,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             }
             AppEvent::Tray(event) => {
                 if let TrayIconEvent::DoubleClick { .. } = event {
-                    self.set_tray_status("状态：待机中");
+                    self.set_tray_status(&self.idle_status_text());
                 }
             }
             AppEvent::Menu(event) => self.handle_menu_event(event_loop, event),
@@ -1305,6 +1617,8 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.hotkey_monitor = None;
+        self.fast_worker_tx = None;
+        self.streaming_worker_tx = None;
         hotkey::set_recording_cancel_enabled(false);
         hotkey::set_automation_cancel_enabled(false);
         self.automation_service = None;
@@ -1323,6 +1637,38 @@ impl DesktopApp {
             return;
         }
         if self.handle_recording_menu_event(&event) {
+            return;
+        }
+
+        if self
+            .voice_mode_fast_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            match self.set_voice_mode(ainput_shell::VoiceMode::Fast) {
+                Ok(()) => self.set_tray_status("状态：已切换到极速语音识别"),
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：切换语音模式失败 - {}",
+                    shorten(&error.to_string(), 16)
+                )),
+            }
+            return;
+        }
+
+        if self
+            .voice_mode_streaming_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            match self.set_voice_mode(ainput_shell::VoiceMode::Streaming) {
+                Ok(()) => self.set_tray_status("状态：已切换到流式语音识别"),
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：切换语音模式失败 - {}",
+                    shorten(&error.to_string(), 16)
+                )),
+            }
             return;
         }
 

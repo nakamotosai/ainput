@@ -77,6 +77,24 @@ impl ActiveRecording {
         f32::from_bits(self.shared_level_bits.load(Ordering::Relaxed))
     }
 
+    pub fn sample_rate_hz(&self) -> i32 {
+        self.sample_rate_hz
+    }
+
+    pub fn take_new_samples(&self, cursor: &mut usize) -> Vec<f32> {
+        let Ok(samples) = self.shared_samples.lock() else {
+            return Vec::new();
+        };
+
+        if *cursor >= samples.len() {
+            return Vec::new();
+        }
+
+        let chunk = samples[*cursor..].to_vec();
+        *cursor = samples.len();
+        chunk
+    }
+
     pub fn stop(self) -> Result<RecordedAudio> {
         drop(self.stream);
 

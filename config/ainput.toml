@@ -21,6 +21,11 @@ mouse_middle_hold_enabled = false
 # 是否启用语音输入主功能。
 enabled = true
 
+# 当前语音模式。
+# fast = 极速语音识别
+# streaming = 流式语音识别
+mode = "fast"
+
 # 是否优先尝试“直接粘贴到当前输入框”。
 # true = 先写剪贴板再模拟 Ctrl+V
 # false = 不做直贴，只走剪贴板
@@ -49,6 +54,22 @@ history_file_name = "voice-history.log"
 
 # 语音历史最多保留多少条。
 history_limit = 500
+
+[voice.streaming]
+# 是否启用流式语音识别模式。
+enabled = true
+
+# 流式 ASR 模型目录。
+model_dir = "models/streaming-zipformer-small-bilingual-zh-en"
+
+# 是否显示流式语音面板。
+panel_enabled = true
+
+# 是否启用流式短句整理。
+rewrite_enabled = true
+
+# 流式音频切块时长（毫秒）。
+chunk_ms = 320
 
 [capture]
 # 是否启用截图主功能。

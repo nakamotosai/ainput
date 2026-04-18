@@ -251,6 +251,23 @@ impl RecordingOverlay {
         self.voice_pulse_enabled = enabled;
     }
 
+    pub fn show_status_hud(&mut self, message: &str, persistent: bool) {
+        self.suppress_voice_bar_immediately();
+
+        if self.hud_message != message {
+            self.hud_message = message.to_string();
+            self.hud_window.set_text(message);
+        }
+
+        self.hud_persistent = persistent;
+        self.hud_hold_until = Some(Instant::now() + HUD_DISPLAY_MIN);
+    }
+
+    pub fn clear_status_hud(&mut self) {
+        self.hud_persistent = false;
+        self.hud_hold_until = Some(Instant::now());
+    }
+
     pub fn update_automation_feedback(
         &mut self,
         activity: AutomationActivity,
