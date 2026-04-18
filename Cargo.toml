@@ -16,7 +16,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Proprietary"
-version = "1.0.14-preview.1"
+version = "1.0.14-preview.2"
 authors = ["sai"]
 
 [workspace.dependencies]

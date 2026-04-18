@@ -32,20 +32,20 @@ const FILL_ALPHA_MAX: u8 = 245;
 const TRACK_COLOR: COLORREF = COLORREF(0x00404040);
 const FILL_COLOR: COLORREF = COLORREF(0x00F4F4F4);
 
-const HUD_INITIAL_WIDTH_PX: i32 = 320;
-const HUD_INITIAL_HEIGHT_PX: i32 = 132;
-const HUD_MIN_WIDTH_PX: i32 = 220;
-const HUD_MIN_HEIGHT_PX: i32 = 120;
+const HUD_INITIAL_WIDTH_PX: i32 = 720;
+const HUD_INITIAL_HEIGHT_PX: i32 = 220;
+const HUD_MIN_WIDTH_PX: i32 = 420;
+const HUD_MIN_HEIGHT_PX: i32 = 170;
 const HUD_RADIUS_PX: i32 = 28;
 const HUD_MARGIN_LEFT_PX: i32 = 18;
 const HUD_MARGIN_BOTTOM_PX: i32 = 24;
 const HUD_ALPHA_MAX: u8 = 212;
 const HUD_DISPLAY_MIN: Duration = Duration::from_millis(1000);
 const HUD_BG_COLOR: COLORREF = COLORREF(0x00F3F3F3);
-const HUD_TEXT_PADDING_X_PX: i32 = 24;
-const HUD_TEXT_PADDING_Y_PX: i32 = 18;
-const HUD_FONT_HEIGHT_PX: i32 = 84;
-const HUD_MIN_TEXT_WIDTH_PX: i32 = 120;
+const HUD_TEXT_PADDING_X_PX: i32 = 28;
+const HUD_TEXT_PADDING_Y_PX: i32 = 20;
+const HUD_FONT_HEIGHT_PX: i32 = 34;
+const HUD_MIN_TEXT_WIDTH_PX: i32 = 220;
 
 const CLICK_OUTER_SIZE_PX: i32 = 58;
 const CLICK_INNER_SIZE_PX: i32 = 18;
@@ -808,14 +808,17 @@ impl HudWindow {
         let work_area = work_area_rect();
         let available_width =
             (work_area.right - work_area.left - HUD_MARGIN_LEFT_PX * 2).max(HUD_MIN_WIDTH_PX);
+        let available_height =
+            (work_area.bottom - work_area.top - HUD_MARGIN_BOTTOM_PX * 2).max(HUD_MIN_HEIGHT_PX);
         let max_text_width = (available_width - HUD_TEXT_PADDING_X_PX * 2).max(1);
         let (text_width, text_height) =
             measure_hud_text(self.text_hwnd, self.font, text, max_text_width);
         let hud_width =
             (text_width + HUD_TEXT_PADDING_X_PX * 2).clamp(HUD_MIN_WIDTH_PX, available_width);
-        let hud_height = (text_height + HUD_TEXT_PADDING_Y_PX * 2).max(HUD_MIN_HEIGHT_PX);
+        let hud_height =
+            (text_height + HUD_TEXT_PADDING_Y_PX * 2).clamp(HUD_MIN_HEIGHT_PX, available_height);
         let hud_x = work_area.left + HUD_MARGIN_LEFT_PX;
-        let hud_y = work_area.bottom - HUD_MARGIN_BOTTOM_PX - hud_height;
+        let hud_y = (work_area.bottom - HUD_MARGIN_BOTTOM_PX - hud_height).max(work_area.top);
 
         unsafe {
             let _ = SetWindowPos(

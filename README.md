@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.14-preview.1`
+当前预览版本：`1.0.14-preview.2`
 
 它不做系统级 IME，也不依赖在线模型。当前重点是把四条前台主链路做稳：
 
@@ -40,7 +40,7 @@
   - `极速语音识别` 保留原有 `SenseVoice` 离线整段识别
   - `流式语音识别` 使用 `streaming-zipformer-small-bilingual-zh-en`
   - 流式模式按住热键时显示 HUD 面板
-  - 面板实时显示 `原始识别` 与 `待提交整理`
+  - 面板实时显示 `实时` 与 `整理` 两行，按住期间持续增长
   - 松开热键后，对整段内容做规则整理，再一次性提交到当前输入区
   - 语音热键可配置
   - 自动直贴失败时，可按配置降级到剪贴板
@@ -158,8 +158,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.14-preview.1\
-dist\ainput-1.0.14-preview.1.zip
+dist\ainput-1.0.14-preview.2\
+dist\ainput-1.0.14-preview.2.zip
 ```
 
 说明：
@@ -185,7 +185,7 @@ dist\ainput-1.0.14-preview.1.zip
 
 - 在托盘一级菜单切到 `流式语音识别`
 - 按住 `Alt+Z`
-- 说话时左下 HUD 会持续显示 `原始识别` 和 `待提交整理`
+- 说话时左下 HUD 会持续显示 `实时` 和 `整理`，文字会随着说话不断增长
 - 松开后程序会收尾、整理整段内容，再一次性写入当前输入框
 - 如果直贴失败，会按配置退回到剪贴板
 
@@ -424,8 +424,8 @@ cargo build --release -p ainput-desktop
 
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.14-preview.1\`
-- `dist\ainput-1.0.14-preview.1.zip`
+- `dist\ainput-1.0.14-preview.2\`
+- `dist\ainput-1.0.14-preview.2.zip`
 
 ## 项目结构
 

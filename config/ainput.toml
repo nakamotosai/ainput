@@ -69,7 +69,7 @@ panel_enabled = true
 rewrite_enabled = true
 
 # 流式音频切块时长（毫秒）。
-chunk_ms = 320
+chunk_ms = 160
 
 [capture]
 # 是否启用截图主功能。

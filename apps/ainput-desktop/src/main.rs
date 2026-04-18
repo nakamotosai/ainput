@@ -571,18 +571,16 @@ impl DesktopApp {
             "规则整理：当前关闭"
         };
         format!(
-            "流式语音识别\n请开始说话\n{}\n待提交整理：等待稳定整段\n模型目录：{}",
-            rewrite_status, self.runtime.config.voice.streaming.model_dir
+            "流式语音识别\n按住说话，松手整段提交\n{}\n实时：等待语音\n整理：等待语音",
+            rewrite_status
         )
     }
 
     fn streaming_partial_message(raw_text: &str, prepared_text: &str) -> String {
         if prepared_text.is_empty() {
-            format!("流式语音识别\n原始识别：{raw_text}\n待提交整理：等待稳定整段")
+            format!("流式语音识别\n实时：{raw_text}\n整理：等待语音继续")
         } else {
-            format!(
-                "流式语音识别\n原始识别：{raw_text}\n待提交整理：{prepared_text}"
-            )
+            format!("流式语音识别\n实时：{raw_text}\n整理：{prepared_text}")
         }
     }
 

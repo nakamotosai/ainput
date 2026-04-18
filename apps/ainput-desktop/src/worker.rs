@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,13 +8,11 @@ use ainput_output::{OutputConfig, OutputDelivery};
 use anyhow::Result;
 use winit::event_loop::EventLoopProxy;
 
-use crate::{AppEvent, AppRuntime, hotkey};
+use crate::{hotkey, AppEvent, AppRuntime};
 
 const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
 const STREAMING_FINALIZE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const STREAMING_FINALIZE_TIMEOUT: Duration = Duration::from_millis(800);
-const STREAMING_STABLE_PREVIEW_MIN_CHARS: usize = 6;
-const STREAMING_STABLE_PREVIEW_RESERVE_CHARS: usize = 6;
 
 pub(crate) enum WorkerEvent {
     Started,
@@ -363,6 +361,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 &recognizer,
                                 &stream,
                                 &recording,
+                                runtime.config.voice.streaming.rewrite_enabled,
                                 &mut sample_cursor,
                                 &mut captured_samples,
                                 &mut last_partial,
@@ -380,6 +379,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 emit_streaming_partial_if_changed(
                                     &recognizer,
                                     &stream,
+                                    runtime.config.voice.streaming.rewrite_enabled,
                                     &mut last_partial,
                                     &mut last_prepared_preview,
                                     &proxy,
@@ -402,15 +402,14 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 .unwrap_or_default();
 
                             if final_text.is_empty() {
-                                let _ = proxy
-                                    .send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
+                                let _ =
+                                    proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
                             } else {
                                 let prepared_full_text =
                                     build_streaming_output_text(&runtime, &final_text);
                                 if prepared_full_text.is_empty() {
-                                    let _ = proxy.send_event(AppEvent::Worker(
-                                        WorkerEvent::IgnoredSilence,
-                                    ));
+                                    let _ = proxy
+                                        .send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
                                     drop(recording);
                                     continue;
                                 }
@@ -453,11 +452,10 @@ pub(crate) fn streaming_push_to_talk_worker(
                                         delivery
                                     }
                                     Err(error) => {
-                                        let _ = proxy.send_event(AppEvent::Worker(
-                                            WorkerEvent::Error(format!(
-                                                "输出流式文本失败：{error}"
-                                            )),
-                                        ));
+                                        let _ =
+                                            proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                                format!("输出流式文本失败：{error}"),
+                                            )));
                                         drop(recording);
                                         continue;
                                     }
@@ -490,6 +488,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                     &recognizer,
                     stream,
                     recording,
+                    runtime.config.voice.streaming.rewrite_enabled,
                     &mut sample_cursor,
                     &mut captured_samples,
                     &mut last_partial,
@@ -518,7 +517,9 @@ fn build_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::SenseVoiceRecogn
     })
 }
 
-fn build_streaming_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::StreamingZipformerRecognizer> {
+fn build_streaming_recognizer(
+    runtime: &AppRuntime,
+) -> Result<ainput_asr::StreamingZipformerRecognizer> {
     ainput_asr::StreamingZipformerRecognizer::create(&ainput_asr::StreamingZipformerConfig {
         model_dir: runtime
             .runtime_paths
@@ -539,6 +540,7 @@ fn flush_streaming_audio_chunk(
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
     stream: &ainput_asr::StreamingZipformerStream,
     recording: &ainput_audio::ActiveRecording,
+    rewrite_enabled: bool,
     sample_cursor: &mut usize,
     captured_samples: &mut Vec<f32>,
     last_partial: &mut String,
@@ -556,6 +558,7 @@ fn flush_streaming_audio_chunk(
     emit_streaming_partial_if_changed(
         recognizer,
         stream,
+        rewrite_enabled,
         last_partial,
         last_prepared_preview,
         proxy,
@@ -565,6 +568,7 @@ fn flush_streaming_audio_chunk(
 fn emit_streaming_partial_if_changed(
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
     stream: &ainput_asr::StreamingZipformerStream,
+    rewrite_enabled: bool,
     last_partial: &mut String,
     last_prepared_preview: &mut String,
     proxy: &EventLoopProxy<AppEvent>,
@@ -578,7 +582,12 @@ fn emit_streaming_partial_if_changed(
         return;
     }
 
-    let prepared_text = build_streaming_prepared_preview(last_partial, &text);
+    let prepared_text = build_streaming_prepared_preview(&text, rewrite_enabled);
+    tracing::info!(
+        raw_text = %text,
+        prepared_text = %prepared_text,
+        "streaming partial updated"
+    );
     *last_partial = text.clone();
     if *last_prepared_preview != prepared_text {
         *last_prepared_preview = prepared_text.clone();
@@ -694,50 +703,17 @@ fn streaming_delivery_label(delivery: OutputDelivery) -> &'static str {
     }
 }
 
-fn build_streaming_prepared_preview(previous_partial: &str, current_partial: &str) -> String {
-    let common_prefix = common_prefix(previous_partial, current_partial);
-    let stable_prefix = trim_stable_preview_prefix(&common_prefix);
-    let rewritten_segments = ainput_rewrite::rewrite_streaming_text(&stable_prefix);
-    if rewritten_segments.is_empty() {
-        ainput_rewrite::normalize_streaming_preview(&stable_prefix)
+fn build_streaming_prepared_preview(current_partial: &str, rewrite_enabled: bool) -> String {
+    if rewrite_enabled {
+        let rewritten_segments = ainput_rewrite::rewrite_streaming_text(current_partial);
+        if rewritten_segments.is_empty() {
+            ainput_rewrite::normalize_streaming_preview(current_partial)
+        } else {
+            rewritten_segments.join("")
+        }
     } else {
-        rewritten_segments.join("")
+        ainput_rewrite::normalize_streaming_preview(current_partial)
     }
-}
-
-fn trim_stable_preview_prefix(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len()
-        <= STREAMING_STABLE_PREVIEW_MIN_CHARS + STREAMING_STABLE_PREVIEW_RESERVE_CHARS
-    {
-        return String::new();
-    }
-
-    let cutoff = chars.len() - STREAMING_STABLE_PREVIEW_RESERVE_CHARS;
-    let adjusted_cutoff = safe_preview_cutoff(&chars, cutoff);
-    chars[..adjusted_cutoff].iter().collect::<String>().trim().to_string()
-}
-
-fn safe_preview_cutoff(chars: &[char], cutoff: usize) -> usize {
-    let mut index = cutoff.min(chars.len());
-    while index > STREAMING_STABLE_PREVIEW_MIN_CHARS
-        && chars
-            .get(index - 1)
-            .is_some_and(|ch| ch.is_ascii_alphanumeric())
-        && chars.get(index).is_some_and(|ch| ch.is_ascii_alphanumeric())
-    {
-        index -= 1;
-    }
-
-    index.max(STREAMING_STABLE_PREVIEW_MIN_CHARS)
-}
-
-fn common_prefix(left: &str, right: &str) -> String {
-    left.chars()
-        .zip(right.chars())
-        .take_while(|(left, right)| left == right)
-        .map(|(ch, _)| ch)
-        .collect()
 }
 
 fn build_streaming_output_text(runtime: &AppRuntime, final_text: &str) -> String {
@@ -750,23 +726,21 @@ fn build_streaming_output_text(runtime: &AppRuntime, final_text: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{build_streaming_prepared_preview, common_prefix, trim_stable_preview_prefix};
+    use super::build_streaming_prepared_preview;
 
     #[test]
-    fn common_prefix_keeps_shared_prefix_only() {
-        assert_eq!(common_prefix("你好世界", "你好明天"), "你好");
-    }
-
-    #[test]
-    fn stable_preview_keeps_safe_prefix() {
-        assert_eq!(trim_stable_preview_prefix("帮我看一下这个功能现在"), "帮我看一下这个");
-    }
-
-    #[test]
-    fn streaming_preview_uses_previous_partial() {
+    fn streaming_preview_keeps_full_partial_with_rewrite() {
         assert_eq!(
-            build_streaming_prepared_preview("帮我看一下这个功能", "帮我看一下这个功能有没有问题"),
-            "帮我看一下这个"
+            build_streaming_prepared_preview("帮我看一下这个功能有没有问题", true),
+            "帮我看一下这个功能有没有问题。"
+        );
+    }
+
+    #[test]
+    fn streaming_preview_can_skip_rewrite() {
+        assert_eq!(
+            build_streaming_prepared_preview("嗯， 帮我看一下 这个功能", false),
+            "帮我看一下 这个功能"
         );
     }
 }
