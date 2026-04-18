@@ -13,7 +13,6 @@ use crate::{AppEvent, AppRuntime, hotkey};
 const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
 const STREAMING_FINALIZE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const STREAMING_FINALIZE_TIMEOUT: Duration = Duration::from_millis(800);
-const STREAMING_SEGMENT_PASTE_INTERVAL: Duration = Duration::from_millis(45);
 const STREAMING_STABLE_PREVIEW_MIN_CHARS: usize = 6;
 const STREAMING_STABLE_PREVIEW_RESERVE_CHARS: usize = 6;
 
@@ -32,7 +31,6 @@ pub(crate) enum WorkerEvent {
         prepared_text: String,
     },
     StreamingFlushing,
-    StreamingCommitted(String),
     StreamingClipboardFallback(String),
     StreamingFinal(String),
     Error(String),
@@ -407,34 +405,15 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 let _ = proxy
                                     .send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
                             } else {
-                                let rewritten_segments =
-                                    build_streaming_output_segments(&runtime, &final_text);
-                                if rewritten_segments.is_empty() {
+                                let prepared_full_text =
+                                    build_streaming_output_text(&runtime, &final_text);
+                                if prepared_full_text.is_empty() {
                                     let _ = proxy.send_event(AppEvent::Worker(
                                         WorkerEvent::IgnoredSilence,
                                     ));
                                     drop(recording);
                                     continue;
                                 }
-
-                                let prepared_segments = rewritten_segments
-                                    .iter()
-                                    .map(|segment| runtime.output_controller.prepare_streaming_text(segment))
-                                    .collect::<Result<Vec<_>>>();
-
-                                let prepared_segments = match prepared_segments {
-                                    Ok(segments) => segments,
-                                    Err(error) => {
-                                        let _ = proxy.send_event(AppEvent::Worker(
-                                            WorkerEvent::Error(format!(
-                                                "整理流式文本失败：{error}"
-                                            )),
-                                        ));
-                                        drop(recording);
-                                        continue;
-                                    }
-                                };
-                                let prepared_full_text = prepared_segments.join("");
 
                                 let hotkey_release_wait_started_at = Instant::now();
                                 let modifiers_released = hotkey::wait_for_voice_hotkey_release(
@@ -459,94 +438,29 @@ pub(crate) fn streaming_push_to_talk_worker(
                                     voice_hotkey_uses_alt: hotkey::voice_hotkey_uses_alt(),
                                 };
 
-                                let direct_output_config = OutputConfig {
-                                    prefer_direct_paste: true,
-                                    fallback_to_clipboard: false,
-                                    voice_hotkey_uses_alt: output_config.voice_hotkey_uses_alt,
-                                };
-
-                                let delivery = if output_config.prefer_direct_paste {
-                                    let mut direct_paste_error = None;
-
-                                    for (index, segment) in prepared_segments.iter().enumerate() {
-                                        if let Err(error) = runtime
-                                            .output_controller
-                                            .paste_text_verbatim(segment, &direct_output_config)
-                                        {
-                                            direct_paste_error = Some(error);
-                                            break;
-                                        }
-
-                                        let _ = proxy.send_event(AppEvent::Worker(
-                                            WorkerEvent::StreamingCommitted(segment.clone()),
-                                        ));
-
-                                        if index + 1 < prepared_segments.len() {
-                                            thread::sleep(STREAMING_SEGMENT_PASTE_INTERVAL);
-                                        }
-                                    }
-
-                                    if let Some(error) = direct_paste_error {
-                                        if !output_config.fallback_to_clipboard {
+                                let delivery = match runtime
+                                    .output_controller
+                                    .deliver_text(&prepared_full_text, &output_config)
+                                {
+                                    Ok(delivery) => {
+                                        if matches!(delivery, OutputDelivery::ClipboardOnly) {
                                             let _ = proxy.send_event(AppEvent::Worker(
-                                                WorkerEvent::Error(format!(
-                                                    "输出流式文本失败：{error}"
-                                                )),
+                                                WorkerEvent::StreamingClipboardFallback(
+                                                    prepared_full_text.clone(),
+                                                ),
                                             ));
-                                            drop(recording);
-                                            continue;
                                         }
-
-                                        tracing::warn!(
-                                            error = %error,
-                                            "streaming direct paste failed, falling back to clipboard"
-                                        );
-                                        if let Err(copy_error) =
-                                            ainput_output::copy_to_clipboard(&prepared_full_text)
-                                        {
-                                            let _ = proxy.send_event(AppEvent::Worker(
-                                                WorkerEvent::Error(format!(
-                                                    "复制流式文本失败：{copy_error}"
-                                                )),
-                                            ));
-                                            drop(recording);
-                                            continue;
-                                        }
-                                        let _ = proxy.send_event(AppEvent::Worker(
-                                            WorkerEvent::StreamingClipboardFallback(
-                                                prepared_full_text.clone(),
-                                            ),
-                                        ));
-                                        OutputDelivery::ClipboardOnly
-                                    } else {
-                                        OutputDelivery::DirectPaste
+                                        delivery
                                     }
-                                } else if output_config.fallback_to_clipboard {
-                                    if let Err(error) =
-                                        ainput_output::copy_to_clipboard(&prepared_full_text)
-                                    {
+                                    Err(error) => {
                                         let _ = proxy.send_event(AppEvent::Worker(
                                             WorkerEvent::Error(format!(
-                                                "复制流式文本失败：{error}"
+                                                "输出流式文本失败：{error}"
                                             )),
                                         ));
                                         drop(recording);
                                         continue;
                                     }
-                                    let _ = proxy.send_event(AppEvent::Worker(
-                                        WorkerEvent::StreamingClipboardFallback(
-                                            prepared_full_text.clone(),
-                                        ),
-                                    ));
-                                    OutputDelivery::ClipboardOnly
-                                } else {
-                                    let _ = proxy.send_event(AppEvent::Worker(
-                                        WorkerEvent::Error(
-                                            "流式语音输出已关闭直贴和剪贴板回退".to_string(),
-                                        ),
-                                    ));
-                                    drop(recording);
-                                    continue;
                                 };
 
                                 runtime
@@ -783,7 +697,12 @@ fn streaming_delivery_label(delivery: OutputDelivery) -> &'static str {
 fn build_streaming_prepared_preview(previous_partial: &str, current_partial: &str) -> String {
     let common_prefix = common_prefix(previous_partial, current_partial);
     let stable_prefix = trim_stable_preview_prefix(&common_prefix);
-    ainput_rewrite::normalize_streaming_preview(&stable_prefix)
+    let rewritten_segments = ainput_rewrite::rewrite_streaming_text(&stable_prefix);
+    if rewritten_segments.is_empty() {
+        ainput_rewrite::normalize_streaming_preview(&stable_prefix)
+    } else {
+        rewritten_segments.join("")
+    }
 }
 
 fn trim_stable_preview_prefix(text: &str) -> String {
@@ -821,16 +740,11 @@ fn common_prefix(left: &str, right: &str) -> String {
         .collect()
 }
 
-fn build_streaming_output_segments(runtime: &AppRuntime, final_text: &str) -> Vec<String> {
+fn build_streaming_output_text(runtime: &AppRuntime, final_text: &str) -> String {
     if runtime.config.voice.streaming.rewrite_enabled {
-        ainput_rewrite::rewrite_streaming_text(final_text)
+        ainput_rewrite::rewrite_streaming_text(final_text).join("")
     } else {
-        let normalized = ainput_rewrite::normalize_transcription(final_text);
-        if normalized.is_empty() {
-            Vec::new()
-        } else {
-            vec![normalized]
-        }
+        ainput_rewrite::normalize_transcription(final_text)
     }
 }
 

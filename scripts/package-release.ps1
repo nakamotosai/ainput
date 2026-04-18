@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.13"
+    [string]$Version = "1.0.14-preview.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,6 +11,8 @@ $packageDir = Join-Path $distRoot $packageName
 $zipPath = Join-Path $distRoot "$packageName.zip"
 $modelSource = Join-Path $repoRoot "models\sense-voice\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 $modelTarget = Join-Path $packageDir "models\sense-voice"
+$streamingModelSource = Join-Path $repoRoot "models\streaming-zipformer-small-bilingual-zh-en"
+$streamingModelTarget = Join-Path $packageDir "models\streaming-zipformer-small-bilingual-zh-en"
 $packageExe = Join-Path $packageDir "ainput-desktop.exe"
 
 function Remove-ItemWithRetry {
@@ -64,6 +66,7 @@ if (Test-Path $zipPath) {
 New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "config") | Out-Null
 New-Item -ItemType Directory -Force -Path $modelTarget | Out-Null
+New-Item -ItemType Directory -Force -Path $streamingModelTarget | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "logs") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "assets") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") | Out-Null
@@ -75,6 +78,7 @@ Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "as
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
 Copy-Item (Join-Path $repoRoot "data\terms\base_terms.json") (Join-Path $packageDir "data\terms\base_terms.json") -Force
 Copy-Item $modelSource $modelTarget -Recurse -Force
+Copy-Item $streamingModelSource $streamingModelTarget -Recurse -Force
 
 Set-Content -Path (Join-Path $packageDir "run-ainput.bat") -Encoding ASCII -Value @(
     "@echo off",
@@ -97,7 +101,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- run-ainput.bat: launcher",
     "- README.md: full guide",
     "- config\ainput.toml: default config",
-    "- models\: offline speech model",
+    "- models\\sense-voice\\: fast voice recognition model",
+    "- models\\streaming-zipformer-small-bilingual-zh-en\\: streaming voice recognition model",
     "- assets\app-icon.ico: tray icon resource",
     "- data\terms\base_terms.json: built-in AI terms",
     "- logs\: runtime logs",
@@ -106,6 +111,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
+    "- Streaming voice shows a HUD while the hotkey is held, and submits the rewritten full text only after release",
     "- Clipboard fallback is used when direct paste fails",
     "- Recording options are available from the tray: audio, mouse, watermark, FPS, and quality",
     "- During automation recording and playback, the tray icon, left-bottom HUD, and click feedback show the current state",

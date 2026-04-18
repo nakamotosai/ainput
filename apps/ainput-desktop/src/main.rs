@@ -571,14 +571,14 @@ impl DesktopApp {
             "规则整理：当前关闭"
         };
         format!(
-            "流式语音识别\n请开始说话\n{}\n待提交整理：等待稳定短句\n模型目录：{}",
+            "流式语音识别\n请开始说话\n{}\n待提交整理：等待稳定整段\n模型目录：{}",
             rewrite_status, self.runtime.config.voice.streaming.model_dir
         )
     }
 
     fn streaming_partial_message(raw_text: &str, prepared_text: &str) -> String {
         if prepared_text.is_empty() {
-            format!("流式语音识别\n原始识别：{raw_text}\n待提交整理：等待稳定短句")
+            format!("流式语音识别\n原始识别：{raw_text}\n待提交整理：等待稳定整段")
         } else {
             format!(
                 "流式语音识别\n原始识别：{raw_text}\n待提交整理：{prepared_text}"
@@ -588,10 +588,6 @@ impl DesktopApp {
 
     fn streaming_flushing_message() -> &'static str {
         "流式语音识别\n正在收尾，请稍候"
-    }
-
-    fn streaming_committed_message(text: &str) -> String {
-        format!("流式语音识别\n已提交整理：{text}")
     }
 
     fn streaming_clipboard_message(text: &str) -> String {
@@ -1377,12 +1373,6 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.set_tray_visual_state(TrayVisualState::Voice, 1);
                     self.set_tray_status("状态：流式语音识别收尾中");
                     self.show_streaming_status_overlay(Self::streaming_flushing_message(), true);
-                }
-                WorkerEvent::StreamingCommitted(text) => {
-                    self.mode = AppMode::Voice;
-                    self.set_tray_visual_state(TrayVisualState::Voice, 1);
-                    self.set_tray_status("状态：流式整理结果已提交");
-                    self.show_streaming_status_overlay(&Self::streaming_committed_message(&text), true);
                 }
                 WorkerEvent::StreamingClipboardFallback(text) => {
                     self.mode = AppMode::Idle;

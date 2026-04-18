@@ -122,13 +122,7 @@ impl OutputController {
     pub fn deliver_text(&self, text: &str, config: &OutputConfig) -> Result<OutputDelivery> {
         let started_at = Instant::now();
         let correction_started_at = Instant::now();
-        let corrected_text = {
-            let catalog = self
-                .term_catalog
-                .read()
-                .map_err(|_| anyhow!("term catalog read lock poisoned"))?;
-            catalog.apply_to_text(text)
-        };
+        let corrected_text = self.apply_term_corrections(text)?;
         let correction_elapsed_ms = correction_started_at.elapsed().as_millis();
 
         let prepare_started_at = Instant::now();
@@ -185,22 +179,6 @@ impl OutputController {
             "output delivery timing"
         );
         Ok(OutputDelivery::ClipboardOnly)
-    }
-
-    pub fn prepare_streaming_text(&self, text: &str) -> Result<String> {
-        self.apply_term_corrections(text)
-    }
-
-    pub fn paste_text_verbatim(&self, text: &str, config: &OutputConfig) -> Result<()> {
-        let context = inspect_output_context().unwrap_or_else(|error| {
-            tracing::warn!(error = %error, "failed to inspect caret context for streaming paste");
-            OutputContextSnapshot {
-                process_name: None,
-                kind: OutputContextKind::Unknown,
-            }
-        });
-
-        paste_via_clipboard(text, &context, config)
     }
 
     pub fn learn_from_recent_correction(
