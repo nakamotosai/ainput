@@ -173,7 +173,9 @@ fn build_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::SenseVoiceRecogn
     })
 }
 
-fn build_streaming_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::StreamingZipformerRecognizer> {
+fn build_streaming_recognizer(
+    runtime: &AppRuntime,
+) -> Result<ainput_asr::StreamingZipformerRecognizer> {
     ainput_asr::StreamingZipformerRecognizer::create(&ainput_asr::StreamingZipformerConfig {
         model_dir: runtime
             .runtime_paths
@@ -216,6 +218,10 @@ fn open_readme_document(runtime: &AppRuntime) -> Result<()> {
 
 fn open_config_document(runtime: &AppRuntime) -> Result<()> {
     open_in_notepad(runtime.runtime_paths.config_file.clone())
+}
+
+fn open_hud_overlay_document(runtime: &AppRuntime) -> Result<()> {
+    open_in_notepad(runtime.runtime_paths.hud_overlay_file.clone())
 }
 
 fn open_voice_history_document(runtime: &AppRuntime) -> Result<()> {
@@ -292,6 +298,7 @@ struct DesktopApp {
     status_item: Option<MenuItem>,
     voice_mode_fast_item: Option<CheckMenuItem>,
     voice_mode_streaming_item: Option<CheckMenuItem>,
+    open_hud_overlay_item: Option<MenuItem>,
     learn_terms_item: Option<MenuItem>,
     mouse_middle_item: Option<CheckMenuItem>,
     launch_at_login_item: Option<CheckMenuItem>,
@@ -336,6 +343,7 @@ impl DesktopApp {
             status_item: None,
             voice_mode_fast_item: None,
             voice_mode_streaming_item: None,
+            open_hud_overlay_item: None,
             learn_terms_item: None,
             mouse_middle_item: None,
             launch_at_login_item: None,
@@ -413,7 +421,9 @@ impl DesktopApp {
 
             let message = match result {
                 Ok(()) => "流式语音线程已退出，下次按快捷键会自动重试".to_string(),
-                Err(payload) => format!("流式语音线程异常退出：{}", panic_message(payload.as_ref())),
+                Err(payload) => {
+                    format!("流式语音线程异常退出：{}", panic_message(payload.as_ref()))
+                }
             };
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Unavailable(message)));
         });
@@ -617,7 +627,8 @@ impl DesktopApp {
         self.runtime.config.voice.mode = mode;
         self.sync_voice_mode_menu();
 
-        if let Err(error) = ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
+        if let Err(error) =
+            ainput_shell::save_config(&self.runtime.runtime_paths, &self.runtime.config)
         {
             self.runtime.config.voice.mode = previous_mode;
             self.sync_voice_mode_menu();
@@ -625,7 +636,15 @@ impl DesktopApp {
         }
 
         self.set_tray_status(&self.idle_status_text());
+        self.prewarm_current_voice_worker();
         Ok(())
+    }
+
+    fn prewarm_current_voice_worker(&mut self) {
+        match self.runtime.config.voice.mode {
+            ainput_shell::VoiceMode::Fast => self.start_fast_worker_once(),
+            ainput_shell::VoiceMode::Streaming => self.start_streaming_worker_once(),
+        }
     }
 
     fn show_streaming_status_overlay(&mut self, message: &str, persistent: bool) {
@@ -696,6 +715,8 @@ impl DesktopApp {
             self.runtime.config.voice.mode == ainput_shell::VoiceMode::Streaming,
             None,
         );
+        let open_hud_overlay_item =
+            MenuItem::with_id("open_hud_overlay_config", "打开 HUD 参数文档", true, None);
 
         let voice_hotkey_hint = MenuItem::with_id(
             "voice_hotkey_hint",
@@ -986,11 +1007,14 @@ impl DesktopApp {
 
         let separator = PredefinedMenuItem::separator();
         let mode_separator = PredefinedMenuItem::separator();
+        let hud_separator = PredefinedMenuItem::separator();
         let _ = tray_menu.append(&status_item);
         let _ = tray_menu.append(&separator);
         let _ = tray_menu.append(&voice_mode_fast_item);
         let _ = tray_menu.append(&voice_mode_streaming_item);
         let _ = tray_menu.append(&mode_separator);
+        let _ = tray_menu.append(&open_hud_overlay_item);
+        let _ = tray_menu.append(&hud_separator);
         let _ = tray_menu.append(&voice_menu);
         let _ = tray_menu.append(&capture_menu);
         let _ = tray_menu.append(&recording_menu);
@@ -1006,7 +1030,7 @@ impl DesktopApp {
             .build()
             .map_err(|error| anyhow!("create tray icon: {error}"))?;
 
-        let overlay = match overlay::RecordingOverlay::create() {
+        let overlay = match overlay::RecordingOverlay::create(&self.runtime.config.hud_overlay) {
             Ok(overlay) => Some(overlay),
             Err(error) => {
                 tracing::error!(error = %error, "create recording overlay failed");
@@ -1018,6 +1042,7 @@ impl DesktopApp {
         self.status_item = Some(status_item);
         self.voice_mode_fast_item = Some(voice_mode_fast_item);
         self.voice_mode_streaming_item = Some(voice_mode_streaming_item);
+        self.open_hud_overlay_item = Some(open_hud_overlay_item);
         self.exit_item = Some(exit_item);
         self.restart_item = Some(restart_item);
         self.learn_terms_item = Some(learn_terms_item);
@@ -1262,6 +1287,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
         }
 
         self.start_overlay_tick_once();
+        self.prewarm_current_voice_worker();
         if self.hotkey_monitor.is_none() {
             self.hotkey_monitor = Some(
                 hotkey::GlobalHotkeyMonitor::start(
@@ -1374,13 +1400,19 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：流式整理结果已复制到剪贴板");
-                    self.show_streaming_status_overlay(&Self::streaming_clipboard_message(&text), false);
+                    self.show_streaming_status_overlay(
+                        &Self::streaming_clipboard_message(&text),
+                        false,
+                    );
                 }
                 WorkerEvent::StreamingFinal(text) => {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：流式整理结果已完成");
-                    self.show_streaming_status_overlay(&Self::streaming_final_message(&text), false);
+                    self.show_streaming_status_overlay(
+                        &Self::streaming_final_message(&text),
+                        false,
+                    );
                 }
                 WorkerEvent::Error(message) => {
                     self.handle_worker_error(&message);
@@ -1395,8 +1427,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                         match self.runtime.config.voice.mode {
                             ainput_shell::VoiceMode::Fast => {
                                 self.mode = AppMode::Voice;
-                                let _ =
-                                    self.send_fast_worker_command(WorkerCommand::HotkeyPressed);
+                                let _ = self.send_fast_worker_command(WorkerCommand::HotkeyPressed);
                             }
                             ainput_shell::VoiceMode::Streaming => {
                                 if !self.runtime.config.voice.streaming.enabled {
@@ -1691,6 +1722,11 @@ impl DesktopApp {
             self.set_tray_status_from_result(
                 open_config_document(&self.runtime),
                 "状态：已打开配置文件",
+            );
+        } else if event.id.0 == "open_hud_overlay_config" {
+            self.set_tray_status_from_result(
+                open_hud_overlay_document(&self.runtime),
+                "状态：已打开 HUD 参数文档",
             );
         } else if event.id.0 == "open_logs" {
             self.set_tray_status_from_result(

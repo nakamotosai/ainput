@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.14-preview.3"
+    [string]$Version = "1.0.14-preview.4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,6 +73,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") |
 
 Copy-Item (Join-Path $repoRoot "target\release\ainput-desktop.exe") (Join-Path $packageDir "ainput-desktop.exe") -Force
 Copy-Item (Join-Path $repoRoot "config\ainput.toml") (Join-Path $packageDir "config\ainput.toml") -Force
+Copy-Item (Join-Path $repoRoot "config\hud-overlay.toml") (Join-Path $packageDir "config\hud-overlay.toml") -Force
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $packageDir "README.md") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "assets\app-icon.ico") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
@@ -100,7 +101,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- ainput-desktop.exe: main app",
     "- run-ainput.bat: launcher",
     "- README.md: full guide",
-    "- config\ainput.toml: default config",
+    "- config\ainput.toml: main config",
+    "- config\hud-overlay.toml: HUD parameter document",
     "- models\\sense-voice\\: fast voice recognition model",
     "- models\\streaming-zipformer-small-bilingual-zh-en\\: streaming voice recognition model",
     "- assets\app-icon.ico: tray icon resource",
@@ -111,10 +113,11 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
-    "- Streaming voice shows a HUD while the hotkey is held, and submits the rewritten full text only after release",
+    "- Streaming voice shows a bottom-center HUD above the taskbar while the hotkey is held, and submits the rewritten full text only after release",
+    "- You can open config\hud-overlay.toml directly from the tray menu to adjust font size, color, width, and position",
     "- Clipboard fallback is used when direct paste fails",
     "- Recording options are available from the tray: audio, mouse, watermark, FPS, and quality",
-    "- During automation recording and playback, the tray icon, left-bottom HUD, and click feedback show the current state",
+    "- During automation recording and playback, the tray icon, HUD, and click feedback show the current state",
     "- During automation playback, keyboard input, mouse clicks, wheel input, and clear mouse movement will auto-pause playback",
     "- Automation repeat count supports presets and custom values, and the last used value is written to config\\ainput.toml"
 )

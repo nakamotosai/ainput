@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub asr: AsrConfig,
     pub learning: LearningConfig,
     pub logging: LoggingConfig,
+    #[serde(skip)]
+    pub hud_overlay: HudOverlayConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +66,45 @@ pub struct StreamingVoiceConfig {
     pub panel_enabled: bool,
     pub rewrite_enabled: bool,
     pub chunk_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HudOverlayConfig {
+    pub anchor: HudAnchor,
+    pub offset_x_px: i32,
+    pub offset_y_px: i32,
+    pub width_px: i32,
+    pub min_width_px: i32,
+    pub min_height_px: i32,
+    pub min_text_width_px: i32,
+    pub padding_x_px: i32,
+    pub padding_y_px: i32,
+    pub font_height_px: i32,
+    pub font_weight: i32,
+    pub font_family: String,
+    pub text_align: HudTextAlign,
+    pub text_color: String,
+    pub background_color: String,
+    pub background_alpha: u8,
+    pub corner_radius_px: i32,
+    pub display_hold_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HudAnchor {
+    BottomLeft,
+    #[default]
+    BottomCenter,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HudTextAlign {
+    #[default]
+    Left,
+    Center,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +154,7 @@ pub struct LoggingConfig {
 pub struct RuntimePaths {
     pub root_dir: PathBuf,
     pub config_file: PathBuf,
+    pub hud_overlay_file: PathBuf,
     pub legacy_config_file: PathBuf,
     pub logs_dir: PathBuf,
     pub models_dir: PathBuf,
@@ -150,6 +192,31 @@ impl Default for StreamingVoiceConfig {
             panel_enabled: true,
             rewrite_enabled: true,
             chunk_ms: 320,
+        }
+    }
+}
+
+impl Default for HudOverlayConfig {
+    fn default() -> Self {
+        Self {
+            anchor: HudAnchor::BottomCenter,
+            offset_x_px: 0,
+            offset_y_px: -6,
+            width_px: 560,
+            min_width_px: 220,
+            min_height_px: 84,
+            min_text_width_px: 140,
+            padding_x_px: 20,
+            padding_y_px: 14,
+            font_height_px: 34,
+            font_weight: 700,
+            font_family: "Microsoft YaHei".to_string(),
+            text_align: HudTextAlign::Left,
+            text_color: "#111111".to_string(),
+            background_color: "#F3F3F3".to_string(),
+            background_alpha: 212,
+            corner_radius_px: 26,
+            display_hold_ms: 650,
         }
     }
 }
@@ -209,7 +276,8 @@ impl Default for LoggingConfig {
 
 pub fn bootstrap() -> Result<Bootstrap> {
     let runtime_paths = RuntimePaths::discover()?;
-    let config = load_or_create_config(&runtime_paths)?;
+    let mut config = load_or_create_config(&runtime_paths)?;
+    config.hud_overlay = load_or_create_hud_overlay_config(&runtime_paths)?;
     let log_guard = init_logging(&runtime_paths, &config.logging)?;
 
     tracing::info!(
@@ -246,6 +314,7 @@ impl RuntimePaths {
 
         Ok(Self {
             config_file: root_dir.join("config").join("ainput.toml"),
+            hud_overlay_file: root_dir.join("config").join("hud-overlay.toml"),
             legacy_config_file: root_dir.join("config").join("ainput.config.json"),
             logs_dir: root_dir.join("logs"),
             models_dir: root_dir.join("models").join("sense-voice"),
@@ -354,6 +423,29 @@ fn load_or_create_config(paths: &RuntimePaths) -> Result<AppConfig> {
     Ok(config)
 }
 
+fn load_or_create_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayConfig> {
+    if let Some(parent) = paths.hud_overlay_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create HUD config directory {}", parent.display()))?;
+    }
+
+    if paths.hud_overlay_file.exists() {
+        let raw = fs::read_to_string(&paths.hud_overlay_file).with_context(|| {
+            format!("read HUD config file {}", paths.hud_overlay_file.display())
+        })?;
+        let config = toml::from_str(&raw).with_context(|| {
+            format!("parse HUD config file {}", paths.hud_overlay_file.display())
+        })?;
+        return Ok(config);
+    }
+
+    let config = HudOverlayConfig::default();
+    let payload = render_hud_overlay_config_file(&config);
+    fs::write(&paths.hud_overlay_file, payload)
+        .with_context(|| format!("write HUD config file {}", paths.hud_overlay_file.display()))?;
+    Ok(config)
+}
+
 fn render_config_file(config: &AppConfig) -> String {
     format!(
         r#"# ainput 配置文件
@@ -412,7 +504,7 @@ panel_enabled = {streaming_panel_enabled}
 # 是否启用流式短句整理。
 rewrite_enabled = {streaming_rewrite_enabled}
 
-# 流式音频切块时长（毫秒）。
+# 流式预览刷新间隔（毫秒）。
 chunk_ms = {streaming_chunk_ms}
 
 [capture]
@@ -552,6 +644,129 @@ file_name = "{log_file_name}"
         auto_activate_threshold = config.learning.auto_activate_threshold,
         log_level = config.logging.level,
         log_file_name = config.logging.file_name,
+    )
+}
+
+fn render_hud_overlay_config_file(config: &HudOverlayConfig) -> String {
+    format!(
+        r##"# ainput HUD 参数文档
+# 用法说明：
+# 1. 这是专门给流式语音 HUD 用的参数文件。
+# 2. 每个参数上方都有中文注释，按注释改完后保存文件。
+# 3. 修改后重启 ainput 生效；如果已经在托盘运行，可以直接点“重新启动”。
+# 4. 颜色统一写成 "#RRGGBB" 格式，例如黑色 "#111111"，白色 "#FFFFFF"。
+
+[layout]
+# HUD 停靠位置。
+# 可选值：
+# - "bottom_center" = 屏幕正下方，默认推荐
+# - "bottom_left" = 屏幕左下角
+anchor = "{anchor}"
+
+# 水平方向偏移（像素）。
+# 正数 = 往右移，负数 = 往左移。
+offset_x_px = {offset_x_px}
+
+# 垂直方向偏移（像素）。
+# 正数 = 往下移，负数 = 往上移。
+# 默认给一个轻微负值，让 HUD 正好贴在任务栏上方。
+offset_y_px = {offset_y_px}
+
+# HUD 的目标宽度（像素）。
+# 字太长时会在这个宽度附近自动换行。
+width_px = {width_px}
+
+# HUD 的最小宽度（像素）。
+# 字很少时也不会比这个更窄。
+min_width_px = {min_width_px}
+
+# HUD 的最小高度（像素）。
+# 字很少时也不会比这个更矮。
+min_height_px = {min_height_px}
+
+# 文本区域的最小宽度（像素）。
+# 如果只显示“请说话”这类短字，仍然至少保留这么宽的文本区。
+min_text_width_px = {min_text_width_px}
+
+# HUD 左右内边距（像素）。
+# 调大后文字离边缘更远，看起来更松。
+padding_x_px = {padding_x_px}
+
+# HUD 上下内边距（像素）。
+# 调大后 HUD 会更高，文字不容易贴边。
+padding_y_px = {padding_y_px}
+
+# HUD 圆角半径（像素）。
+# 0 = 直角；数值越大越圆。
+corner_radius_px = {corner_radius_px}
+
+# 松手后“已识别”提示至少保留多久（毫秒）。
+# 想让提示闪得更快就调小，想看得更久就调大。
+display_hold_ms = {display_hold_ms}
+
+[font]
+# 字号高度（像素）。
+# 这是你最常调的参数；觉得太小就把它调大。
+font_height_px = {font_height_px}
+
+# 字重。
+# 常用值：
+# - 400 = 常规
+# - 500 = 中等
+# - 700 = 加粗
+font_weight = {font_weight}
+
+# 字体名称。
+# 常见可用值：
+# - "Microsoft YaHei"
+# - "PingFang SC"
+# - "SimHei"
+font_family = "{font_family}"
+
+# 文本对齐方式。
+# 可选值：
+# - "left" = 左对齐
+# - "center" = 居中
+text_align = "{text_align}"
+
+# 文字颜色，格式固定为 "#RRGGBB"。
+text_color = "{text_color}"
+
+[background]
+# 背景颜色，格式固定为 "#RRGGBB"。
+background_color = "{background_color}"
+
+# 背景透明度。
+# 0 = 完全透明；255 = 完全不透明。
+background_alpha = {background_alpha}
+"##,
+        anchor = match config.anchor {
+            HudAnchor::BottomLeft => "bottom_left",
+            HudAnchor::BottomCenter => "bottom_center",
+        },
+        offset_x_px = config.offset_x_px,
+        offset_y_px = config.offset_y_px,
+        width_px = config.width_px,
+        min_width_px = config.min_width_px,
+        min_height_px = config.min_height_px,
+        min_text_width_px = config.min_text_width_px,
+        padding_x_px = config.padding_x_px,
+        padding_y_px = config.padding_y_px,
+        corner_radius_px = config.corner_radius_px,
+        display_hold_ms = config.display_hold_ms,
+        font_height_px = config.font_height_px,
+        font_weight = config.font_weight,
+        font_family = config
+            .font_family
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        text_align = match config.text_align {
+            HudTextAlign::Left => "left",
+            HudTextAlign::Center => "center",
+        },
+        text_color = config.text_color,
+        background_color = config.background_color,
+        background_alpha = config.background_alpha,
     )
 }
 

@@ -1,0 +1,90 @@
+# ainput HUD 参数文档
+# 用法说明：
+# 1. 这是专门给流式语音 HUD 用的参数文件。
+# 2. 每个参数上方都有中文注释，按注释改完后保存文件。
+# 3. 修改后重启 ainput 生效；如果已经在托盘运行，可以直接点“重新启动”。
+# 4. 颜色统一写成 "#RRGGBB" 格式，例如黑色 "#111111"，白色 "#FFFFFF"。
+
+[layout]
+# HUD 停靠位置。
+# 可选值：
+# - "bottom_center" = 屏幕正下方，默认推荐
+# - "bottom_left" = 屏幕左下角
+anchor = "bottom_center"
+
+# 水平方向偏移（像素）。
+# 正数 = 往右移，负数 = 往左移。
+offset_x_px = 0
+
+# 垂直方向偏移（像素）。
+# 正数 = 往下移，负数 = 往上移。
+# 默认给一个轻微负值，让 HUD 正好贴在任务栏上方。
+offset_y_px = -6
+
+# HUD 的目标宽度（像素）。
+# 字太长时会在这个宽度附近自动换行。
+width_px = 560
+
+# HUD 的最小宽度（像素）。
+# 字很少时也不会比这个更窄。
+min_width_px = 220
+
+# HUD 的最小高度（像素）。
+# 字很少时也不会比这个更矮。
+min_height_px = 84
+
+# 文本区域的最小宽度（像素）。
+# 如果只显示“请说话”这类短字，仍然至少保留这么宽的文本区。
+min_text_width_px = 140
+
+# HUD 左右内边距（像素）。
+# 调大后文字离边缘更远，看起来更松。
+padding_x_px = 20
+
+# HUD 上下内边距（像素）。
+# 调大后 HUD 会更高，文字不容易贴边。
+padding_y_px = 14
+
+# HUD 圆角半径（像素）。
+# 0 = 直角；数值越大越圆。
+corner_radius_px = 26
+
+# 松手后“已识别”提示至少保留多久（毫秒）。
+# 想让提示闪得更快就调小，想看得更久就调大。
+display_hold_ms = 650
+
+[font]
+# 字号高度（像素）。
+# 这是你最常调的参数；觉得太小就把它调大。
+font_height_px = 34
+
+# 字重。
+# 常用值：
+# - 400 = 常规
+# - 500 = 中等
+# - 700 = 加粗
+font_weight = 700
+
+# 字体名称。
+# 常见可用值：
+# - "Microsoft YaHei"
+# - "PingFang SC"
+# - "SimHei"
+font_family = "Microsoft YaHei"
+
+# 文本对齐方式。
+# 可选值：
+# - "left" = 左对齐
+# - "center" = 居中
+text_align = "left"
+
+# 文字颜色，格式固定为 "#RRGGBB"。
+text_color = "#111111"
+
+[background]
+# 背景颜色，格式固定为 "#RRGGBB"。
+background_color = "#F3F3F3"
+
+# 背景透明度。
+# 0 = 完全透明；255 = 完全不透明。
+background_alpha = 212

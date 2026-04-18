@@ -1,13 +1,15 @@
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ainput_automation::{AutomationActivity, AutomationClickSnapshot, AutomationOverlayHint};
+use ainput_shell::{HudAnchor, HudOverlayConfig, HudTextAlign};
 use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DEFAULT_QUALITY, DT_CALCRECT, DT_NOPREFIX, DT_WORDBREAK, DeleteObject,
-    DrawTextW, FF_DONTCARE, GetDC, HBRUSH, HFONT, OUT_OUTLINE_PRECIS, ReleaseDC, SelectObject,
-    SetWindowRgn,
+    DEFAULT_PITCH, DEFAULT_QUALITY, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_WORDBREAK,
+    DeleteObject, DrawTextW, FF_DONTCARE, GetDC, HBRUSH, HDC, HFONT, OUT_OUTLINE_PRECIS, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -15,11 +17,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW, SET_WINDOW_POS_FLAGS,
     SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_NCHITTEST, WM_SETFONT, WNDCLASSW, WS_CHILD,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-    WS_VISIBLE,
+    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_CTLCOLORSTATIC, WM_NCHITTEST,
+    WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 const TRACK_WIDTH_PX: i32 = 136;
 const TRACK_HEIGHT_PX: i32 = 24;
@@ -32,20 +34,11 @@ const FILL_ALPHA_MAX: u8 = 245;
 const TRACK_COLOR: COLORREF = COLORREF(0x00404040);
 const FILL_COLOR: COLORREF = COLORREF(0x00F4F4F4);
 
-const HUD_INITIAL_WIDTH_PX: i32 = 420;
-const HUD_INITIAL_HEIGHT_PX: i32 = 92;
-const HUD_MIN_WIDTH_PX: i32 = 180;
-const HUD_MIN_HEIGHT_PX: i32 = 72;
-const HUD_RADIUS_PX: i32 = 28;
-const HUD_MARGIN_LEFT_PX: i32 = 18;
-const HUD_MARGIN_BOTTOM_PX: i32 = 24;
-const HUD_ALPHA_MAX: u8 = 212;
-const HUD_DISPLAY_MIN: Duration = Duration::from_millis(650);
-const HUD_BG_COLOR: COLORREF = COLORREF(0x00F3F3F3);
-const HUD_TEXT_PADDING_X_PX: i32 = 18;
-const HUD_TEXT_PADDING_Y_PX: i32 = 14;
-const HUD_FONT_HEIGHT_PX: i32 = 26;
-const HUD_MIN_TEXT_WIDTH_PX: i32 = 140;
+const HUD_SCREEN_MARGIN_PX: i32 = 8;
+const STATIC_TEXT_ALIGN_LEFT: u32 = 0x0000_0000;
+const STATIC_TEXT_ALIGN_CENTER: u32 = 0x0000_0001;
+static HUD_TEXT_COLOR: AtomicU32 = AtomicU32::new(0x00111111);
+static HUD_BACKGROUND_BRUSH: AtomicIsize = AtomicIsize::new(0);
 
 const CLICK_OUTER_SIZE_PX: i32 = 58;
 const CLICK_INNER_SIZE_PX: i32 = 18;
@@ -92,6 +85,29 @@ struct HudWindow {
     text_hwnd: HWND,
     brush: HBRUSH,
     font: HFONT,
+    style: HudStyle,
+}
+
+#[derive(Debug, Clone)]
+struct HudStyle {
+    anchor: HudAnchor,
+    offset_x_px: i32,
+    offset_y_px: i32,
+    width_px: i32,
+    min_width_px: i32,
+    min_height_px: i32,
+    min_text_width_px: i32,
+    padding_x_px: i32,
+    padding_y_px: i32,
+    font_height_px: i32,
+    font_weight: i32,
+    font_family: String,
+    text_align: HudTextAlign,
+    text_color: COLORREF,
+    background_color: COLORREF,
+    background_alpha: u8,
+    corner_radius_px: i32,
+    display_min: Duration,
 }
 
 struct ActiveClick {
@@ -100,8 +116,38 @@ struct ActiveClick {
     started_at: Instant,
 }
 
+impl HudStyle {
+    fn from_config(config: &HudOverlayConfig) -> Self {
+        Self {
+            anchor: config.anchor,
+            offset_x_px: config.offset_x_px,
+            offset_y_px: config.offset_y_px,
+            width_px: config.width_px.max(220),
+            min_width_px: config.min_width_px.max(120),
+            min_height_px: config.min_height_px.max(56),
+            min_text_width_px: config.min_text_width_px.max(64),
+            padding_x_px: config.padding_x_px.max(8),
+            padding_y_px: config.padding_y_px.max(6),
+            font_height_px: config.font_height_px.clamp(16, 96),
+            font_weight: config.font_weight.clamp(100, 900),
+            font_family: if config.font_family.trim().is_empty() {
+                "Microsoft YaHei".to_string()
+            } else {
+                config.font_family.trim().to_string()
+            },
+            text_align: config.text_align,
+            text_color: parse_color_ref(&config.text_color, "#111111"),
+            background_color: parse_color_ref(&config.background_color, "#F3F3F3"),
+            background_alpha: config.background_alpha,
+            corner_radius_px: config.corner_radius_px.clamp(0, 120),
+            display_min: Duration::from_millis(config.display_hold_ms.clamp(100, 10_000)),
+        }
+    }
+}
+
 impl RecordingOverlay {
-    pub fn create() -> Result<Self> {
+    pub fn create(config: &HudOverlayConfig) -> Result<Self> {
+        let hud_style = HudStyle::from_config(config);
         unsafe {
             let instance = GetModuleHandleW(None)
                 .map_err(|error| anyhow!("resolve module handle: {error}"))?;
@@ -109,7 +155,7 @@ impl RecordingOverlay {
 
             let track_brush = CreateSolidBrush(TRACK_COLOR);
             let fill_brush = CreateSolidBrush(FILL_COLOR);
-            let hud_brush = CreateSolidBrush(HUD_BG_COLOR);
+            let hud_brush = CreateSolidBrush(hud_style.background_color);
             let click_outer_brush = CreateSolidBrush(CLICK_OUTER_COLOR);
             let click_inner_brush = CreateSolidBrush(CLICK_INNER_COLOR);
 
@@ -177,12 +223,7 @@ impl RecordingOverlay {
                 0,
             )?;
 
-            let hud_window = create_hud_window(
-                instance,
-                hud_brush,
-                HUD_MARGIN_LEFT_PX,
-                work_area_bottom().saturating_sub(HUD_INITIAL_HEIGHT_PX + HUD_MARGIN_BOTTOM_PX),
-            )?;
+            let hud_window = create_hud_window(instance, hud_brush, &hud_style)?;
             let click_outer_window = create_shape_window(
                 instance,
                 w!("ainput_automation_click_outer_surface"),
@@ -260,7 +301,7 @@ impl RecordingOverlay {
         }
 
         self.hud_persistent = persistent;
-        self.hud_hold_until = Some(Instant::now() + HUD_DISPLAY_MIN);
+        self.hud_hold_until = Some(Instant::now() + self.hud_window.style.display_min);
     }
 
     pub fn clear_status_hud(&mut self) {
@@ -294,7 +335,7 @@ impl RecordingOverlay {
 
         self.hud_persistent = persistent;
         self.hud_hold_until = Some(if should_show {
-            Instant::now() + HUD_DISPLAY_MIN
+            Instant::now() + self.hud_window.style.display_min
         } else {
             Instant::now()
         });
@@ -419,8 +460,9 @@ impl RecordingOverlay {
         }
 
         if self.hud_shown {
-            self.hud_window
-                .set_alpha((HUD_ALPHA_MAX as f32 * self.hud_visibility).round() as u8);
+            let alpha =
+                (self.hud_window.style.background_alpha as f32 * self.hud_visibility).round() as u8;
+            self.hud_window.set_alpha(alpha);
         }
 
         if self.hud_visibility < 0.01 && self.hud_shown && !should_show {
@@ -580,19 +622,25 @@ unsafe fn create_shape_window(
 unsafe fn create_hud_window(
     instance: HINSTANCE,
     brush: HBRUSH,
-    x: i32,
-    y: i32,
+    style: &HudStyle,
 ) -> Result<HudWindow> {
+    let initial_width = style.width_px.max(style.min_width_px);
+    let initial_height = style.min_height_px;
+    let text_style_bits = match style.text_align {
+        HudTextAlign::Left => STATIC_TEXT_ALIGN_LEFT,
+        HudTextAlign::Center => STATIC_TEXT_ALIGN_CENTER,
+    };
+
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("ainput_automation_hud_surface"),
             w!(""),
             WINDOW_STYLE(WS_POPUP.0),
-            x,
-            y,
-            HUD_INITIAL_WIDTH_PX,
-            HUD_INITIAL_HEIGHT_PX,
+            0,
+            0,
+            initial_width,
+            initial_height,
             None,
             None,
             Some(instance),
@@ -601,14 +649,7 @@ unsafe fn create_hud_window(
     }
     .map_err(|error| anyhow!("create automation hud window failed: {error}"))?;
 
-    unsafe {
-        apply_rounded_region(
-            hwnd,
-            HUD_INITIAL_WIDTH_PX,
-            HUD_INITIAL_HEIGHT_PX,
-            HUD_RADIUS_PX,
-        )?
-    };
+    unsafe { apply_rounded_region(hwnd, initial_width, initial_height, style.corner_radius_px)? };
     unsafe {
         SetLayeredWindowAttributes(
             hwnd,
@@ -624,11 +665,11 @@ unsafe fn create_hud_window(
             WS_EX_TRANSPARENT,
             w!("STATIC"),
             w!(""),
-            WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0),
-            HUD_TEXT_PADDING_X_PX,
-            HUD_TEXT_PADDING_Y_PX,
-            HUD_INITIAL_WIDTH_PX - HUD_TEXT_PADDING_X_PX * 2,
-            HUD_INITIAL_HEIGHT_PX - HUD_TEXT_PADDING_Y_PX * 2,
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | text_style_bits),
+            style.padding_x_px,
+            style.padding_y_px,
+            (initial_width - style.padding_x_px * 2).max(1),
+            (initial_height - style.padding_y_px * 2).max(1),
             Some(hwnd),
             None,
             Some(instance),
@@ -637,13 +678,14 @@ unsafe fn create_hud_window(
     }
     .map_err(|error| anyhow!("create automation hud text failed: {error}"))?;
 
+    let font_family = HSTRING::from(style.font_family.as_str());
     let font = unsafe {
         CreateFontW(
-            HUD_FONT_HEIGHT_PX,
+            style.font_height_px,
             0,
             0,
             0,
-            700,
+            style.font_weight,
             0,
             0,
             0,
@@ -652,7 +694,7 @@ unsafe fn create_hud_window(
             CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY,
             u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
-            w!("Microsoft YaHei"),
+            PCWSTR(font_family.as_ptr()),
         )
     };
     if font.is_invalid() {
@@ -660,6 +702,9 @@ unsafe fn create_hud_window(
         let _ = unsafe { DestroyWindow(hwnd) };
         return Err(anyhow!("create automation hud font failed"));
     }
+
+    HUD_TEXT_COLOR.store(style.text_color.0, Ordering::Relaxed);
+    HUD_BACKGROUND_BRUSH.store(brush.0 as isize, Ordering::Relaxed);
 
     unsafe {
         let _ = SendMessageW(
@@ -676,6 +721,7 @@ unsafe fn create_hud_window(
         text_hwnd,
         brush,
         font,
+        style: style.clone(),
     })
 }
 
@@ -745,10 +791,6 @@ fn work_area_rect() -> RECT {
     }
 }
 
-fn work_area_bottom() -> i32 {
-    work_area_rect().bottom.max(0)
-}
-
 fn fill_min_width(progress_mode: bool) -> i32 {
     if progress_mode { 0 } else { 30 }
 }
@@ -806,19 +848,39 @@ impl HudWindow {
 
     fn resize_to_fit(&self, text: &str) {
         let work_area = work_area_rect();
-        let available_width =
-            (work_area.right - work_area.left - HUD_MARGIN_LEFT_PX * 2).max(HUD_MIN_WIDTH_PX);
-        let available_height =
-            (work_area.bottom - work_area.top - HUD_MARGIN_BOTTOM_PX * 2).max(HUD_MIN_HEIGHT_PX);
-        let max_text_width = (available_width - HUD_TEXT_PADDING_X_PX * 2).max(1);
+        let available_width = (work_area.right - work_area.left - HUD_SCREEN_MARGIN_PX * 2)
+            .max(self.style.min_width_px);
+        let available_height = (work_area.bottom - work_area.top - HUD_SCREEN_MARGIN_PX * 2)
+            .max(self.style.min_height_px);
+        let preferred_width = self
+            .style
+            .width_px
+            .clamp(self.style.min_width_px, available_width);
+        let max_text_width = (preferred_width - self.style.padding_x_px * 2).max(1);
         let (text_width, text_height) =
-            measure_hud_text(self.text_hwnd, self.font, text, max_text_width);
-        let hud_width =
-            (text_width + HUD_TEXT_PADDING_X_PX * 2).clamp(HUD_MIN_WIDTH_PX, available_width);
-        let hud_height =
-            (text_height + HUD_TEXT_PADDING_Y_PX * 2).clamp(HUD_MIN_HEIGHT_PX, available_height);
-        let hud_x = work_area.left + HUD_MARGIN_LEFT_PX;
-        let hud_y = (work_area.bottom - HUD_MARGIN_BOTTOM_PX - hud_height).max(work_area.top);
+            measure_hud_text(self.text_hwnd, self.font, text, max_text_width, &self.style);
+        let hud_width = (text_width + self.style.padding_x_px * 2)
+            .clamp(self.style.min_width_px, available_width);
+        let hud_height = (text_height + self.style.padding_y_px * 2)
+            .clamp(self.style.min_height_px, available_height);
+
+        let base_x = match self.style.anchor {
+            HudAnchor::BottomLeft => work_area.left + HUD_SCREEN_MARGIN_PX,
+            HudAnchor::BottomCenter => {
+                work_area.left + ((work_area.right - work_area.left - hud_width) / 2)
+            }
+        };
+        let base_y = work_area.bottom - hud_height - HUD_SCREEN_MARGIN_PX;
+        let hud_x = clamp_i32(
+            base_x + self.style.offset_x_px,
+            work_area.left + HUD_SCREEN_MARGIN_PX,
+            (work_area.right - hud_width - HUD_SCREEN_MARGIN_PX).max(work_area.left),
+        );
+        let hud_y = clamp_i32(
+            base_y + self.style.offset_y_px,
+            work_area.top + HUD_SCREEN_MARGIN_PX,
+            (work_area.bottom - hud_height - HUD_SCREEN_MARGIN_PX).max(work_area.top),
+        );
 
         unsafe {
             let _ = SetWindowPos(
@@ -830,29 +892,40 @@ impl HudWindow {
                 hud_height,
                 SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0),
             );
-            let _ = apply_rounded_region(self.hwnd, hud_width, hud_height, HUD_RADIUS_PX);
+            let _ = apply_rounded_region(
+                self.hwnd,
+                hud_width,
+                hud_height,
+                self.style.corner_radius_px,
+            );
             let _ = SetWindowPos(
                 self.text_hwnd,
                 None,
-                HUD_TEXT_PADDING_X_PX,
-                HUD_TEXT_PADDING_Y_PX,
-                hud_width - HUD_TEXT_PADDING_X_PX * 2,
-                hud_height - HUD_TEXT_PADDING_Y_PX * 2,
+                self.style.padding_x_px,
+                self.style.padding_y_px,
+                (hud_width - self.style.padding_x_px * 2).max(1),
+                (hud_height - self.style.padding_y_px * 2).max(1),
                 SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOZORDER.0),
             );
         }
     }
 }
 
-fn measure_hud_text(text_hwnd: HWND, font: HFONT, text: &str, max_text_width: i32) -> (i32, i32) {
+fn measure_hud_text(
+    text_hwnd: HWND,
+    font: HFONT,
+    text: &str,
+    max_text_width: i32,
+    style: &HudStyle,
+) -> (i32, i32) {
     if text.trim().is_empty() {
-        return (HUD_MIN_TEXT_WIDTH_PX, HUD_FONT_HEIGHT_PX);
+        return (style.min_text_width_px, style.font_height_px);
     }
 
     unsafe {
         let hdc = GetDC(Some(text_hwnd));
         if hdc.0.is_null() {
-            return (HUD_MIN_TEXT_WIDTH_PX, HUD_FONT_HEIGHT_PX);
+            return (style.min_text_width_px, style.font_height_px);
         }
 
         let old_font = SelectObject(hdc, font.into());
@@ -863,18 +936,25 @@ fn measure_hud_text(text_hwnd: HWND, font: HFONT, text: &str, max_text_width: i3
             bottom: 0,
         };
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
+        let align = match style.text_align {
+            HudTextAlign::Left => DT_LEFT,
+            HudTextAlign::Center => DT_CENTER,
+        };
         let _ = DrawTextW(
             hdc,
             utf16.as_mut_slice(),
             &mut rect,
-            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+            DT_CALCRECT | align | DT_WORDBREAK | DT_NOPREFIX,
         );
         let _ = SelectObject(hdc, old_font);
         let _ = ReleaseDC(Some(text_hwnd), hdc);
 
         (
-            (rect.right - rect.left).max(HUD_MIN_TEXT_WIDTH_PX),
-            (rect.bottom - rect.top).max(HUD_FONT_HEIGHT_PX),
+            (rect.right - rect.left).clamp(
+                style.min_text_width_px,
+                max_text_width.max(style.min_text_width_px),
+            ),
+            (rect.bottom - rect.top).max(style.font_height_px),
         )
     }
 }
@@ -886,9 +966,40 @@ unsafe extern "system" fn overlay_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_CTLCOLORSTATIC => {
+            let hdc = HDC(wparam.0 as _);
+            let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
+            let _ = unsafe { SetTextColor(hdc, COLORREF(HUD_TEXT_COLOR.load(Ordering::Relaxed))) };
+            LRESULT(HUD_BACKGROUND_BRUSH.load(Ordering::Relaxed))
+        }
         WM_NCHITTEST => LRESULT(-1),
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
+    if min > max {
+        return min;
+    }
+    value.clamp(min, max)
+}
+
+fn parse_color_ref(value: &str, fallback: &str) -> COLORREF {
+    parse_color_ref_hex(value)
+        .unwrap_or_else(|| parse_color_ref_hex(fallback).unwrap_or(COLORREF(0x00111111)))
+}
+
+fn parse_color_ref_hex(value: &str) -> Option<COLORREF> {
+    let hex = value.trim().strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+
+    let rgb = u32::from_str_radix(hex, 16).ok()?;
+    let r = (rgb >> 16) & 0xFF;
+    let g = (rgb >> 8) & 0xFF;
+    let b = rgb & 0xFF;
+    Some(COLORREF((b << 16) | (g << 8) | r))
 }
 
 #[cfg(test)]
