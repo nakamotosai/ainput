@@ -299,7 +299,7 @@ pub fn bootstrap() -> Result<Bootstrap> {
 
 pub fn save_config(paths: &RuntimePaths, config: &AppConfig) -> Result<()> {
     let payload = render_config_file(config);
-    fs::write(&paths.config_file, payload)
+    write_utf8_bom_text_file(&paths.config_file, &payload)
         .with_context(|| format!("write config file {}", paths.config_file.display()))?;
     Ok(())
 }
@@ -398,7 +398,7 @@ fn load_or_create_config(paths: &RuntimePaths) -> Result<AppConfig> {
         .with_context(|| format!("create models directory {}", paths.models_dir.display()))?;
 
     if paths.config_file.exists() {
-        let raw = fs::read_to_string(&paths.config_file)
+        let raw = read_text_file_strip_utf8_bom(&paths.config_file)
             .with_context(|| format!("read config file {}", paths.config_file.display()))?;
         let config = toml::from_str(&raw)
             .with_context(|| format!("parse config file {}", paths.config_file.display()))?;
@@ -434,20 +434,47 @@ fn load_or_create_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayC
     }
 
     if paths.hud_overlay_file.exists() {
-        let raw = fs::read_to_string(&paths.hud_overlay_file).with_context(|| {
+        let raw = read_text_file_strip_utf8_bom(&paths.hud_overlay_file).with_context(|| {
             format!("read HUD config file {}", paths.hud_overlay_file.display())
         })?;
         let config = toml::from_str(&raw).with_context(|| {
             format!("parse HUD config file {}", paths.hud_overlay_file.display())
+        })?;
+        let payload = render_hud_overlay_config_file(&config);
+        write_utf8_bom_text_file(&paths.hud_overlay_file, &payload).with_context(|| {
+            format!(
+                "rewrite HUD config file {}",
+                paths.hud_overlay_file.display()
+            )
         })?;
         return Ok(config);
     }
 
     let config = HudOverlayConfig::default();
     let payload = render_hud_overlay_config_file(&config);
-    fs::write(&paths.hud_overlay_file, payload)
+    write_utf8_bom_text_file(&paths.hud_overlay_file, &payload)
         .with_context(|| format!("write HUD config file {}", paths.hud_overlay_file.display()))?;
     Ok(config)
+}
+
+fn read_text_file_strip_utf8_bom(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read text file {}", path.display()))?;
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("decode UTF-8 text file {}", path.display()))?;
+    Ok(strip_utf8_bom(&text).to_string())
+}
+
+fn write_utf8_bom_text_file(path: &Path, content: &str) -> Result<()> {
+    let normalized = strip_utf8_bom(content);
+    let mut bytes = Vec::with_capacity(3 + normalized.len());
+    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    bytes.extend_from_slice(normalized.as_bytes());
+    fs::write(path, bytes).with_context(|| format!("write UTF-8 BOM file {}", path.display()))?;
+    Ok(())
+}
+
+fn strip_utf8_bom(text: &str) -> &str {
+    text.strip_prefix('\u{FEFF}').unwrap_or(text)
 }
 
 fn render_config_file(config: &AppConfig) -> String {
