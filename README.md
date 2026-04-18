@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.14-preview.4`
+当前预览版本：`1.0.14-preview.5`
 
 它不做系统级 IME，也不依赖在线模型。当前重点是把四条前台主链路做稳：
 
@@ -44,6 +44,7 @@
   - 流式模式按住时只显示文字本身，松手后再整段提交
   - HUD 默认停靠在屏幕正下方、任务栏上方
   - 可从托盘右键菜单直接打开 `HUD 参数文档`
+  - `config\hud-overlay.toml` 保存后会自动热加载
   - 松开热键后，对整段内容做规则整理，再一次性提交到当前输入区
   - 语音热键可配置
   - 自动直贴失败时，可按配置降级到剪贴板
@@ -105,6 +106,7 @@
 - `打开 HUD 参数文档`
   - 一级菜单直接打开 `config\hud-overlay.toml`
   - 可调整 HUD 字号、字体、颜色、宽度、圆角、位置、停留时间等参数
+  - 保存后立即热加载，无需重启
 - `语音`
   - 显示当前语音热键
   - 可开关鼠标中键长按录音
@@ -164,8 +166,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.14-preview.4\
-dist\ainput-1.0.14-preview.4.zip
+dist\ainput-1.0.14-preview.5\
+dist\ainput-1.0.14-preview.5.zip
 ```
 
 说明：
@@ -192,6 +194,7 @@ dist\ainput-1.0.14-preview.4.zip
 - 在托盘一级菜单切到 `流式语音识别`
 - 按住 `Alt+Z`
 - 说话时屏幕正下方 HUD 只显示当前识别文字
+- 如果你正在编辑 `config\hud-overlay.toml`，保存后 HUD 会立刻刷新
 - 松开后程序会收尾、整理整段内容，再一次性写入当前输入框
 - 如果直贴失败，会按配置退回到剪贴板
 - 如果想调字号、颜色、宽度或位置，直接在托盘右键点 `打开 HUD 参数文档`
@@ -431,8 +434,8 @@ cargo build --release -p ainput-desktop
 
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.14-preview.4\`
-- `dist\ainput-1.0.14-preview.4.zip`
+- `dist\ainput-1.0.14-preview.5\`
+- `dist\ainput-1.0.14-preview.5.zip`
 
 ## 项目结构
 

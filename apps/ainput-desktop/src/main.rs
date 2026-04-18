@@ -23,7 +23,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
@@ -35,6 +35,7 @@ use worker::{WorkerCommand, WorkerEvent};
 const RUN_REGISTRY_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_REGISTRY_VALUE_NAME: &str = "ainput";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const HUD_CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 fn main() -> Result<()> {
     ainput_recording::configure_dpi_awareness();
@@ -290,6 +291,9 @@ struct DesktopApp {
     tray_icon: Option<TrayIcon>,
     overlay: Option<overlay::RecordingOverlay>,
     overlay_available: bool,
+    hud_overlay_last_modified: Option<SystemTime>,
+    hud_overlay_last_checked_at: Instant,
+    hud_overlay_last_error: Option<String>,
     mode: AppMode,
     tray_visual_state: TrayVisualState,
     tray_visual_frame: u8,
@@ -322,6 +326,8 @@ struct DesktopApp {
 
 impl DesktopApp {
     fn new(runtime: AppRuntime, proxy: EventLoopProxy<AppEvent>) -> Self {
+        let hud_overlay_last_modified =
+            hud_overlay_modified_at(&runtime.runtime_paths.hud_overlay_file);
         Self {
             runtime,
             proxy,
@@ -335,6 +341,9 @@ impl DesktopApp {
             tray_icon: None,
             overlay: None,
             overlay_available: true,
+            hud_overlay_last_modified,
+            hud_overlay_last_checked_at: Instant::now(),
+            hud_overlay_last_error: None,
             mode: AppMode::Idle,
             tray_visual_state: TrayVisualState::Idle,
             tray_visual_frame: 0,
@@ -656,6 +665,69 @@ impl DesktopApp {
         }
         if let Some(overlay) = &mut self.overlay {
             overlay.show_status_hud(message, persistent);
+        }
+    }
+
+    fn reload_hud_overlay_if_changed(&mut self) {
+        if self.hud_overlay_last_checked_at.elapsed() < HUD_CONFIG_POLL_INTERVAL {
+            return;
+        }
+        self.hud_overlay_last_checked_at = Instant::now();
+
+        let modified = hud_overlay_modified_at(&self.runtime.runtime_paths.hud_overlay_file);
+        if modified == self.hud_overlay_last_modified {
+            return;
+        }
+
+        match ainput_shell::load_hud_overlay_config(&self.runtime.runtime_paths) {
+            Ok(config) => {
+                self.hud_overlay_last_modified = modified;
+                self.hud_overlay_last_error = None;
+                self.runtime.config.hud_overlay = config.clone();
+
+                let overlay_reload_result = if let Some(overlay) = &mut self.overlay {
+                    overlay.apply_hud_config(&config)
+                } else {
+                    match overlay::RecordingOverlay::create(&config) {
+                        Ok(overlay) => {
+                            self.overlay = Some(overlay);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+
+                match overlay_reload_result {
+                    Ok(()) => {
+                        self.overlay_available = self.overlay.is_some();
+                        tracing::info!(
+                            path = %self.runtime.runtime_paths.hud_overlay_file.display(),
+                            "HUD overlay config hot reloaded"
+                        );
+                        self.set_tray_status_menu_only("状态：HUD 参数已热加载");
+                    }
+                    Err(error) => {
+                        self.overlay_available = self.overlay.is_some();
+                        self.set_tray_status(&format!(
+                            "状态：HUD 热加载失败 - {}",
+                            shorten(&error.to_string(), 16)
+                        ));
+                        tracing::error!(error = %error, "apply HUD overlay config failed");
+                    }
+                }
+            }
+            Err(error) => {
+                self.hud_overlay_last_modified = modified;
+                let error_text = error.to_string();
+                if self.hud_overlay_last_error.as_ref() != Some(&error_text) {
+                    self.set_tray_status(&format!(
+                        "状态：HUD 参数解析失败 - {}",
+                        shorten(&error_text, 16)
+                    ));
+                    tracing::warn!(error = %error, "parse HUD overlay config failed");
+                    self.hud_overlay_last_error = Some(error_text);
+                }
+            }
         }
     }
 
@@ -1598,6 +1670,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             AppEvent::AutomationUpdated => self.handle_automation_update(),
             AppEvent::RecordingUpdated => self.handle_recording_update(),
             AppEvent::OverlayTick => {
+                self.reload_hud_overlay_if_changed();
                 if self.mode == AppMode::Automation
                     && let Some(service) = &self.automation_service
                 {
@@ -2509,6 +2582,10 @@ fn automation_storage_dir(runtime: &AppRuntime) -> PathBuf {
     }
 
     persistent_dir
+}
+
+fn hud_overlay_modified_at(path: &std::path::Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
 }
 
 fn migrate_automation_storage_if_needed(

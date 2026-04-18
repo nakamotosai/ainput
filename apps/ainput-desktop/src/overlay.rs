@@ -17,9 +17,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW, SET_WINDOW_POS_FLAGS,
     SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_CTLCOLORSTATIC, WM_NCHITTEST,
-    WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_CTLCOLORSTATIC, WM_NCHITTEST, WM_SETFONT,
+    WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -275,6 +275,45 @@ impl RecordingOverlay {
     pub fn show(&mut self) {
         self.voice_visible_target = true;
         self.voice_level_target = 0.0;
+    }
+
+    pub fn apply_hud_config(&mut self, config: &HudOverlayConfig) -> Result<()> {
+        let hud_style = HudStyle::from_config(config);
+        let instance = unsafe {
+            GetModuleHandleW(None).map_err(|error| anyhow!("resolve module handle: {error}"))?
+        };
+        let instance = HINSTANCE(instance.0);
+        let hud_brush = unsafe { CreateSolidBrush(hud_style.background_color) };
+        if hud_brush.is_invalid() {
+            return Err(anyhow!("create hot-reload HUD brush failed"));
+        }
+
+        let new_hud_window = match unsafe { create_hud_window(instance, hud_brush, &hud_style) } {
+            Ok(window) => window,
+            Err(error) => {
+                unsafe {
+                    let _ = DeleteObject(hud_brush.into());
+                }
+                return Err(error);
+            }
+        };
+
+        let preview_text = if self.hud_message.trim().is_empty() {
+            "请说话"
+        } else {
+            self.hud_message.as_str()
+        };
+        new_hud_window.set_text(preview_text);
+        if self.hud_shown {
+            new_hud_window.show();
+            let alpha =
+                (new_hud_window.style.background_alpha as f32 * self.hud_visibility).round() as u8;
+            new_hud_window.set_alpha(alpha);
+        }
+
+        let old_hud_window = std::mem::replace(&mut self.hud_window, new_hud_window);
+        drop(old_hud_window);
+        Ok(())
     }
 
     pub fn hide(&mut self) {

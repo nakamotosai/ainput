@@ -304,6 +304,10 @@ pub fn save_config(paths: &RuntimePaths, config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+pub fn load_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayConfig> {
+    load_or_create_hud_overlay_config(paths)
+}
+
 impl RuntimePaths {
     pub fn discover() -> Result<Self> {
         let root_dir = if let Ok(value) = env::var("AINPUT_ROOT") {
@@ -653,8 +657,9 @@ fn render_hud_overlay_config_file(config: &HudOverlayConfig) -> String {
 # 用法说明：
 # 1. 这是专门给流式语音 HUD 用的参数文件。
 # 2. 每个参数上方都有中文注释，按注释改完后保存文件。
-# 3. 修改后重启 ainput 生效；如果已经在托盘运行，可以直接点“重新启动”。
-# 4. 颜色统一写成 "#RRGGBB" 格式，例如黑色 "#111111"，白色 "#FFFFFF"。
+# 3. 保存文件后会自动热加载，不需要重启。
+# 4. 如果当前 HUD 正显示着，保存后会立刻按新参数刷新位置、大小、颜色和字体。
+# 5. 颜色统一写成 "#RRGGBB" 格式，例如黑色 "#111111"，白色 "#FFFFFF"。
 
 [layout]
 # HUD 停靠位置。

@@ -388,8 +388,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                             continue;
                         }
 
-                        let _ =
-                            proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFlushing));
+                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFlushing));
 
                         let asr_started_at = Instant::now();
                         let transcription = match recognizer.transcribe_samples(
@@ -583,6 +582,19 @@ fn emit_streaming_partial_if_changed(
     proxy: &EventLoopProxy<AppEvent>,
 ) -> Result<()> {
     let audio_duration_ms = audio_duration_ms(sample_rate_hz, captured_samples.len());
+    let activity = analyze_recent_audio_activity(captured_samples, sample_rate_hz, 700);
+    if should_skip_streaming_preview(&activity) {
+        tracing::debug!(
+            samples = captured_samples.len(),
+            audio_duration_ms,
+            peak_abs = format_args!("{:.6}", activity.peak_abs),
+            rms = format_args!("{:.6}", activity.rms),
+            active_ratio = format_args!("{:.4}", activity.active_ratio),
+            "skip streaming preview because audio still looks like background noise"
+        );
+        return Ok(());
+    }
+
     let asr_started_at = Instant::now();
     let transcription =
         recognizer.transcribe_samples(sample_rate_hz, captured_samples, "streaming-preview")?;
@@ -594,6 +606,20 @@ fn emit_streaming_partial_if_changed(
             audio_duration_ms,
             asr_elapsed_ms,
             "streaming preview produced empty text"
+        );
+        return Ok(());
+    }
+
+    if should_drop_streaming_preview_result(&text, &activity) {
+        tracing::info!(
+            samples = captured_samples.len(),
+            audio_duration_ms,
+            asr_elapsed_ms,
+            raw_text = %text,
+            peak_abs = format_args!("{:.6}", activity.peak_abs),
+            rms = format_args!("{:.6}", activity.rms),
+            active_ratio = format_args!("{:.4}", activity.active_ratio),
+            "drop low-signal streaming preview text"
         );
         return Ok(());
     }
@@ -660,8 +686,26 @@ fn analyze_audio_activity(samples: &[f32]) -> AudioActivity {
     }
 }
 
+fn analyze_recent_audio_activity(
+    samples: &[f32],
+    sample_rate_hz: i32,
+    tail_window_ms: u64,
+) -> AudioActivity {
+    if samples.is_empty() {
+        return analyze_audio_activity(samples);
+    }
+
+    let tail_samples = ((sample_rate_hz.max(1) as usize) * (tail_window_ms as usize) / 1000).max(1);
+    let start = samples.len().saturating_sub(tail_samples);
+    analyze_audio_activity(&samples[start..])
+}
+
 fn should_skip_as_silence(activity: &AudioActivity) -> bool {
     activity.peak_abs < 0.006 || (activity.rms < 0.0015 && activity.active_ratio < 0.01)
+}
+
+fn should_skip_streaming_preview(activity: &AudioActivity) -> bool {
+    activity.peak_abs < 0.0075 || (activity.rms < 0.0020 && activity.active_ratio < 0.015)
 }
 
 fn should_drop_low_signal_result(text: &str, activity: &AudioActivity) -> bool {
@@ -678,6 +722,38 @@ fn should_drop_low_signal_result(text: &str, activity: &AudioActivity) -> bool {
     }
 
     stripped.chars().count() <= 2
+}
+
+fn should_drop_streaming_preview_result(text: &str, activity: &AudioActivity) -> bool {
+    let stripped = text
+        .trim()
+        .trim_matches(|ch: char| ch.is_whitespace() || is_sentence_punctuation(ch));
+    if stripped.is_empty() {
+        return true;
+    }
+
+    let char_count = stripped.chars().count();
+    if activity.rms < 0.0035 && activity.active_ratio < 0.03 && char_count <= 4 {
+        return true;
+    }
+
+    if !contains_meaningful_preview_char(stripped) {
+        return true;
+    }
+
+    false
+}
+
+fn contains_meaningful_preview_char(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ch.is_ascii_alphanumeric() || is_cjk_char(ch))
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+    )
 }
 
 fn is_sentence_punctuation(ch: char) -> bool {
@@ -767,7 +843,10 @@ fn build_streaming_output_text(runtime: &AppRuntime, final_text: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::build_streaming_prepared_preview;
+    use super::{
+        AudioActivity, analyze_recent_audio_activity, build_streaming_prepared_preview,
+        should_drop_streaming_preview_result, should_skip_streaming_preview,
+    };
 
     #[test]
     fn streaming_preview_keeps_full_partial_with_rewrite() {
@@ -783,5 +862,39 @@ mod tests {
             build_streaming_prepared_preview("嗯， 帮我看一下 这个功能", false),
             "帮我看一下 这个功能"
         );
+    }
+
+    #[test]
+    fn streaming_preview_skips_background_noise_before_real_speech() {
+        let activity = AudioActivity {
+            peak_abs: 0.004,
+            rms: 0.0012,
+            active_ratio: 0.004,
+        };
+        assert!(should_skip_streaming_preview(&activity));
+        assert!(should_drop_streaming_preview_result("喂喂", &activity));
+    }
+
+    #[test]
+    fn streaming_preview_keeps_real_sentence_once_signal_is_clear() {
+        let activity = AudioActivity {
+            peak_abs: 0.036,
+            rms: 0.008,
+            active_ratio: 0.12,
+        };
+        assert!(!should_skip_streaming_preview(&activity));
+        assert!(!should_drop_streaming_preview_result(
+            "帮我看一下这里有没有问题",
+            &activity
+        ));
+    }
+
+    #[test]
+    fn recent_audio_activity_prefers_latest_speech_over_old_silence() {
+        let mut samples = vec![0.0f32; 16_000];
+        samples.extend(std::iter::repeat_n(0.05f32, 4_000));
+        let activity = analyze_recent_audio_activity(&samples, 16_000, 700);
+        assert!(activity.peak_abs >= 0.05);
+        assert!(activity.active_ratio > 0.1);
     }
 }

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.14-preview.4"
+    [string]$Version = "1.0.14-preview.5"
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +14,35 @@ $modelTarget = Join-Path $packageDir "models\sense-voice"
 $streamingModelSource = Join-Path $repoRoot "models\streaming-zipformer-small-bilingual-zh-en"
 $streamingModelTarget = Join-Path $packageDir "models\streaming-zipformer-small-bilingual-zh-en"
 $packageExe = Join-Path $packageDir "ainput-desktop.exe"
+
+function Get-PreferredConfigSource {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FileName,
+        [Parameter(Mandatory = $true)]
+        [string]$FallbackPath
+    )
+
+    $sameVersionPath = Join-Path $packageDir "config\$FileName"
+    if (Test-Path $sameVersionPath) {
+        return $sameVersionPath
+    }
+
+    $previousPackage = Get-ChildItem $distRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -like 'ainput-*' -and
+            $_.FullName -ne $packageDir -and
+            (Test-Path (Join-Path $_.FullName "config\$FileName"))
+        } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if ($previousPackage) {
+        return (Join-Path $previousPackage.FullName "config\$FileName")
+    }
+
+    return $FallbackPath
+}
 
 function Remove-ItemWithRetry {
     param(
@@ -63,6 +92,13 @@ if (Test-Path $zipPath) {
     Remove-ItemWithRetry -Path $zipPath
 }
 
+$mainConfigSource = Get-PreferredConfigSource `
+    -FileName "ainput.toml" `
+    -FallbackPath (Join-Path $repoRoot "config\ainput.toml")
+$hudConfigSource = Get-PreferredConfigSource `
+    -FileName "hud-overlay.toml" `
+    -FallbackPath (Join-Path $repoRoot "config\hud-overlay.toml")
+
 New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "config") | Out-Null
 New-Item -ItemType Directory -Force -Path $modelTarget | Out-Null
@@ -72,8 +108,8 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "assets") | Out
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") | Out-Null
 
 Copy-Item (Join-Path $repoRoot "target\release\ainput-desktop.exe") (Join-Path $packageDir "ainput-desktop.exe") -Force
-Copy-Item (Join-Path $repoRoot "config\ainput.toml") (Join-Path $packageDir "config\ainput.toml") -Force
-Copy-Item (Join-Path $repoRoot "config\hud-overlay.toml") (Join-Path $packageDir "config\hud-overlay.toml") -Force
+Copy-Item $mainConfigSource (Join-Path $packageDir "config\ainput.toml") -Force
+Copy-Item $hudConfigSource (Join-Path $packageDir "config\hud-overlay.toml") -Force
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $packageDir "README.md") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "assets\app-icon.ico") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
@@ -115,6 +151,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
     "- Streaming voice shows a bottom-center HUD above the taskbar while the hotkey is held, and submits the rewritten full text only after release",
     "- You can open config\hud-overlay.toml directly from the tray menu to adjust font size, color, width, and position",
+    "- Saving config\hud-overlay.toml hot-reloads the HUD immediately",
+    "- New preview packages reuse the latest dist config files when available so HUD settings are kept",
     "- Clipboard fallback is used when direct paste fails",
     "- Recording options are available from the tray: audio, mouse, watermark, FPS, and quality",
     "- During automation recording and playback, the tray icon, HUD, and click feedback show the current state",
