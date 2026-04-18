@@ -434,14 +434,14 @@ fn load_or_create_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayC
     }
 
     if paths.hud_overlay_file.exists() {
-        let raw = read_text_file_strip_utf8_bom(&paths.hud_overlay_file).with_context(|| {
+        let raw = read_text_file_with_bom_support(&paths.hud_overlay_file).with_context(|| {
             format!("read HUD config file {}", paths.hud_overlay_file.display())
         })?;
         let config = toml::from_str(&raw).with_context(|| {
             format!("parse HUD config file {}", paths.hud_overlay_file.display())
         })?;
         let payload = render_hud_overlay_config_file(&config);
-        write_utf8_bom_text_file(&paths.hud_overlay_file, &payload).with_context(|| {
+        write_utf16le_bom_text_file(&paths.hud_overlay_file, &payload).with_context(|| {
             format!(
                 "rewrite HUD config file {}",
                 paths.hud_overlay_file.display()
@@ -452,7 +452,7 @@ fn load_or_create_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayC
 
     let config = HudOverlayConfig::default();
     let payload = render_hud_overlay_config_file(&config);
-    write_utf8_bom_text_file(&paths.hud_overlay_file, &payload)
+    write_utf16le_bom_text_file(&paths.hud_overlay_file, &payload)
         .with_context(|| format!("write HUD config file {}", paths.hud_overlay_file.display()))?;
     Ok(config)
 }
@@ -464,6 +464,11 @@ fn read_text_file_strip_utf8_bom(path: &Path) -> Result<String> {
     Ok(strip_utf8_bom(&text).to_string())
 }
 
+fn read_text_file_with_bom_support(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read text file {}", path.display()))?;
+    decode_text_file_with_bom(path, &bytes)
+}
+
 fn write_utf8_bom_text_file(path: &Path, content: &str) -> Result<()> {
     let normalized = strip_utf8_bom(content);
     let mut bytes = Vec::with_capacity(3 + normalized.len());
@@ -471,6 +476,60 @@ fn write_utf8_bom_text_file(path: &Path, content: &str) -> Result<()> {
     bytes.extend_from_slice(normalized.as_bytes());
     fs::write(path, bytes).with_context(|| format!("write UTF-8 BOM file {}", path.display()))?;
     Ok(())
+}
+
+fn write_utf16le_bom_text_file(path: &Path, content: &str) -> Result<()> {
+    let normalized = strip_utf8_bom(content);
+    let mut bytes = Vec::with_capacity(2 + normalized.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in normalized.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(path, bytes)
+        .with_context(|| format!("write UTF-16LE BOM file {}", path.display()))?;
+    Ok(())
+}
+
+fn decode_text_file_with_bom(path: &Path, bytes: &[u8]) -> Result<String> {
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(rest.to_vec())
+            .with_context(|| format!("decode UTF-8 BOM text file {}", path.display()));
+    }
+
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16_units(path, rest, true);
+    }
+
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16_units(path, rest, false);
+    }
+
+    String::from_utf8(bytes.to_vec())
+        .map(|text| strip_utf8_bom(&text).to_string())
+        .with_context(|| format!("decode UTF-8 text file {}", path.display()))
+}
+
+fn decode_utf16_units(path: &Path, bytes: &[u8], little_endian: bool) -> Result<String> {
+    if bytes.len() % 2 != 0 {
+        return Err(anyhow!(
+            "decode UTF-16 text file {}: odd byte length",
+            path.display()
+        ));
+    }
+
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+
+    String::from_utf16(&units)
+        .with_context(|| format!("decode UTF-16 text file {}", path.display()))
 }
 
 fn strip_utf8_bom(text: &str) -> &str {

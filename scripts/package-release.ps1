@@ -87,7 +87,7 @@ function Copy-HudOverlayTemplateWithValues {
         }
     }
 
-    Set-Content -Path $DestinationPath -Value $content -Encoding UTF8
+    Set-Content -Path $DestinationPath -Value $content -Encoding Unicode
 }
 
 function Remove-ItemWithRetry {
