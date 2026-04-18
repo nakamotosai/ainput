@@ -221,6 +221,128 @@ impl Default for HudOverlayConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct HudOverlayConfigFile {
+    anchor: Option<HudAnchor>,
+    offset_x_px: Option<i32>,
+    offset_y_px: Option<i32>,
+    width_px: Option<i32>,
+    min_width_px: Option<i32>,
+    min_height_px: Option<i32>,
+    min_text_width_px: Option<i32>,
+    padding_x_px: Option<i32>,
+    padding_y_px: Option<i32>,
+    font_height_px: Option<i32>,
+    font_weight: Option<i32>,
+    font_family: Option<String>,
+    text_align: Option<HudTextAlign>,
+    text_color: Option<String>,
+    background_color: Option<String>,
+    background_alpha: Option<u8>,
+    corner_radius_px: Option<i32>,
+    display_hold_ms: Option<u64>,
+    layout: HudOverlayLayoutSection,
+    font: HudOverlayFontSection,
+    background: HudOverlayBackgroundSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct HudOverlayLayoutSection {
+    anchor: Option<HudAnchor>,
+    offset_x_px: Option<i32>,
+    offset_y_px: Option<i32>,
+    width_px: Option<i32>,
+    min_width_px: Option<i32>,
+    min_height_px: Option<i32>,
+    min_text_width_px: Option<i32>,
+    padding_x_px: Option<i32>,
+    padding_y_px: Option<i32>,
+    corner_radius_px: Option<i32>,
+    display_hold_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct HudOverlayFontSection {
+    font_height_px: Option<i32>,
+    font_weight: Option<i32>,
+    font_family: Option<String>,
+    text_align: Option<HudTextAlign>,
+    text_color: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct HudOverlayBackgroundSection {
+    background_color: Option<String>,
+    background_alpha: Option<u8>,
+}
+
+impl HudOverlayConfigFile {
+    fn into_config(self) -> HudOverlayConfig {
+        let mut config = HudOverlayConfig::default();
+
+        if let Some(value) = self.anchor.or(self.layout.anchor) {
+            config.anchor = value;
+        }
+        if let Some(value) = self.offset_x_px.or(self.layout.offset_x_px) {
+            config.offset_x_px = value;
+        }
+        if let Some(value) = self.offset_y_px.or(self.layout.offset_y_px) {
+            config.offset_y_px = value;
+        }
+        if let Some(value) = self.width_px.or(self.layout.width_px) {
+            config.width_px = value;
+        }
+        if let Some(value) = self.min_width_px.or(self.layout.min_width_px) {
+            config.min_width_px = value;
+        }
+        if let Some(value) = self.min_height_px.or(self.layout.min_height_px) {
+            config.min_height_px = value;
+        }
+        if let Some(value) = self.min_text_width_px.or(self.layout.min_text_width_px) {
+            config.min_text_width_px = value;
+        }
+        if let Some(value) = self.padding_x_px.or(self.layout.padding_x_px) {
+            config.padding_x_px = value;
+        }
+        if let Some(value) = self.padding_y_px.or(self.layout.padding_y_px) {
+            config.padding_y_px = value;
+        }
+        if let Some(value) = self.corner_radius_px.or(self.layout.corner_radius_px) {
+            config.corner_radius_px = value;
+        }
+        if let Some(value) = self.display_hold_ms.or(self.layout.display_hold_ms) {
+            config.display_hold_ms = value;
+        }
+        if let Some(value) = self.font_height_px.or(self.font.font_height_px) {
+            config.font_height_px = value;
+        }
+        if let Some(value) = self.font_weight.or(self.font.font_weight) {
+            config.font_weight = value;
+        }
+        if let Some(value) = self.font_family.or(self.font.font_family) {
+            config.font_family = value;
+        }
+        if let Some(value) = self.text_align.or(self.font.text_align) {
+            config.text_align = value;
+        }
+        if let Some(value) = self.text_color.or(self.font.text_color) {
+            config.text_color = value;
+        }
+        if let Some(value) = self.background_color.or(self.background.background_color) {
+            config.background_color = value;
+        }
+        if let Some(value) = self.background_alpha.or(self.background.background_alpha) {
+            config.background_alpha = value;
+        }
+
+        config
+    }
+}
+
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
@@ -305,6 +427,10 @@ pub fn save_config(paths: &RuntimePaths, config: &AppConfig) -> Result<()> {
 }
 
 pub fn load_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayConfig> {
+    if paths.hud_overlay_file.exists() {
+        return read_hud_overlay_config_file(&paths.hud_overlay_file);
+    }
+
     load_or_create_hud_overlay_config(paths)
 }
 
@@ -377,7 +503,7 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
 }
 
 fn has_project_root_markers(candidate: &Path) -> bool {
-    candidate.join("AGENTS.md").exists() || candidate.join("Cargo.toml").exists()
+    candidate.join("Cargo.toml").exists()
 }
 
 fn has_runtime_asset_markers(candidate: &Path) -> bool {
@@ -434,12 +560,7 @@ fn load_or_create_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayC
     }
 
     if paths.hud_overlay_file.exists() {
-        let raw = read_text_file_with_bom_support(&paths.hud_overlay_file).with_context(|| {
-            format!("read HUD config file {}", paths.hud_overlay_file.display())
-        })?;
-        let config = toml::from_str(&raw).with_context(|| {
-            format!("parse HUD config file {}", paths.hud_overlay_file.display())
-        })?;
+        let config = read_hud_overlay_config_file(&paths.hud_overlay_file)?;
         let payload = render_hud_overlay_config_file(&config);
         write_utf16le_bom_text_file(&paths.hud_overlay_file, &payload).with_context(|| {
             format!(
@@ -455,6 +576,61 @@ fn load_or_create_hud_overlay_config(paths: &RuntimePaths) -> Result<HudOverlayC
     write_utf16le_bom_text_file(&paths.hud_overlay_file, &payload)
         .with_context(|| format!("write HUD config file {}", paths.hud_overlay_file.display()))?;
     Ok(config)
+}
+
+fn read_hud_overlay_config_file(path: &Path) -> Result<HudOverlayConfig> {
+    let raw = read_text_file_with_bom_support(path)
+        .with_context(|| format!("read HUD config file {}", path.display()))?;
+    let normalized = normalize_legacy_hud_overlay_text(&raw);
+    toml::from_str::<HudOverlayConfigFile>(&normalized)
+        .map(HudOverlayConfigFile::into_config)
+        .with_context(|| format!("parse HUD config file {}", path.display()))
+}
+
+fn normalize_legacy_hud_overlay_text(raw: &str) -> String {
+    const HUD_KEYS: &[&str] = &[
+        "anchor",
+        "offset_x_px",
+        "offset_y_px",
+        "width_px",
+        "min_width_px",
+        "min_height_px",
+        "min_text_width_px",
+        "padding_x_px",
+        "padding_y_px",
+        "corner_radius_px",
+        "display_hold_ms",
+        "font_height_px",
+        "font_weight",
+        "font_family",
+        "text_align",
+        "text_color",
+        "background_color",
+        "background_alpha",
+    ];
+
+    raw.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                for key in HUD_KEYS {
+                    let marker = format!("{key} =");
+                    if let Some(position) = line.find(&marker) {
+                        let valid_boundary = position == 0
+                            || !line[..position]
+                                .chars()
+                                .last()
+                                .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+                        if valid_boundary {
+                            return line[position..].to_string();
+                        }
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn read_text_file_strip_utf8_bom(path: &Path) -> Result<String> {
@@ -971,5 +1147,131 @@ impl LegacyAppConfig {
         }
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn load_hud_overlay_config_does_not_rewrite_existing_file() {
+        let paths = temp_runtime_paths("hot-reload-readonly");
+        let mut config = HudOverlayConfig::default();
+        config.font_height_px = 72;
+        config.width_px = 880;
+        write_hud_config(&paths, &config);
+
+        let before_bytes = fs::read(&paths.hud_overlay_file).expect("read hud config before");
+        let before_modified = fs::metadata(&paths.hud_overlay_file)
+            .expect("stat hud config before")
+            .modified()
+            .expect("hud config modified before");
+
+        std::thread::sleep(Duration::from_millis(20));
+        let loaded = load_hud_overlay_config(&paths).expect("load hud overlay config");
+        let after_bytes = fs::read(&paths.hud_overlay_file).expect("read hud config after");
+        let after_modified = fs::metadata(&paths.hud_overlay_file)
+            .expect("stat hud config after")
+            .modified()
+            .expect("hud config modified after");
+
+        assert_eq!(loaded.font_height_px, 72);
+        assert_eq!(loaded.width_px, 880);
+        assert_eq!(before_bytes, after_bytes);
+        assert_eq!(before_modified, after_modified);
+    }
+
+    #[test]
+    fn startup_hud_loader_preserves_existing_values() {
+        let paths = temp_runtime_paths("startup-preserves-values");
+        let mut config = HudOverlayConfig::default();
+        config.font_height_px = 68;
+        config.offset_y_px = -32;
+        write_hud_config(&paths, &config);
+
+        let loaded = load_or_create_hud_overlay_config(&paths).expect("startup hud load");
+        let reloaded = read_hud_overlay_config_file(&paths.hud_overlay_file).expect("reload hud");
+
+        assert_eq!(loaded.font_height_px, 68);
+        assert_eq!(loaded.offset_y_px, -32);
+        assert_eq!(reloaded.font_height_px, 68);
+        assert_eq!(reloaded.offset_y_px, -32);
+    }
+
+    #[test]
+    fn project_root_markers_require_cargo_toml() {
+        let dir = unique_temp_dir("project-root-marker");
+        fs::create_dir_all(&dir).expect("create temp root");
+        fs::write(dir.join("AGENTS.md"), "# temp").expect("write temp agents");
+
+        assert!(!has_project_root_markers(&dir));
+
+        fs::write(dir.join("Cargo.toml"), "[workspace]\n").expect("write temp cargo");
+        assert!(has_project_root_markers(&dir));
+    }
+
+    #[test]
+    fn legacy_commented_key_lines_are_salvaged() {
+        let raw = r##"[layout]
+# 旧坏格式 width_px = 900
+# 旧坏格式 min_width_px = 260
+
+[font]
+# 旧坏格式 font_height_px = 72
+font_weight = 700
+font_family = "Microsoft YaHei"
+text_align = "center"
+text_color = "#111111"
+
+[background]
+# 旧坏格式 background_alpha = 255
+"##;
+
+        let config = toml::from_str::<HudOverlayConfigFile>(&normalize_legacy_hud_overlay_text(raw))
+            .expect("parse salvaged hud config")
+            .into_config();
+
+        assert_eq!(config.width_px, 900);
+        assert_eq!(config.min_width_px, 260);
+        assert_eq!(config.font_height_px, 72);
+        assert_eq!(config.background_alpha, 255);
+    }
+
+    fn temp_runtime_paths(label: &str) -> RuntimePaths {
+        let root_dir = unique_temp_dir(label);
+        RuntimePaths {
+            config_file: root_dir.join("config").join("ainput.toml"),
+            hud_overlay_file: root_dir.join("config").join("hud-overlay.toml"),
+            legacy_config_file: root_dir.join("config").join("ainput.config.json"),
+            logs_dir: root_dir.join("logs"),
+            models_dir: root_dir.join("models").join("sense-voice"),
+            root_dir,
+        }
+    }
+
+    fn write_hud_config(paths: &RuntimePaths, config: &HudOverlayConfig) {
+        fs::create_dir_all(
+            paths
+                .hud_overlay_file
+                .parent()
+                .expect("hud config parent directory"),
+        )
+        .expect("create hud config directory");
+        let payload = render_hud_overlay_config_file(config);
+        write_utf16le_bom_text_file(&paths.hud_overlay_file, &payload).expect("write hud config");
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ainput-shell-{label}-{unique}"));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).expect("remove stale temp dir");
+        }
+        dir
     }
 }

@@ -718,9 +718,10 @@ unsafe fn create_hud_window(
     .map_err(|error| anyhow!("create automation hud text failed: {error}"))?;
 
     let font_family = HSTRING::from(style.font_family.as_str());
+    let logical_font_height = -style.font_height_px.abs();
     let font = unsafe {
         CreateFontW(
-            style.font_height_px,
+            logical_font_height,
             0,
             0,
             0,

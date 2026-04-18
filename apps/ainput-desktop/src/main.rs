@@ -702,6 +702,17 @@ impl DesktopApp {
                         self.overlay_available = self.overlay.is_some();
                         tracing::info!(
                             path = %self.runtime.runtime_paths.hud_overlay_file.display(),
+                            anchor = ?config.anchor,
+                            offset_x_px = config.offset_x_px,
+                            offset_y_px = config.offset_y_px,
+                            width_px = config.width_px,
+                            min_width_px = config.min_width_px,
+                            padding_x_px = config.padding_x_px,
+                            padding_y_px = config.padding_y_px,
+                            font_height_px = config.font_height_px,
+                            font_weight = config.font_weight,
+                            text_align = ?config.text_align,
+                            background_alpha = config.background_alpha,
                             "HUD overlay config hot reloaded"
                         );
                         self.set_tray_status_menu_only("状态：HUD 参数已热加载");
