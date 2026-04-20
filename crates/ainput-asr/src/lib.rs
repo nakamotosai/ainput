@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use sherpa_onnx::{
-    OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig, OnlineRecognizer,
-    OnlineRecognizerConfig, OnlineTransducerModelConfig, OnlineStream,
+    OfflinePunctuation, OfflinePunctuationConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineSenseVoiceModelConfig, OnlineParaformerModelConfig, OnlineRecognizer,
+    OnlineRecognizerConfig, OnlineStream, OnlineTransducerModelConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -55,6 +56,33 @@ pub struct StreamingZipformerModelBundle {
 }
 
 #[derive(Debug, Clone)]
+struct StreamingParaformerModelBundle {
+    root_dir: PathBuf,
+    encoder_file: PathBuf,
+    decoder_file: PathBuf,
+    tokens_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+enum StreamingModelBundle {
+    Transducer(StreamingZipformerModelBundle),
+    Paraformer(StreamingParaformerModelBundle),
+}
+
+#[derive(Debug, Clone)]
+pub struct OfflinePunctuationConfigBundle {
+    pub model_dir: PathBuf,
+    pub provider: String,
+    pub num_threads: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct OfflinePunctuationModelBundle {
+    pub root_dir: PathBuf,
+    pub model_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct StreamingRecognitionResult {
     pub text: String,
     pub is_final: bool,
@@ -67,7 +95,12 @@ pub struct SenseVoiceRecognizer {
 
 pub struct StreamingZipformerRecognizer {
     recognizer: OnlineRecognizer,
-    model_bundle: StreamingZipformerModelBundle,
+    model_bundle: StreamingModelBundle,
+}
+
+pub struct OfflinePunctuationRestorer {
+    punctuator: OfflinePunctuation,
+    model_bundle: OfflinePunctuationModelBundle,
 }
 
 pub struct StreamingZipformerStream {
@@ -157,41 +190,71 @@ impl SenseVoiceRecognizer {
 impl StreamingZipformerRecognizer {
     pub fn create(config: &StreamingZipformerConfig) -> Result<Self> {
         let model_bundle =
-            prepare_streaming_runtime_bundle(StreamingZipformerModelBundle::discover(&config.model_dir)?)?;
-        let encoder_path = path_to_runtime_string(&model_bundle.encoder_file)?;
-        let decoder_path = path_to_runtime_string(&model_bundle.decoder_file)?;
-        let joiner_path = path_to_runtime_string(&model_bundle.joiner_file)?;
-        let tokens_path = path_to_runtime_string(&model_bundle.tokens_file)?;
+            prepare_streaming_runtime_bundle(StreamingModelBundle::discover(&config.model_dir)?)?;
+        let tokens_path = path_to_runtime_string(model_bundle.tokens_file())?;
 
         let mut recognizer_config = OnlineRecognizerConfig::default();
         recognizer_config.feat_config.sample_rate = config.sample_rate_hz;
         recognizer_config.model_config.tokens = Some(tokens_path);
         recognizer_config.model_config.provider = Some(config.provider.clone());
         recognizer_config.model_config.num_threads = config.num_threads;
-        recognizer_config.model_config.transducer = OnlineTransducerModelConfig {
-            encoder: Some(encoder_path),
-            decoder: Some(decoder_path),
-            joiner: Some(joiner_path),
-        };
         recognizer_config.decoding_method = Some(config.decoding_method.clone());
         recognizer_config.enable_endpoint = config.enable_endpoint;
         recognizer_config.rule1_min_trailing_silence = config.rule1_min_trailing_silence;
         recognizer_config.rule2_min_trailing_silence = config.rule2_min_trailing_silence;
         recognizer_config.rule3_min_utterance_length = config.rule3_min_utterance_length;
 
+        match &model_bundle {
+            StreamingModelBundle::Transducer(bundle) => {
+                let encoder_path = path_to_runtime_string(&bundle.encoder_file)?;
+                let decoder_path = path_to_runtime_string(&bundle.decoder_file)?;
+                let joiner_path = path_to_runtime_string(&bundle.joiner_file)?;
+                recognizer_config.model_config.transducer = OnlineTransducerModelConfig {
+                    encoder: Some(encoder_path),
+                    decoder: Some(decoder_path),
+                    joiner: Some(joiner_path),
+                };
+            }
+            StreamingModelBundle::Paraformer(bundle) => {
+                let encoder_path = path_to_runtime_string(&bundle.encoder_file)?;
+                let decoder_path = path_to_runtime_string(&bundle.decoder_file)?;
+                recognizer_config.model_config.paraformer = OnlineParaformerModelConfig {
+                    encoder: Some(encoder_path),
+                    decoder: Some(decoder_path),
+                };
+            }
+        }
+
         let recognizer = OnlineRecognizer::create(&recognizer_config)
             .ok_or_else(|| anyhow!("create sherpa-onnx online recognizer failed"))?;
 
-        tracing::info!(
-            model_dir = %model_bundle.root_dir.display(),
-            encoder_file = %model_bundle.encoder_file.display(),
-            decoder_file = %model_bundle.decoder_file.display(),
-            joiner_file = %model_bundle.joiner_file.display(),
-            tokens_file = %model_bundle.tokens_file.display(),
-            decoding_method = %config.decoding_method,
-            num_threads = config.num_threads,
-            "streaming zipformer recognizer created"
-        );
+        match &model_bundle {
+            StreamingModelBundle::Transducer(bundle) => {
+                tracing::info!(
+                    model_family = "transducer",
+                    model_dir = %bundle.root_dir.display(),
+                    encoder_file = %bundle.encoder_file.display(),
+                    decoder_file = %bundle.decoder_file.display(),
+                    joiner_file = %bundle.joiner_file.display(),
+                    tokens_file = %bundle.tokens_file.display(),
+                    decoding_method = %config.decoding_method,
+                    num_threads = config.num_threads,
+                    "streaming recognizer created"
+                );
+            }
+            StreamingModelBundle::Paraformer(bundle) => {
+                tracing::info!(
+                    model_family = "paraformer",
+                    model_dir = %bundle.root_dir.display(),
+                    encoder_file = %bundle.encoder_file.display(),
+                    decoder_file = %bundle.decoder_file.display(),
+                    tokens_file = %bundle.tokens_file.display(),
+                    decoding_method = %config.decoding_method,
+                    num_threads = config.num_threads,
+                    "streaming recognizer created"
+                );
+            }
+        }
 
         Ok(Self {
             recognizer,
@@ -262,6 +325,13 @@ impl StreamingZipformerRecognizer {
             self.decode_available(&stream);
         }
 
+        let tail_padding_num_samples = ((sample_rate_hz.max(1) as f32) * 0.3) as usize;
+        if tail_padding_num_samples > 0 {
+            let tail_padding = vec![0.0f32; tail_padding_num_samples];
+            self.accept_waveform(&stream, sample_rate_hz, &tail_padding);
+            self.decode_available(&stream);
+        }
+
         self.input_finished(&stream);
         self.decode_available(&stream);
 
@@ -273,7 +343,87 @@ impl StreamingZipformerRecognizer {
             text: result.text,
             sample_rate_hz,
             source_wav: wav_path.to_path_buf(),
-            model_root: self.model_bundle.root_dir.clone(),
+            model_root: self.model_bundle.root_dir().to_path_buf(),
+        })
+    }
+
+    pub fn transcribe_samples(
+        &self,
+        sample_rate_hz: i32,
+        samples: &[f32],
+        chunk_num_samples: usize,
+        source_label: impl Into<PathBuf>,
+    ) -> Result<Transcription> {
+        let stream = self.create_stream();
+        let chunk_num_samples = chunk_num_samples.max(1);
+
+        for chunk in samples.chunks(chunk_num_samples) {
+            self.accept_waveform(&stream, sample_rate_hz, chunk);
+            self.decode_available(&stream);
+        }
+
+        let tail_padding_num_samples = ((sample_rate_hz.max(1) as f32) * 0.3) as usize;
+        if tail_padding_num_samples > 0 {
+            let tail_padding = vec![0.0f32; tail_padding_num_samples];
+            self.accept_waveform(&stream, sample_rate_hz, &tail_padding);
+            self.decode_available(&stream);
+        }
+
+        self.input_finished(&stream);
+        self.decode_available(&stream);
+
+        let result = self
+            .get_result(&stream)
+            .ok_or_else(|| anyhow!("sherpa-onnx returned no streaming transcription result"))?;
+
+        Ok(Transcription {
+            text: result.text,
+            sample_rate_hz,
+            source_wav: source_label.into(),
+            model_root: self.model_bundle.root_dir().to_path_buf(),
+        })
+    }
+}
+
+impl OfflinePunctuationRestorer {
+    pub fn create(config: &OfflinePunctuationConfigBundle) -> Result<Self> {
+        let model_bundle = prepare_punctuation_runtime_bundle(
+            OfflinePunctuationModelBundle::discover(&config.model_dir)?,
+        )?;
+        let model_path = path_to_runtime_string(&model_bundle.model_file)?;
+
+        let mut punctuation_config = OfflinePunctuationConfig::default();
+        punctuation_config.model.ct_transformer = Some(model_path);
+        punctuation_config.model.num_threads = config.num_threads;
+        punctuation_config.model.provider = Some(config.provider.clone());
+
+        let punctuator = OfflinePunctuation::create(&punctuation_config)
+            .ok_or_else(|| anyhow!("create sherpa-onnx offline punctuation failed"))?;
+
+        tracing::info!(
+            model_dir = %model_bundle.root_dir.display(),
+            model_file = %model_bundle.model_file.display(),
+            num_threads = config.num_threads,
+            "offline punctuation restorer created"
+        );
+
+        Ok(Self {
+            punctuator,
+            model_bundle,
+        })
+    }
+
+    pub fn add_punctuation(&self, text: &str) -> Result<String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+
+        self.punctuator.add_punctuation(trimmed).ok_or_else(|| {
+            anyhow!(
+                "sherpa-onnx offline punctuation returned no result for {}",
+                self.model_bundle.model_file.display()
+            )
         })
     }
 }
@@ -281,6 +431,7 @@ impl StreamingZipformerRecognizer {
 fn path_to_runtime_string(path: &Path) -> Result<String> {
     let absolute_path =
         fs::canonicalize(path).with_context(|| format!("canonicalize path {}", path.display()))?;
+    #[allow(unused_mut)]
     let mut absolute_string = absolute_path
         .to_str()
         .map(ToOwned::to_owned)
@@ -345,8 +496,100 @@ fn prepare_runtime_bundle(model_bundle: SenseVoiceModelBundle) -> Result<SenseVo
 }
 
 fn prepare_streaming_runtime_bundle(
-    model_bundle: StreamingZipformerModelBundle,
-) -> Result<StreamingZipformerModelBundle> {
+    model_bundle: StreamingModelBundle,
+) -> Result<StreamingModelBundle> {
+    if !contains_non_ascii(model_bundle.root_dir()) {
+        return Ok(model_bundle);
+    }
+
+    let cache_root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ainput")
+        .join("asr-cache");
+    let bundle_name = model_bundle
+        .root_dir()
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "streaming-asr".to_string());
+    let cache_dir = cache_root.join(bundle_name);
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("create ASR cache directory {}", cache_dir.display()))?;
+
+    let cached_encoder =
+        cache_dir.join(model_bundle.encoder_file().file_name().ok_or_else(|| {
+            anyhow!(
+                "invalid encoder file name: {}",
+                model_bundle.encoder_file().display()
+            )
+        })?);
+    let cached_decoder =
+        cache_dir.join(model_bundle.decoder_file().file_name().ok_or_else(|| {
+            anyhow!(
+                "invalid decoder file name: {}",
+                model_bundle.decoder_file().display()
+            )
+        })?);
+    let cached_tokens =
+        cache_dir.join(model_bundle.tokens_file().file_name().ok_or_else(|| {
+            anyhow!(
+                "invalid tokens file name: {}",
+                model_bundle.tokens_file().display()
+            )
+        })?);
+
+    copy_if_stale(model_bundle.encoder_file(), &cached_encoder)?;
+    copy_if_stale(model_bundle.decoder_file(), &cached_decoder)?;
+    if let Some(joiner_file) = model_bundle.joiner_file() {
+        let cached_joiner = cache_dir.join(
+            joiner_file
+                .file_name()
+                .ok_or_else(|| anyhow!("invalid joiner file name: {}", joiner_file.display()))?,
+        );
+        copy_if_stale(joiner_file, &cached_joiner)?;
+        copy_if_stale(model_bundle.tokens_file(), &cached_tokens)?;
+
+        tracing::info!(
+            source_model_dir = %model_bundle.root_dir().display(),
+            cache_dir = %cache_dir.display(),
+            model_family = %model_bundle.model_family(),
+            "prepared ASCII-safe streaming ASR runtime bundle"
+        );
+
+        return Ok(StreamingModelBundle::Transducer(
+            StreamingZipformerModelBundle {
+                root_dir: cache_dir,
+                encoder_file: cached_encoder,
+                decoder_file: cached_decoder,
+                joiner_file: cached_joiner,
+                tokens_file: cached_tokens,
+            },
+        ));
+    }
+
+    copy_if_stale(model_bundle.tokens_file(), &cached_tokens)?;
+
+    tracing::info!(
+        source_model_dir = %model_bundle.root_dir().display(),
+        cache_dir = %cache_dir.display(),
+        model_family = %model_bundle.model_family(),
+        "prepared ASCII-safe streaming ASR runtime bundle"
+    );
+
+    Ok(StreamingModelBundle::Paraformer(
+        StreamingParaformerModelBundle {
+            root_dir: cache_dir,
+            encoder_file: cached_encoder,
+            decoder_file: cached_decoder,
+            tokens_file: cached_tokens,
+        },
+    ))
+}
+
+fn prepare_punctuation_runtime_bundle(
+    model_bundle: OfflinePunctuationModelBundle,
+) -> Result<OfflinePunctuationModelBundle> {
     if !contains_non_ascii(&model_bundle.root_dir) {
         return Ok(model_bundle);
     }
@@ -361,53 +604,28 @@ fn prepare_streaming_runtime_bundle(
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "streaming-zipformer".to_string());
+        .unwrap_or_else(|| "offline-punctuation".to_string());
     let cache_dir = cache_root.join(bundle_name);
     fs::create_dir_all(&cache_dir)
         .with_context(|| format!("create ASR cache directory {}", cache_dir.display()))?;
 
-    let cached_encoder = cache_dir.join(model_bundle.encoder_file.file_name().ok_or_else(|| {
+    let cached_model = cache_dir.join(model_bundle.model_file.file_name().ok_or_else(|| {
         anyhow!(
-            "invalid encoder file name: {}",
-            model_bundle.encoder_file.display()
+            "invalid punctuation model file name: {}",
+            model_bundle.model_file.display()
         )
     })?);
-    let cached_decoder = cache_dir.join(model_bundle.decoder_file.file_name().ok_or_else(|| {
-        anyhow!(
-            "invalid decoder file name: {}",
-            model_bundle.decoder_file.display()
-        )
-    })?);
-    let cached_joiner = cache_dir.join(model_bundle.joiner_file.file_name().ok_or_else(|| {
-        anyhow!(
-            "invalid joiner file name: {}",
-            model_bundle.joiner_file.display()
-        )
-    })?);
-    let cached_tokens = cache_dir.join(model_bundle.tokens_file.file_name().ok_or_else(|| {
-        anyhow!(
-            "invalid tokens file name: {}",
-            model_bundle.tokens_file.display()
-        )
-    })?);
-
-    copy_if_stale(&model_bundle.encoder_file, &cached_encoder)?;
-    copy_if_stale(&model_bundle.decoder_file, &cached_decoder)?;
-    copy_if_stale(&model_bundle.joiner_file, &cached_joiner)?;
-    copy_if_stale(&model_bundle.tokens_file, &cached_tokens)?;
+    copy_if_stale(&model_bundle.model_file, &cached_model)?;
 
     tracing::info!(
         source_model_dir = %model_bundle.root_dir.display(),
         cache_dir = %cache_dir.display(),
-        "prepared ASCII-safe streaming ASR runtime bundle"
+        "prepared ASCII-safe punctuation runtime bundle"
     );
 
-    Ok(StreamingZipformerModelBundle {
+    Ok(OfflinePunctuationModelBundle {
         root_dir: cache_dir,
-        encoder_file: cached_encoder,
-        decoder_file: cached_decoder,
-        joiner_file: cached_joiner,
-        tokens_file: cached_tokens,
+        model_file: cached_model,
     })
 }
 
@@ -532,7 +750,7 @@ impl SenseVoiceModelBundle {
     }
 }
 
-impl StreamingZipformerModelBundle {
+impl StreamingModelBundle {
     pub fn discover(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         if !model_dir.exists() {
@@ -542,7 +760,7 @@ impl StreamingZipformerModelBundle {
         let candidates = discover_model_bundles(model_dir, Self::from_dir)?;
         if candidates.is_empty() {
             bail!(
-                "no streaming zipformer model bundle found under {}",
+                "no streaming model bundle found under {}",
                 model_dir.display()
             );
         }
@@ -558,14 +776,102 @@ impl StreamingZipformerModelBundle {
 
         let encoder_file = find_model_component_file(dir, "encoder")?;
         let decoder_file = find_model_component_file(dir, "decoder")?;
-        let joiner_file = find_model_component_file(dir, "joiner")?;
+        if let Some(joiner_file) = find_model_component_file(dir, "joiner") {
+            return Some(Self::Transducer(StreamingZipformerModelBundle {
+                root_dir: dir.to_path_buf(),
+                encoder_file,
+                decoder_file,
+                joiner_file,
+                tokens_file,
+            }));
+        }
 
-        Some(Self {
+        Some(Self::Paraformer(StreamingParaformerModelBundle {
             root_dir: dir.to_path_buf(),
             encoder_file,
             decoder_file,
-            joiner_file,
             tokens_file,
+        }))
+    }
+}
+
+impl StreamingModelBundle {
+    fn root_dir(&self) -> &Path {
+        match self {
+            Self::Transducer(bundle) => &bundle.root_dir,
+            Self::Paraformer(bundle) => &bundle.root_dir,
+        }
+    }
+
+    fn encoder_file(&self) -> &Path {
+        match self {
+            Self::Transducer(bundle) => &bundle.encoder_file,
+            Self::Paraformer(bundle) => &bundle.encoder_file,
+        }
+    }
+
+    fn decoder_file(&self) -> &Path {
+        match self {
+            Self::Transducer(bundle) => &bundle.decoder_file,
+            Self::Paraformer(bundle) => &bundle.decoder_file,
+        }
+    }
+
+    fn joiner_file(&self) -> Option<&Path> {
+        match self {
+            Self::Transducer(bundle) => Some(&bundle.joiner_file),
+            Self::Paraformer(_) => None,
+        }
+    }
+
+    fn tokens_file(&self) -> &Path {
+        match self {
+            Self::Transducer(bundle) => &bundle.tokens_file,
+            Self::Paraformer(bundle) => &bundle.tokens_file,
+        }
+    }
+
+    fn model_family(&self) -> &'static str {
+        match self {
+            Self::Transducer(_) => "transducer",
+            Self::Paraformer(_) => "paraformer",
+        }
+    }
+}
+
+impl OfflinePunctuationModelBundle {
+    pub fn discover(model_dir: impl AsRef<Path>) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        if !model_dir.exists() {
+            bail!("model directory does not exist: {}", model_dir.display());
+        }
+
+        let candidates = discover_model_bundles(model_dir, Self::from_dir)?;
+        if candidates.is_empty() {
+            bail!(
+                "no offline punctuation model bundle found under {}",
+                model_dir.display()
+            );
+        }
+
+        Ok(select_first_bundle(candidates))
+    }
+
+    fn from_dir(dir: &Path) -> Option<Self> {
+        let model_int8 = dir.join("model.int8.onnx");
+        let model_fp32 = dir.join("model.onnx");
+
+        let model_file = if model_int8.exists() {
+            model_int8
+        } else if model_fp32.exists() {
+            model_fp32
+        } else {
+            return None;
+        };
+
+        Some(Self {
+            root_dir: dir.to_path_buf(),
+            model_file,
         })
     }
 }
@@ -650,5 +956,77 @@ impl ModelBundleRoot for SenseVoiceModelBundle {
 impl ModelBundleRoot for StreamingZipformerModelBundle {
     fn root_dir(&self) -> &Path {
         &self.root_dir
+    }
+}
+
+impl ModelBundleRoot for StreamingModelBundle {
+    fn root_dir(&self) -> &Path {
+        self.root_dir()
+    }
+}
+
+impl ModelBundleRoot for OfflinePunctuationModelBundle {
+    fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        OfflinePunctuationModelBundle, StreamingModelBundle, StreamingParaformerModelBundle,
+        StreamingZipformerModelBundle, select_first_bundle,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn streaming_bundle_prefers_int8_components() {
+        let root = PathBuf::from("root");
+        let bundle = StreamingZipformerModelBundle {
+            root_dir: root.clone(),
+            encoder_file: root.join("encoder.int8.onnx"),
+            decoder_file: root.join("decoder.onnx"),
+            joiner_file: root.join("joiner.int8.onnx"),
+            tokens_file: root.join("tokens.txt"),
+        };
+        assert!(bundle.encoder_file.ends_with("encoder.int8.onnx"));
+        assert!(bundle.decoder_file.ends_with("decoder.onnx"));
+        assert!(bundle.joiner_file.ends_with("joiner.int8.onnx"));
+    }
+
+    #[test]
+    fn punctuation_bundle_sorts_by_root_dir() {
+        let first = OfflinePunctuationModelBundle {
+            root_dir: PathBuf::from("a"),
+            model_file: PathBuf::from("a/model.int8.onnx"),
+        };
+        let second = OfflinePunctuationModelBundle {
+            root_dir: PathBuf::from("b"),
+            model_file: PathBuf::from("b/model.int8.onnx"),
+        };
+
+        let selected = select_first_bundle(vec![second, first]);
+        assert_eq!(selected.root_dir, PathBuf::from("a"));
+    }
+
+    #[test]
+    fn streaming_model_bundle_sorts_by_root_dir() {
+        let first = StreamingModelBundle::Paraformer(StreamingParaformerModelBundle {
+            root_dir: PathBuf::from("a"),
+            encoder_file: PathBuf::from("a/encoder.int8.onnx"),
+            decoder_file: PathBuf::from("a/decoder.int8.onnx"),
+            tokens_file: PathBuf::from("a/tokens.txt"),
+        });
+        let second = StreamingModelBundle::Transducer(StreamingZipformerModelBundle {
+            root_dir: PathBuf::from("b"),
+            encoder_file: PathBuf::from("b/encoder.int8.onnx"),
+            decoder_file: PathBuf::from("b/decoder.onnx"),
+            joiner_file: PathBuf::from("b/joiner.int8.onnx"),
+            tokens_file: PathBuf::from("b/tokens.txt"),
+        });
+
+        let selected = select_first_bundle(vec![second, first]);
+        assert_eq!(selected.root_dir(), PathBuf::from("a"));
+        assert_eq!(selected.model_family(), "paraformer");
     }
 }

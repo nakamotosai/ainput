@@ -81,6 +81,14 @@ impl ActiveRecording {
         self.sample_rate_hz
     }
 
+    pub fn sample_count(&self) -> usize {
+        let Ok(samples) = self.shared_samples.lock() else {
+            return 0;
+        };
+
+        samples.len()
+    }
+
     pub fn take_new_samples(&self, cursor: &mut usize) -> Vec<f32> {
         let Ok(samples) = self.shared_samples.lock() else {
             return Vec::new();

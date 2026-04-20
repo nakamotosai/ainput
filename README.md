@@ -2,20 +2,21 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.14-preview.6`
+当前预览版本：`1.0.0-preview.23`
 
-## 本轮已修复
+## 当前预览重点
 
-- `hud-overlay.toml` 现在会按 `[layout] / [font] / [background]` 三个分组正确解析，不会再把大部分参数默默退回默认值。
-- 旧版本遗留的坏格式 HUD 参数文档会在启动时自动迁移；即使键值被挤进注释行，程序也会尽量抢救并重写成正常格式。
-- HUD 热加载改成只读加载，不会再因为程序自己回写文件而每隔约 `250ms` 自激重载一次，减少闪烁。
-- 流式 worker 现在改成真正接 `StreamingZipformerRecognizer` 在线解码，按住期间不再反复把累计音频丢回离线 `SenseVoice` 整段重跑。
-- 流式模式松手后不再重新全量识别整段录音，只做在线流 `input_finished + drain` 收尾，最终上屏延迟比之前更短。
-- 流式模式的最终提交链路单独缩短了等待：热键释放等待和粘贴前稳定等待不再沿用之前那套更保守的配置。
-- 运行时根目录不再误把 `C:\Users\sai` 这类带 `AGENTS.md` 的目录当成项目根；便携版会稳定读取 `dist\ainput-1.0.14-preview.6\config\` 下自己的配置。
-- HUD 字号创建改成 Windows 更符合直觉的逻辑高度，`font_height_px` 的视觉变化会比之前明显。
+- 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
+- `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
+- `流式语音识别` 现在固定走“在线 partial + 最近一句局部修正 + HUD 即最终结果”的单链路，不再把整段离线 rescore 伪装成流式最终提交。
+- `1.0.0-preview.23` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
+- 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
+- 流式模式的 HUD 继续保持“只显示文字本身”的单行面板，并保留原有位置、热加载参数和占位符保护。
+- AI 改写已经从本地 Ollama 切到云端 OpenAI-compatible 接口，默认模型是 `openai/gpt-oss-20b`。
+- 松开热键后，worker 会给最后一轮 AI 改写一个短等待窗口，并在真正上屏前再同步一次 HUD，重点收口“最后一个字容易丢”和“HUD 与最终上屏不一致”。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.23\` 与 `dist\ainput-1.0.0-preview.23.zip`。
 
-它不做系统级 IME，也不依赖在线模型。当前重点是把四条前台主链路做稳：
+它不做系统级 IME。当前主识别链路仍是本地离线模型；只有 AI 改写默认走云端接口。当前重点是把四条前台主链路做稳：
 
 1. 按住语音热键开始录音，松开后离线识别并把文本送进当前输入区
 1. 语音支持 `极速语音识别 / 流式语音识别` 双模式，直接从托盘一级菜单切换
@@ -50,13 +51,17 @@
 - 语音输入主链路
   - 托盘一级菜单直接切换 `极速语音识别 / 流式语音识别`
   - `极速语音识别` 保留原有 `SenseVoice` 离线整段识别
-  - `流式语音识别` 使用 `streaming-zipformer-small-bilingual-zh-en`
+  - `流式语音识别` 使用本地 `sherpa-onnx-streaming-paraformer-bilingual-zh-en` 作为在线流式识别主模型
   - 流式模式按住热键时显示 HUD 面板
-  - 流式模式按住时只显示文字本身，松手后再整段提交
+  - 流式模式按住时持续显示流式文字，并默认接入云端 AI 对“最新尾巴”做实时改写
+  - 流式模式会持续喂入在线音频块，并以“冻结前缀 + 最新一句”共享状态驱动 HUD 和最终提交
+  - 默认流式块时长已压到 `60ms`，用于缩短 HUD 首字和增量刷新延迟
+  - 流式模式的标点主链来自官方 `ct-transformer` 标点模型；模型缺失时只降级为无标点，不再让整个流式功能启动失败
+  - 云端 AI 改写服务不可用时，只降级回当前轻整理链路，不影响流式识别继续使用
   - HUD 默认停靠在屏幕正下方、任务栏上方
   - 可从托盘右键菜单直接打开 `HUD 参数文档`
   - `config\hud-overlay.toml` 保存后会自动热加载
-  - 松开热键后，对整段内容做规则整理，再一次性提交到当前输入区
+  - 松开热键后会继续收完最后尾音，再直接提交最终 HUD 文字；最终阶段只做冻结，不再二次重写
   - 语音热键可配置
   - 自动直贴失败时，可按配置降级到剪贴板
   - 普通输入框与终端输入区使用不同句号策略
@@ -71,7 +76,8 @@
   - 支持系统音频内录
   - 支持鼠标录制开关
   - 支持水印开关、文本、位置、移动闪现、随机游走
-  - 支持 `30 / 60 / 90 FPS`
+  - 支持 `30 / 60 / 90 / 144 FPS`
+  - 高帧率录屏会强制按目标帧率输出，并在封装后校验输出视频的实际帧率
   - 支持 `低 / 中 / 高` 三档画质
 - 按键精灵主链路
   - 内置 `10` 个录制槽位
@@ -177,8 +183,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.14-preview.6\
-dist\ainput-1.0.14-preview.6.zip
+dist\ainput-1.0.0-preview.23\
+dist\ainput-1.0.0-preview.23.zip
 ```
 
 说明：
@@ -186,6 +192,19 @@ dist\ainput-1.0.14-preview.6.zip
 - 直接运行目录里的 `ainput-desktop.exe` 或 `run-ainput.bat`
 - 后续版本发布默认只验证便携版目录和 zip
 - 安装包流程已废弃，不再作为收口标准
+
+### 方式 4：跑流式长句回归
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
+```
+
+说明：
+
+- 这条脚本会直接调用 `target\release\ainput-desktop.exe`
+- 默认会生成一条拼接长句样本，并跑固定 wav 阈值检查
+- 每条样本都会检查“可见字符数是否明显大于老 bug 的 2 到 3 个字”
+- 结果会同时写入 `tmp\streaming-regression-latest.txt`
 
 ## 日常使用
 
@@ -350,6 +369,18 @@ dist\ainput-1.0.14-preview.6.zip
 .\target\debug\ainput-desktop.exe transcribe-wav .\some.wav
 ```
 
+只测 streaming 模型 WAV 文件：
+
+```powershell
+.\target\debug\ainput-desktop.exe transcribe-streaming-wav .\some.wav
+```
+
+只测一轮真麦克风流式识别并输出结构化证据：
+
+```powershell
+.\target\debug\ainput-desktop.exe probe-streaming-live 8
+```
+
 只测图片写入剪贴板：
 
 ```powershell
@@ -391,9 +422,35 @@ dist\ainput-1.0.14-preview.6.zip
 - 按键精灵当前先沿用固定热键 `F7 / F8 / F9 / F10 / Esc`，还没有并入 `ainput.toml`
 - 按键精灵回放轮数已经并入 `ainput.toml` 的 `[automation].repeat_count`，托盘里修改后会立即写回
 
+## 当前状态
+
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.23\`
+- 默认启动模式已经切到 `流式语音识别`
+- 当前流式主链是：`Paraformer bilingual zh-en + 官方标点 + HUD 实时显示 + 云端尾巴改写`
+- 默认 AI 改写后端是 `https://integrate.api.nvidia.com/v1/chat/completions`
+- 默认 AI 改写模型是 `openai/gpt-oss-20b`
+- Windows 用户环境变量 `AINPUT_AI_REWRITE_API_KEY` 已经配置到当前测试机
+- `preview.23` 已经完成真机打包，并能从便携目录启动
+
+## 本轮收口验证
+
+- Windows 真机 `cargo build -p ainput-desktop --release` 已通过
+- Windows 真机 `cargo test -p ainput-desktop final_commit_ --release` 已通过
+- 已成功打包 `dist\ainput-1.0.0-preview.23\` 和 `dist\ainput-1.0.0-preview.23.zip`
+- 已从 `preview.23` 目录真实启动 `ainput-desktop.exe`
+- 启动日志已确认：
+  - 流式 AI 改写客户端已启用
+  - 改写端点是 `integrate.api.nvidia.com`
+  - 改写模型是 `openai/gpt-oss-20b`
+  - 流式 ASR 模型已切到 `streaming-paraformer-bilingual-zh-en`
+  - AI 改写预热请求已成功返回
+
 ## 当前已知取舍
 
 - 当前默认还是 `CPU` 推理，不走 GPU
+- 当前 AI 改写默认依赖外网和云端接口；如果网络不可用或 key 失效，会降级回无 AI 改写
+- 当前 AI 改写只处理“冻结前缀之后的最新尾巴”，不是对整段全文做大模型重写
+- `HUD 即最终结果` 已经尽量收口，但最后几个字、停顿边界和少数应用里的粘贴时机仍然需要继续靠真实前台使用打磨
 - 语音热键与截图热键已经可配置，但当前仍以编辑 `ainput.toml` 为主
 - 截图热键走 Windows 原生 `RegisterHotKey`
 - 语音为了保留“按住说话/松开停止”的行为，仍需要低层按键监听配合
@@ -401,6 +458,16 @@ dist\ainput-1.0.14-preview.6.zip
 - 开机自动启动通过当前用户的 `Run` 注册表项实现
 - 不同应用对直接粘贴的前台体验可能略有差异
 - 某些不支持 UI Automation 的输入框，会退到统一的未知上下文策略
+
+## 仓库卫生要求
+
+- 根 `README.md` 是当前项目状态的唯一真相源
+- 每次影响前台体验、模型、默认配置、发包版本或验收方式的改动，都要同步回写这里
+- 发包收口默认要求同时满足：
+  - 相关代码已验证
+  - README 已同步
+  - 已提交并推送远端
+  - `git status --short` 为空
 
 ## 句尾 Emoji 触发
 
@@ -445,8 +512,13 @@ cargo build --release -p ainput-desktop
 
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.14-preview.6\`
-- `dist\ainput-1.0.14-preview.6.zip`
+- `dist\ainput-1.0.0-preview.23\`
+- `dist\ainput-1.0.0-preview.23.zip`
+
+发包前门禁：
+
+- `.\scripts\streaming-regression.ps1 -Version 1.0.0-preview.23`
+- `.\scripts\live-streaming-acceptance.ps1 -Version 1.0.0-preview.23`
 
 ## 项目结构
 
@@ -473,5 +545,6 @@ cargo build --release -p ainput-desktop
 
 - 本地离线语音输入
 - AI 编程场景下的中英混合口述
-- 语音、截图、按键精灵三条主链路的稳定常驻
+- 以 HUD 为核心的真流式语音输入体验
+- 语音、截图、录屏、按键精灵四条主链路的稳定常驻
 - 后台维护动作与前台主链路解耦

@@ -2,18 +2,45 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use std::{
+    ops::{Deref, DerefMut},
+    path::Path,
+};
 
 use ainput_output::{OutputConfig, OutputDelivery};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use winit::event_loop::EventLoopProxy;
 
+use crate::ai_rewrite::AiRewriteRequest;
+use crate::streaming_fixtures::{
+    StreamingCaseStatus, StreamingFixtureCase, StreamingFixtureManifest,
+    StreamingReplayPartialEntry, StreamingReplayReport, StreamingSelftestReport,
+};
+use crate::streaming_state::{
+    StreamingState, can_append_segment_only_candidate, longest_common_prefix_chars,
+    split_frozen_prefix, visible_text_char_count,
+};
 use crate::{AppEvent, AppRuntime, hotkey};
 
 const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
-const STREAMING_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(80);
+const STREAMING_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(70);
+const STREAMING_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(15);
+const STREAMING_TAIL_PADDING_MS: u64 = 300;
+const STREAMING_RELEASE_GRACE_MS: u64 = 160;
+const STREAMING_RELEASE_MIN_WAIT_MS: u64 = 40;
+const STREAMING_RELEASE_IDLE_SETTLE_MS: u64 = 60;
+const STREAMING_RELEASE_POLL_INTERVAL_MS: u64 = 8;
+const STREAMING_FINAL_AI_REWRITE_WAIT_MS: u64 = 320;
+const STREAMING_PREVIEW_SHORTFALL_TOLERANCE_CHARS: usize = 3;
+const STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS: usize = 3;
+const STREAMING_FINAL_SIMILAR_TAIL_MARGIN_CHARS: usize = 1;
+const STREAMING_PREROLL_MS: u64 = 180;
+const STREAMING_ENDPOINT_TRAILING_SILENCE_SECS: f32 = 10.0;
+const STREAMING_ENDPOINT_MAX_UTTERANCE_SECS: f32 = 20.0;
 
 pub(crate) enum WorkerEvent {
-    Started,
+    Ready(WorkerKind),
     RecordingStarted,
     Meter(f32),
     RecordingStopped,
@@ -22,6 +49,7 @@ pub(crate) enum WorkerEvent {
     Delivered,
     ClipboardFallback,
     StreamingStarted,
+    StreamingRawPartial(String),
     StreamingPartial {
         raw_text: String,
         prepared_text: String,
@@ -31,6 +59,12 @@ pub(crate) enum WorkerEvent {
     StreamingFinal(String),
     Error(String),
     Unavailable(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerKind {
+    Fast,
+    Streaming,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -47,34 +81,224 @@ pub(crate) struct VoiceHistoryEntry {
 }
 
 struct StreamingSession {
-    recording: ainput_audio::ActiveRecording,
-    stream: ainput_asr::StreamingZipformerStream,
+    core: StreamingCoreSession,
     sample_cursor: usize,
+}
+
+struct StreamingCoreSession {
+    input_sample_rate_hz: i32,
+    sample_rate_hz: i32,
+    stream: ainput_asr::StreamingZipformerStream,
+    pending_feed_samples: Vec<f32>,
     captured_samples: Vec<f32>,
-    last_partial: String,
-    last_prepared_preview: String,
-    last_preview_at: Instant,
-    last_preview_sample_count: usize,
+    ingested_input_samples: usize,
+    resampler: StreamingResampler,
+    state: StreamingState,
+    rolled_over_prefix: String,
+    awaiting_post_rollover_speech: bool,
+    last_fast_preview_text: String,
+    last_raw_partial: String,
+    last_display_text: String,
+    ai_rewrite_result_rx: Option<mpsc::Receiver<StreamingAiRewriteOutcome>>,
+    ai_rewrite_inflight_input: String,
+    last_ai_rewrite_input: String,
+    last_ai_rewrite_output: String,
+    last_ai_rewrite_at: Option<Instant>,
+    total_decode_steps: usize,
+    total_chunks_fed: usize,
+    partial_updates: usize,
     started_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamingTextChoice<'a> {
+    source: &'static str,
+    text: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StreamingCommitSource {
+    StreamingState,
+    StreamingTailRepair,
+    OnlineFinal,
+}
+
+impl StreamingCommitSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamingState => "streaming_state",
+            Self::StreamingTailRepair => "streaming_tail_repair",
+            Self::OnlineFinal => "online_final",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamingCommitChoice<'a> {
+    source: StreamingCommitSource,
+    text: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StreamingLiveProbeReport {
+    seconds_requested: u64,
+    input_sample_rate_hz: i32,
+    sample_rate_hz: i32,
+    captured_samples: usize,
+    audio_duration_ms: u64,
+    peak_abs: f32,
+    rms: f32,
+    active_ratio: f32,
+    total_chunks_fed: usize,
+    total_decode_steps: usize,
+    partial_updates: usize,
+    last_partial_text: String,
+    final_online_raw_text: String,
+    final_prepared_candidate: String,
+    final_text: String,
+    commit_source: StreamingCommitSource,
 }
 
 impl StreamingSession {
     fn new(
-        recording: ainput_audio::ActiveRecording,
+        input_sample_rate_hz: i32,
         stream: ainput_asr::StreamingZipformerStream,
+        sample_rate_hz: i32,
+        sample_cursor: usize,
     ) -> Self {
         Self {
-            recording,
+            core: StreamingCoreSession::new(input_sample_rate_hz, stream, sample_rate_hz),
+            sample_cursor,
+        }
+    }
+}
+
+impl Deref for StreamingSession {
+    type Target = StreamingCoreSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for StreamingSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
+impl StreamingCoreSession {
+    fn new(
+        input_sample_rate_hz: i32,
+        stream: ainput_asr::StreamingZipformerStream,
+        sample_rate_hz: i32,
+    ) -> Self {
+        Self {
+            input_sample_rate_hz,
+            sample_rate_hz,
             stream,
-            sample_cursor: 0,
+            pending_feed_samples: Vec::new(),
             captured_samples: Vec::new(),
-            last_partial: String::new(),
-            last_prepared_preview: String::new(),
-            last_preview_at: Instant::now(),
-            last_preview_sample_count: 0,
+            ingested_input_samples: 0,
+            resampler: StreamingResampler::new(input_sample_rate_hz, sample_rate_hz),
+            state: StreamingState::default(),
+            rolled_over_prefix: String::new(),
+            awaiting_post_rollover_speech: false,
+            last_fast_preview_text: String::new(),
+            last_raw_partial: String::new(),
+            last_display_text: String::new(),
+            ai_rewrite_result_rx: None,
+            ai_rewrite_inflight_input: String::new(),
+            last_ai_rewrite_input: String::new(),
+            last_ai_rewrite_output: String::new(),
+            last_ai_rewrite_at: None,
+            total_decode_steps: 0,
+            total_chunks_fed: 0,
+            partial_updates: 0,
             started_at: Instant::now(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct StreamingResampler {
+    passthrough: bool,
+    step: f64,
+    cursor: f64,
+    buffer: Vec<f32>,
+}
+
+impl StreamingResampler {
+    fn new(input_sample_rate_hz: i32, output_sample_rate_hz: i32) -> Self {
+        let input = input_sample_rate_hz.max(1) as f64;
+        let output = output_sample_rate_hz.max(1) as f64;
+        let passthrough = (input - output).abs() < f64::EPSILON;
+
+        Self {
+            passthrough,
+            step: input / output,
+            cursor: 0.0,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+        if self.passthrough {
+            return input.to_vec();
+        }
+
+        self.buffer.extend_from_slice(input);
+        let mut output = Vec::new();
+
+        while self.cursor + 1.0 < self.buffer.len() as f64 {
+            output.push(interpolate_sample(&self.buffer, self.cursor));
+            self.cursor += self.step;
+        }
+
+        let drop_count = (self.cursor.floor() as usize).min(self.buffer.len());
+        if drop_count > 0 {
+            self.buffer.drain(..drop_count);
+            self.cursor -= drop_count as f64;
+        }
+
+        output
+    }
+
+    fn flush(&mut self) -> Vec<f32> {
+        if self.passthrough {
+            return Vec::new();
+        }
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+
+        let mut output = Vec::new();
+        while self.cursor < self.buffer.len() as f64 {
+            output.push(interpolate_sample(&self.buffer, self.cursor));
+            self.cursor += self.step;
+        }
+
+        self.buffer.clear();
+        self.cursor = 0.0;
+        output
+    }
+}
+
+fn interpolate_sample(samples: &[f32], cursor: f64) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    let left_index = cursor.floor() as usize;
+    let right_index = (left_index + 1).min(samples.len().saturating_sub(1));
+    let fraction = (cursor - left_index as f64) as f32;
+    let left = samples[left_index];
+    let right = samples[right_index];
+    left + (right - left) * fraction
 }
 
 pub(crate) fn push_to_talk_worker(
@@ -93,7 +317,7 @@ pub(crate) fn push_to_talk_worker(
         }
     };
 
-    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Started));
+    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(WorkerKind::Fast)));
     let mut active_recording: Option<ainput_audio::ActiveRecording> = None;
 
     tracing::info!(
@@ -103,7 +327,7 @@ pub(crate) fn push_to_talk_worker(
     );
 
     while !shutdown.load(Ordering::Relaxed) {
-        if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(16)) {
+        if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(8)) {
             match command {
                 WorkerCommand::HotkeyPressed => {
                     if active_recording.is_none() {
@@ -340,76 +564,130 @@ pub(crate) fn streaming_push_to_talk_worker(
             return;
         }
     };
+    let punctuator = build_streaming_punctuator(&runtime).map_or_else(
+        |error| {
+            tracing::warn!(
+                error = %error,
+                "streaming punctuation unavailable; falling back to unpunctuated text"
+            );
+            None
+        },
+        Some,
+    );
+    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(WorkerKind::Streaming)));
 
+    let mut standby_recording: Option<ainput_audio::ActiveRecording> = None;
     let mut active_session: Option<StreamingSession> = None;
-    let preview_interval = streaming_preview_interval(&runtime);
-
     tracing::info!(
         shortcut = %runtime.config.hotkeys.voice_input,
-        model_dir = %runtime
-            .runtime_paths
-            .root_dir
-            .join(&runtime.config.voice.streaming.model_dir)
-            .display(),
-        preview_interval_ms = preview_interval.as_millis(),
+        model_dir = %runtime.runtime_paths.root_dir.join(&runtime.config.voice.streaming.model_dir).display(),
+        chunk_ms = runtime.config.voice.streaming.chunk_ms,
         "ainput streaming worker loop started"
     );
 
     while !shutdown.load(Ordering::Relaxed) {
-        if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(16)) {
+        if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(8)) {
             match command {
                 WorkerCommand::HotkeyPressed => {
                     if active_session.is_none() {
-                        match ainput_audio::ActiveRecording::start_default_input() {
-                            Ok(recording) => {
-                                let stream = recognizer.create_stream();
-                                active_session = Some(StreamingSession::new(recording, stream));
-                                let _ = proxy
-                                    .send_event(AppEvent::Worker(WorkerEvent::StreamingStarted));
-                                tracing::info!("streaming push-to-talk recording started");
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    error = %error,
-                                    "failed to start streaming microphone recording"
-                                );
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("启动流式录音失败：{error}"),
-                                )));
-                            }
+                        if let Err(error) = ensure_streaming_recording_ready(&mut standby_recording)
+                        {
+                            tracing::error!(
+                                error = %error,
+                                "failed to start streaming microphone recording"
+                            );
+                            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                format!("启动流式录音失败：{error}"),
+                            )));
+                            continue;
+                        }
+
+                        if let Some(recording) = standby_recording.as_ref() {
+                            let stream = recognizer.create_stream();
+                            let current_cursor = recording.sample_count();
+                            let preroll_samples = sample_count_for_ms(
+                                recording.sample_rate_hz(),
+                                STREAMING_PREROLL_MS,
+                            );
+                            let start_cursor = current_cursor.saturating_sub(preroll_samples);
+                            active_session = Some(StreamingSession::new(
+                                recording.sample_rate_hz(),
+                                stream,
+                                runtime.config.asr.sample_rate_hz as i32,
+                                start_cursor,
+                            ));
+                            let _ =
+                                proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingStarted));
+                            tracing::info!(
+                                sample_rate_hz = recording.sample_rate_hz(),
+                                current_cursor,
+                                start_cursor,
+                                preroll_ms = STREAMING_PREROLL_MS,
+                                "streaming push-to-talk recording started"
+                            );
                         }
                     }
                 }
                 WorkerCommand::HotkeyReleased => {
                     if let Some(mut session) = active_session.take() {
-                        let final_chunk_update = collect_streaming_audio_chunk(
-                            &session.recording,
-                            &mut session.sample_cursor,
-                            &mut session.captured_samples,
+                        let Some(recording) = standby_recording.take() else {
+                            tracing::error!(
+                                "streaming recording disappeared before hotkey release handling"
+                            );
+                            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                "流式录音状态异常，请重试".to_string(),
+                            )));
+                            continue;
+                        };
+                        let release_drain = match finish_streaming_recording(&mut session, recording)
+                        {
+                            Ok(stats) => stats,
+                            Err(error) => {
+                                tracing::error!(
+                                    error = %error,
+                                    "failed to finalize streaming recording on hotkey release"
+                                );
+                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                    format!("结束流式录音失败：{error}"),
+                                )));
+                                continue;
+                            }
+                        };
+                        let sample_rate_hz = session.sample_rate_hz;
+                        let chunk_samples = streaming_chunk_num_samples(
+                            sample_rate_hz,
+                            runtime.config.voice.streaming.chunk_ms,
+                        );
+                        let streamed_samples = feed_streaming_pending_chunks(
                             &recognizer,
-                            &session.stream,
+                            &mut session,
+                            sample_rate_hz,
+                            chunk_samples,
+                            false,
                         );
-
-                        let audio_duration_ms = audio_duration_ms(
-                            session.recording.sample_rate_hz(),
-                            session.captured_samples.len(),
-                        );
+                        let captured_audio_duration_ms =
+                            audio_duration_ms(sample_rate_hz, session.captured_samples.len());
                         let activity = analyze_audio_activity(&session.captured_samples);
                         tracing::info!(
-                            sample_rate_hz = session.recording.sample_rate_hz(),
+                            sample_rate_hz,
+                            input_sample_rate_hz = session.input_sample_rate_hz,
                             frames = session.captured_samples.len(),
-                            audio_duration_ms,
+                            audio_duration_ms = captured_audio_duration_ms,
                             peak_abs = format_args!("{:.6}", activity.peak_abs),
                             rms = format_args!("{:.6}", activity.rms),
                             active_ratio = format_args!("{:.4}", activity.active_ratio),
-                            added_samples = final_chunk_update.added_samples,
-                            decoded_steps = final_chunk_update.decoded_steps,
+                            release_grace_added_samples = release_drain.grace_added_samples,
+                            release_stop_added_samples = release_drain.stop_added_samples,
+                            release_grace_wait_elapsed_ms = release_drain.grace_wait_elapsed_ms,
+                            streamed_samples,
+                            total_chunks_fed = session.total_chunks_fed,
                             "streaming push-to-talk recording captured"
                         );
 
-                        if session.captured_samples.is_empty() || should_skip_as_silence(&activity) {
+                        if session.captured_samples.is_empty() || should_skip_as_silence(&activity)
+                        {
                             tracing::info!(
-                                audio_duration_ms,
+                                audio_duration_ms = captured_audio_duration_ms,
                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
                                 rms = format_args!("{:.6}", activity.rms),
                                 active_ratio = format_args!("{:.4}", activity.active_ratio),
@@ -420,49 +698,64 @@ pub(crate) fn streaming_push_to_talk_worker(
                         }
 
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFlushing));
+                        if let Err(error) =
+                            drain_final_streaming_ai_rewrite(&runtime, &mut session, &proxy)
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "streaming final AI rewrite drain failed; continue with final ASR result"
+                            );
+                        }
+                        let prepared_commit = prepare_final_streaming_commit(
+                            &recognizer,
+                            punctuator.as_ref(),
+                            &mut session,
+                            sample_rate_hz,
+                            chunk_samples,
+                            runtime.config.voice.streaming.rewrite_enabled,
+                        );
 
-                        let final_drain_started_at = Instant::now();
-                        recognizer.input_finished(&session.stream);
-                        let final_decode_steps = recognizer.decode_available(&session.stream);
-                        let final_drain_elapsed_ms = final_drain_started_at.elapsed().as_millis();
-
-                        let raw_text = recognizer
-                            .get_result(&session.stream)
-                            .map(|result| result.text.trim().to_string())
-                            .unwrap_or_default();
-                        if raw_text.is_empty()
-                            || should_drop_low_signal_result(&raw_text, &activity)
+                        if prepared_commit.final_text.is_empty()
+                            || should_drop_low_signal_result(&prepared_commit.final_text, &activity)
                         {
                             tracing::info!(
-                                raw_text = %raw_text,
-                                audio_duration_ms,
-                                final_drain_elapsed_ms,
-                                final_decode_steps,
+                                final_online_raw_text = %prepared_commit.final_online_raw_text,
+                                prepared_final_candidate = %prepared_commit.prepared_final_candidate,
+                                display_text_before_final = %prepared_commit.display_text_before_final,
+                                selected_commit_source = prepared_commit.commit_source.as_str(),
+                                final_drain_elapsed_ms = prepared_commit.final_drain_elapsed_ms,
+                                final_decode_steps = prepared_commit.final_decode_steps,
                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
                                 rms = format_args!("{:.6}", activity.rms),
                                 active_ratio = format_args!("{:.4}", activity.active_ratio),
-                                "drop empty or low-signal streaming transcription"
+                                "drop empty or low-signal streaming final text"
                             );
                             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
                             continue;
                         }
 
-                        let rewrite_started_at = Instant::now();
-                        let prepared_full_text = build_streaming_output_text(&runtime, &raw_text);
-                        let rewrite_elapsed_ms = rewrite_started_at.elapsed().as_millis();
-                        if prepared_full_text.is_empty() {
-                            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
-                            continue;
+                        let final_state = session
+                            .state
+                            .finalize_from_streaming(&prepared_commit.final_text);
+                        if final_state.display_text != prepared_commit.display_text_before_final {
+                            emit_streaming_final_preview_sync(
+                                &mut session,
+                                &final_state.display_text,
+                                &proxy,
+                            );
                         }
 
                         tracing::info!(
                             samples = session.captured_samples.len(),
-                            audio_duration_ms,
-                            final_decode_steps,
-                            final_drain_elapsed_ms,
-                            rewrite_elapsed_ms,
-                            raw_text = %raw_text,
-                            prepared_text = %prepared_full_text,
+                            audio_duration_ms = captured_audio_duration_ms,
+                            final_online_raw_text = %prepared_commit.final_online_raw_text,
+                            display_text_before_final = %prepared_commit.display_text_before_final,
+                            prepared_final_candidate = %prepared_commit.prepared_final_candidate,
+                            selected_commit_source = prepared_commit.commit_source.as_str(),
+                            commit_text = %final_state.display_text,
+                            final_decode_steps = prepared_commit.final_decode_steps,
+                            final_drain_elapsed_ms = prepared_commit.final_drain_elapsed_ms,
+                            total_decode_steps = session.total_decode_steps,
                             "streaming final transcription ready"
                         );
 
@@ -484,19 +777,19 @@ pub(crate) fn streaming_push_to_talk_worker(
                             prefer_direct_paste: runtime.config.voice.prefer_direct_paste,
                             fallback_to_clipboard: runtime.config.voice.fallback_to_clipboard,
                             voice_hotkey_uses_alt: hotkey::voice_hotkey_uses_alt(),
-                            paste_stabilize_delay: Duration::from_millis(10),
+                            paste_stabilize_delay: STREAMING_PASTE_STABILIZE_DELAY,
                         };
 
                         let output_started_at = Instant::now();
                         let delivery = match runtime
                             .output_controller
-                            .deliver_text(&prepared_full_text, &output_config)
+                            .deliver_text(&final_state.display_text, &output_config)
                         {
                             Ok(delivery) => {
                                 if matches!(delivery, OutputDelivery::ClipboardOnly) {
                                     let _ = proxy.send_event(AppEvent::Worker(
                                         WorkerEvent::StreamingClipboardFallback(
-                                            prepared_full_text.clone(),
+                                            final_state.display_text.clone(),
                                         ),
                                     ));
                                 }
@@ -513,25 +806,25 @@ pub(crate) fn streaming_push_to_talk_worker(
 
                         runtime
                             .shared_state
-                            .set_last_voice_text(prepared_full_text.clone());
+                            .set_last_voice_text(final_state.display_text.clone());
                         runtime.maintenance.persist_voice_result(VoiceHistoryEntry {
                             timestamp: current_timestamp(),
                             delivery_label: streaming_delivery_label(delivery),
-                            text: prepared_full_text.clone(),
+                            text: final_state.display_text.clone(),
                         });
                         let pipeline_elapsed_ms = session.started_at.elapsed().as_millis();
-                        let realtime_factor = if audio_duration_ms > 0 {
-                            pipeline_elapsed_ms as f64 / audio_duration_ms as f64
+                        let realtime_factor = if captured_audio_duration_ms > 0 {
+                            pipeline_elapsed_ms as f64 / captured_audio_duration_ms as f64
                         } else {
                             0.0
                         };
                         tracing::info!(
                             ?delivery,
-                            text = %prepared_full_text,
-                            audio_duration_ms,
-                            final_decode_steps,
-                            final_drain_elapsed_ms,
-                            rewrite_elapsed_ms,
+                            text = %final_state.display_text,
+                            audio_duration_ms = captured_audio_duration_ms,
+                            final_drain_elapsed_ms = prepared_commit.final_drain_elapsed_ms,
+                            final_decode_steps = prepared_commit.final_decode_steps,
+                            total_decode_steps = session.total_decode_steps,
                             hotkey_release_wait_elapsed_ms,
                             output_elapsed_ms,
                             pipeline_elapsed_ms,
@@ -540,7 +833,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                         );
 
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFinal(
-                            prepared_full_text,
+                            final_state.display_text,
                         )));
                     }
                 }
@@ -548,48 +841,429 @@ pub(crate) fn streaming_push_to_talk_worker(
         }
 
         if let Some(session) = &mut active_session {
-            let chunk_update = collect_streaming_audio_chunk(
-                &session.recording,
-                &mut session.sample_cursor,
-                &mut session.captured_samples,
+            let Some(recording) = standby_recording.as_ref() else {
+                continue;
+            };
+            let added_samples = collect_streaming_audio_chunk(session, recording);
+            let sample_rate_hz = session.sample_rate_hz;
+            let chunk_samples = streaming_chunk_num_samples(
+                sample_rate_hz,
+                runtime.config.voice.streaming.chunk_ms,
+            );
+            let streamed_samples = feed_streaming_pending_chunks(
                 &recognizer,
-                &session.stream,
+                session,
+                sample_rate_hz,
+                chunk_samples,
+                true,
             );
-            let now = Instant::now();
-            let min_preview_samples = streaming_preview_min_samples(
-                session.recording.sample_rate_hz(),
-                runtime.config.voice.streaming.chunk_ms as u64,
-            );
-            if session.captured_samples.len() >= min_preview_samples
-                && session.captured_samples.len() > session.last_preview_sample_count
-                && (chunk_update.added_samples > 0
-                    || now.duration_since(session.last_preview_at) >= preview_interval)
-            {
+            if streamed_samples > 0 || added_samples > 0 {
+                let audio_duration_ms =
+                    audio_duration_ms(sample_rate_hz, session.captured_samples.len());
                 if let Err(error) = emit_streaming_partial_if_changed(
+                    &runtime,
                     &recognizer,
-                    &session.stream,
-                    session.recording.sample_rate_hz(),
-                    &session.captured_samples,
+                    punctuator.as_ref(),
+                    session,
                     runtime.config.voice.streaming.rewrite_enabled,
-                    &mut session.last_partial,
-                    &mut session.last_prepared_preview,
                     &proxy,
+                    audio_duration_ms,
                 ) {
                     tracing::warn!(
                         error = %error,
                         samples = session.captured_samples.len(),
-                        decoded_steps = chunk_update.decoded_steps,
+                        streamed_samples,
                         "streaming live preview decode failed"
                     );
                 }
-                session.last_preview_at = now;
-                session.last_preview_sample_count = session.captured_samples.len();
             }
 
-            let level = normalize_audio_level(session.recording.current_level());
+            let level = normalize_audio_level(recording.current_level());
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Meter(level)));
         }
     }
+}
+
+pub(crate) fn probe_streaming_live_session(
+    runtime: &AppRuntime,
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    seconds: u64,
+) -> Result<StreamingLiveProbeReport> {
+    let punctuator = build_streaming_punctuator(runtime).ok();
+    let recording = ainput_audio::ActiveRecording::start_default_input()?;
+    let mut session = StreamingSession::new(
+        recording.sample_rate_hz(),
+        recognizer.create_stream(),
+        runtime.config.asr.sample_rate_hz as i32,
+        0,
+    );
+    let sample_rate_hz = session.sample_rate_hz;
+    let chunk_samples =
+        streaming_chunk_num_samples(sample_rate_hz, runtime.config.voice.streaming.chunk_ms);
+    let deadline = Instant::now() + Duration::from_secs(seconds.max(1));
+
+    while Instant::now() < deadline {
+        let added_samples = collect_streaming_audio_chunk(&mut session, &recording);
+        let streamed_samples = feed_streaming_pending_chunks(
+            recognizer,
+            &mut session,
+            sample_rate_hz,
+            chunk_samples,
+            true,
+        );
+
+        if streamed_samples > 0 || added_samples > 0 {
+            let total_audio_duration_ms =
+                audio_duration_ms(sample_rate_hz, session.captured_samples.len());
+            update_streaming_partial_state(
+                runtime,
+                recognizer,
+                punctuator.as_ref(),
+                &mut session,
+                runtime.config.voice.streaming.rewrite_enabled,
+                total_audio_duration_ms,
+            )?;
+            let _ = maybe_rollover_streaming_segment_core(
+                recognizer,
+                punctuator.as_ref(),
+                &mut session,
+                runtime.config.voice.streaming.rewrite_enabled,
+                total_audio_duration_ms,
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(8));
+    }
+
+    let _ = collect_streaming_audio_chunk(&mut session, &recording);
+    let _ = feed_streaming_pending_chunks(
+        recognizer,
+        &mut session,
+        sample_rate_hz,
+        chunk_samples,
+        false,
+    );
+
+    let activity = analyze_audio_activity(&session.captured_samples);
+    let prepared_commit = prepare_final_streaming_commit(
+        recognizer,
+        punctuator.as_ref(),
+        &mut session,
+        sample_rate_hz,
+        chunk_samples,
+        runtime.config.voice.streaming.rewrite_enabled,
+    );
+    let final_text = if prepared_commit.final_text.is_empty() {
+        session.state.full_text().to_string()
+    } else {
+        session
+            .state
+            .finalize_from_streaming(&prepared_commit.final_text)
+            .display_text
+    };
+
+    Ok(StreamingLiveProbeReport {
+        seconds_requested: seconds.max(1),
+        input_sample_rate_hz: session.input_sample_rate_hz,
+        sample_rate_hz,
+        captured_samples: session.captured_samples.len(),
+        audio_duration_ms: audio_duration_ms(sample_rate_hz, session.captured_samples.len()),
+        peak_abs: activity.peak_abs,
+        rms: activity.rms,
+        active_ratio: activity.active_ratio,
+        total_chunks_fed: session.total_chunks_fed,
+        total_decode_steps: session.total_decode_steps,
+        partial_updates: session.partial_updates,
+        last_partial_text: session.last_display_text.clone(),
+        final_online_raw_text: prepared_commit.final_online_raw_text,
+        final_prepared_candidate: prepared_commit.prepared_final_candidate,
+        final_text,
+        commit_source: prepared_commit.commit_source,
+    })
+}
+
+pub(crate) fn replay_streaming_wav(
+    runtime: &AppRuntime,
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    case_id: &str,
+    wav_path: &Path,
+    expected_text: Option<&str>,
+    min_partial_updates: usize,
+    min_visible_chars: Option<usize>,
+    shortfall_tolerance_chars: usize,
+) -> Result<StreamingReplayReport> {
+    let punctuator = build_streaming_punctuator(runtime).ok();
+    let (input_sample_rate_hz, input_samples) = read_wav_samples(wav_path)?;
+    let mut session = StreamingCoreSession::new(
+        input_sample_rate_hz,
+        recognizer.create_stream(),
+        runtime.config.asr.sample_rate_hz as i32,
+    );
+    let replay_chunk_num_samples = streaming_chunk_num_samples(
+        input_sample_rate_hz,
+        runtime.config.voice.streaming.chunk_ms,
+    );
+    let stream_chunk_num_samples = streaming_chunk_num_samples(
+        session.sample_rate_hz,
+        runtime.config.voice.streaming.chunk_ms,
+    );
+    let runner_sample_rate_hz = session.sample_rate_hz;
+    let mut partial_timeline = Vec::new();
+
+    for chunk in input_samples.chunks(replay_chunk_num_samples.max(1)) {
+        let added_samples = push_streaming_input_samples(&mut session, chunk);
+        let streamed_samples = feed_streaming_pending_chunks(
+            recognizer,
+            &mut session,
+            runner_sample_rate_hz,
+            stream_chunk_num_samples,
+            true,
+        );
+
+        if streamed_samples == 0 && added_samples == 0 {
+            continue;
+        }
+
+        let total_audio_duration_ms =
+            audio_duration_ms(session.sample_rate_hz, session.captured_samples.len());
+        if let Some(update) = update_streaming_partial_state(
+            runtime,
+            recognizer,
+            punctuator.as_ref(),
+            &mut session,
+            runtime.config.voice.streaming.rewrite_enabled,
+            total_audio_duration_ms,
+        )? {
+            partial_timeline.push(StreamingReplayPartialEntry {
+                offset_ms: total_audio_duration_ms,
+                raw_text: update.raw_text,
+                prepared_text: update.display_text,
+                source: update.source.to_string(),
+                stable_chars: update.stable_chars,
+                frozen_chars: update.frozen_chars,
+                volatile_chars: update.volatile_chars,
+                rejected_prefix_rewrite: update.rejected_prefix_rewrite,
+            });
+        }
+        if let Some(committed_text) = maybe_rollover_streaming_segment_core(
+            recognizer,
+            punctuator.as_ref(),
+            &mut session,
+            runtime.config.voice.streaming.rewrite_enabled,
+            total_audio_duration_ms,
+        ) {
+            partial_timeline.push(StreamingReplayPartialEntry {
+                offset_ms: total_audio_duration_ms,
+                raw_text: committed_text.clone(),
+                prepared_text: committed_text,
+                source: "endpoint_rollover".to_string(),
+                stable_chars: session.last_display_text.chars().count(),
+                frozen_chars: session.state.frozen_prefix.chars().count(),
+                volatile_chars: session.state.volatile_sentence.chars().count(),
+                rejected_prefix_rewrite: false,
+            });
+        }
+    }
+
+    let _ = feed_streaming_pending_chunks(
+        recognizer,
+        &mut session,
+        runner_sample_rate_hz,
+        stream_chunk_num_samples,
+        false,
+    );
+
+    let activity = analyze_audio_activity(&session.captured_samples);
+    let prepared_commit = prepare_final_streaming_commit(
+        recognizer,
+        punctuator.as_ref(),
+        &mut session,
+        runner_sample_rate_hz,
+        stream_chunk_num_samples,
+        runtime.config.voice.streaming.rewrite_enabled,
+    );
+    let final_text = if prepared_commit.final_text.is_empty() {
+        session.state.full_text().to_string()
+    } else {
+        session
+            .state
+            .finalize_from_streaming(&prepared_commit.final_text)
+            .display_text
+    };
+    let final_visible_chars = visible_text_char_count(&final_text);
+    let expected_text = expected_text.map(str::to_string);
+    let expected_visible_chars = min_visible_chars.or_else(|| {
+        expected_text
+            .as_deref()
+            .map(visible_text_char_count)
+            .filter(|count| *count > 0)
+    });
+    let mut failures = Vec::new();
+
+    if session.partial_updates < min_partial_updates {
+        failures.push(format!(
+            "partial_updates={} < min_partial_updates={}",
+            session.partial_updates, min_partial_updates
+        ));
+    }
+
+    if let Some(expected_visible_chars) = expected_visible_chars
+        && final_visible_chars + shortfall_tolerance_chars < expected_visible_chars
+    {
+        failures.push(format!(
+            "final_visible_chars={} shorter than expected_visible_chars={} with tolerance={}",
+            final_visible_chars, expected_visible_chars, shortfall_tolerance_chars
+        ));
+    }
+
+    if let Some(last_partial) = partial_timeline.last() {
+        let partial_visible_chars = visible_text_char_count(&last_partial.prepared_text);
+        if final_visible_chars + shortfall_tolerance_chars < partial_visible_chars {
+            failures.push(format!(
+                "final_visible_chars={} shorter than last_partial_visible_chars={} with tolerance={}",
+                final_visible_chars, partial_visible_chars, shortfall_tolerance_chars
+            ));
+        }
+    }
+
+    let behavior_status = if failures.is_empty() {
+        StreamingCaseStatus::Pass
+    } else {
+        StreamingCaseStatus::FailBehavior
+    };
+
+    let mut content_failures = Vec::new();
+    if let Some(expected_text) = expected_text.as_deref()
+        && normalize_replay_text(&final_text) != normalize_replay_text(expected_text)
+    {
+        content_failures.push(format!(
+            "final_text_mismatch expected='{}' actual='{}'",
+            expected_text, final_text
+        ));
+    }
+    let content_status = if content_failures.is_empty() {
+        StreamingCaseStatus::Pass
+    } else {
+        StreamingCaseStatus::FailContent
+    };
+    failures.extend(content_failures);
+
+    Ok(StreamingReplayReport {
+        case_id: case_id.to_string(),
+        input_wav: wav_path.display().to_string(),
+        input_sample_rate_hz,
+        runner_sample_rate_hz,
+        input_duration_ms: audio_duration_ms(input_sample_rate_hz, session.ingested_input_samples),
+        captured_samples: session.captured_samples.len(),
+        peak_abs: activity.peak_abs,
+        rms: activity.rms,
+        active_ratio: activity.active_ratio,
+        total_chunks_fed: session.total_chunks_fed,
+        total_decode_steps: session.total_decode_steps,
+        partial_updates: session.partial_updates,
+        first_partial_ms: partial_timeline.first().map(|entry| entry.offset_ms),
+        final_commit_ms: audio_duration_ms(input_sample_rate_hz, session.ingested_input_samples),
+        partial_timeline,
+        last_partial_text: session.last_display_text.clone(),
+        final_online_raw_text: prepared_commit.final_online_raw_text,
+        final_prepared_candidate: prepared_commit.prepared_final_candidate,
+        final_text,
+        final_visible_chars,
+        commit_source: prepared_commit.commit_source.as_str().to_string(),
+        expected_text,
+        expected_visible_chars,
+        min_partial_updates,
+        shortfall_tolerance_chars,
+        behavior_status,
+        content_status,
+        failures,
+    })
+}
+
+pub(crate) fn replay_streaming_manifest(
+    runtime: &AppRuntime,
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    manifest_path: &Path,
+    manifest: &StreamingFixtureManifest,
+) -> Result<StreamingSelftestReport> {
+    let manifest_dir = manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let fixture_root = manifest
+        .fixture_root
+        .as_ref()
+        .map(|root| manifest_dir.join(root));
+    let mut cases = Vec::new();
+
+    for case in &manifest.cases {
+        let wav_path = resolve_fixture_case_path(&manifest_dir, fixture_root.as_deref(), case);
+        let report = replay_streaming_wav(
+            runtime,
+            recognizer,
+            &case.id,
+            &wav_path,
+            case.expected_text.as_deref(),
+            case.min_partial_updates.unwrap_or(1),
+            case.min_visible_chars,
+            case.shortfall_tolerance_chars.unwrap_or(3),
+        )?;
+        cases.push(report);
+    }
+
+    let behavior_failures = cases
+        .iter()
+        .filter(|report| report.behavior_status == StreamingCaseStatus::FailBehavior)
+        .count();
+    let content_failures = cases
+        .iter()
+        .filter(|report| report.content_status == StreamingCaseStatus::FailContent)
+        .count();
+    let passed_cases = cases
+        .iter()
+        .filter(|report| {
+            report.behavior_status == StreamingCaseStatus::Pass
+                && report.content_status == StreamingCaseStatus::Pass
+        })
+        .count();
+    let overall_status = if behavior_failures > 0 {
+        StreamingCaseStatus::FailBehavior
+    } else if content_failures > 0 {
+        StreamingCaseStatus::FailContent
+    } else {
+        StreamingCaseStatus::Pass
+    };
+
+    Ok(StreamingSelftestReport {
+        manifest_path: manifest_path.display().to_string(),
+        total_cases: cases.len(),
+        passed_cases,
+        behavior_failures,
+        content_failures,
+        overall_status,
+        cases,
+    })
+}
+
+fn resolve_fixture_case_path(
+    manifest_dir: &Path,
+    fixture_root: Option<&Path>,
+    case: &StreamingFixtureCase,
+) -> std::path::PathBuf {
+    let wav_path = Path::new(&case.wav_path);
+    if wav_path.is_absolute() {
+        return wav_path.to_path_buf();
+    }
+    if let Some(fixture_root) = fixture_root {
+        return fixture_root.join(wav_path);
+    }
+    manifest_dir.join(wav_path)
+}
+
+fn normalize_replay_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !is_sentence_punctuation(*ch))
+        .collect()
 }
 
 fn build_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::SenseVoiceRecognizer> {
@@ -618,119 +1292,1195 @@ fn build_streaming_recognizer(
         sample_rate_hz: runtime.config.asr.sample_rate_hz as i32,
         num_threads: runtime.config.asr.num_threads,
         decoding_method: "greedy_search".to_string(),
-        enable_endpoint: false,
-        rule1_min_trailing_silence: 2.4,
-        rule2_min_trailing_silence: 1.2,
-        rule3_min_utterance_length: 20.0,
+        enable_endpoint: true,
+        rule1_min_trailing_silence: STREAMING_ENDPOINT_TRAILING_SILENCE_SECS,
+        rule2_min_trailing_silence: STREAMING_ENDPOINT_TRAILING_SILENCE_SECS,
+        rule3_min_utterance_length: STREAMING_ENDPOINT_MAX_UTTERANCE_SECS,
     })
 }
 
-struct StreamingChunkUpdate {
-    added_samples: usize,
-    decoded_steps: usize,
+fn build_streaming_punctuator(
+    runtime: &AppRuntime,
+) -> Result<ainput_asr::OfflinePunctuationRestorer> {
+    ainput_asr::OfflinePunctuationRestorer::create(&ainput_asr::OfflinePunctuationConfigBundle {
+        model_dir: runtime
+            .runtime_paths
+            .root_dir
+            .join(&runtime.config.voice.streaming.punctuation_model_dir),
+        provider: runtime.config.asr.provider.clone(),
+        num_threads: runtime.config.voice.streaming.punctuation_num_threads,
+    })
+}
+
+fn ensure_streaming_recording_ready(
+    standby_recording: &mut Option<ainput_audio::ActiveRecording>,
+) -> Result<()> {
+    if standby_recording.is_none() {
+        let recording = ainput_audio::ActiveRecording::start_default_input()?;
+        tracing::info!(
+            sample_rate_hz = recording.sample_rate_hz(),
+            "streaming microphone armed on hotkey press"
+        );
+        *standby_recording = Some(recording);
+    }
+
+    Ok(())
 }
 
 fn collect_streaming_audio_chunk(
+    session: &mut StreamingSession,
     recording: &ainput_audio::ActiveRecording,
-    sample_cursor: &mut usize,
-    captured_samples: &mut Vec<f32>,
-    recognizer: &ainput_asr::StreamingZipformerRecognizer,
-    stream: &ainput_asr::StreamingZipformerStream,
-) -> StreamingChunkUpdate {
-    let chunk = recording.take_new_samples(sample_cursor);
-    if chunk.is_empty() {
-        return StreamingChunkUpdate {
-            added_samples: 0,
-            decoded_steps: 0,
-        };
+) -> usize {
+    let chunk = recording.take_new_samples(&mut session.sample_cursor);
+    push_streaming_input_samples(&mut session.core, &chunk)
+}
+
+fn sample_count_for_ms(sample_rate_hz: i32, duration_ms: u64) -> usize {
+    if sample_rate_hz <= 0 {
+        return 0;
     }
 
-    recognizer.accept_waveform(stream, recording.sample_rate_hz(), &chunk);
-    let decoded_steps = recognizer.decode_available(stream);
-    captured_samples.extend_from_slice(&chunk);
+    ((sample_rate_hz as usize) * duration_ms as usize) / 1000
+}
 
-    StreamingChunkUpdate {
-        added_samples: chunk.len(),
-        decoded_steps,
+fn push_streaming_input_samples(session: &mut StreamingCoreSession, input: &[f32]) -> usize {
+    if input.is_empty() {
+        return 0;
+    }
+
+    session.ingested_input_samples += input.len();
+    let resampled = session.resampler.process(input);
+    if resampled.is_empty() {
+        return 0;
+    }
+
+    session.pending_feed_samples.extend_from_slice(&resampled);
+    session.captured_samples.extend_from_slice(&resampled);
+    resampled.len()
+}
+
+fn flush_streaming_audio_tail(session: &mut StreamingCoreSession) -> usize {
+    let tail = session.resampler.flush();
+    if tail.is_empty() {
+        return 0;
+    }
+
+    session.pending_feed_samples.extend_from_slice(&tail);
+    session.captured_samples.extend_from_slice(&tail);
+    tail.len()
+}
+
+fn collect_stopped_recording_tail(
+    session: &mut StreamingSession,
+    recorded: &ainput_audio::RecordedAudio,
+) -> usize {
+    if session.sample_cursor >= recorded.samples.len() {
+        return 0;
+    }
+
+    let tail = &recorded.samples[session.sample_cursor..];
+    session.sample_cursor = recorded.samples.len();
+    push_streaming_input_samples(&mut session.core, tail)
+}
+
+fn finish_streaming_recording(
+    session: &mut StreamingSession,
+    recording: ainput_audio::ActiveRecording,
+) -> Result<StreamingReleaseDrainStats> {
+    let grace_started_at = Instant::now();
+    let deadline = grace_started_at + Duration::from_millis(STREAMING_RELEASE_GRACE_MS);
+    let min_wait = Duration::from_millis(STREAMING_RELEASE_MIN_WAIT_MS);
+    let idle_settle = Duration::from_millis(STREAMING_RELEASE_IDLE_SETTLE_MS);
+    let poll_interval = Duration::from_millis(STREAMING_RELEASE_POLL_INTERVAL_MS);
+
+    let mut grace_added_samples = 0usize;
+    let mut last_new_audio_at: Option<Instant> = None;
+    tracing::info!(
+        grace_ms = STREAMING_RELEASE_GRACE_MS,
+        min_wait_ms = STREAMING_RELEASE_MIN_WAIT_MS,
+        idle_settle_ms = STREAMING_RELEASE_IDLE_SETTLE_MS,
+        "streaming release tail drain started"
+    );
+
+    loop {
+        let added = collect_streaming_audio_chunk(session, &recording);
+        if added > 0 {
+            grace_added_samples += added;
+            last_new_audio_at = Some(Instant::now());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        let waited = now.saturating_duration_since(grace_started_at);
+        if waited >= min_wait
+            && last_new_audio_at
+                .is_some_and(|instant| now.saturating_duration_since(instant) >= idle_settle)
+        {
+            break;
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+
+    let recorded = recording.stop()?;
+    let stop_added_samples = collect_stopped_recording_tail(session, &recorded);
+    let grace_wait_elapsed_ms = grace_started_at.elapsed().as_millis();
+    tracing::info!(
+        grace_added_samples,
+        stop_added_samples,
+        grace_wait_elapsed_ms,
+        recorded_total_samples = recorded.samples.len(),
+        "streaming release tail drain finished"
+    );
+
+    Ok(StreamingReleaseDrainStats {
+        grace_added_samples,
+        stop_added_samples,
+        grace_wait_elapsed_ms,
+    })
+}
+
+fn streaming_chunk_num_samples(sample_rate_hz: i32, chunk_ms: u32) -> usize {
+    let effective_sample_rate = sample_rate_hz.max(1) as usize;
+    let effective_chunk_ms = chunk_ms.clamp(60, 500) as usize;
+    ((effective_sample_rate * effective_chunk_ms) / 1000).max(effective_sample_rate / 20)
+}
+
+fn feed_streaming_pending_chunks(
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    session: &mut StreamingCoreSession,
+    sample_rate_hz: i32,
+    chunk_num_samples: usize,
+    full_chunks_only: bool,
+) -> usize {
+    let mut consumed = 0usize;
+
+    while session.pending_feed_samples.len() >= chunk_num_samples {
+        let chunk: Vec<f32> = session
+            .pending_feed_samples
+            .drain(..chunk_num_samples)
+            .collect();
+        recognizer.accept_waveform(&session.stream, sample_rate_hz, &chunk);
+        session.total_decode_steps += recognizer.decode_available(&session.stream);
+        session.total_chunks_fed += 1;
+        consumed += chunk.len();
+    }
+
+    if !full_chunks_only && !session.pending_feed_samples.is_empty() {
+        let chunk: Vec<f32> = session.pending_feed_samples.drain(..).collect();
+        recognizer.accept_waveform(&session.stream, sample_rate_hz, &chunk);
+        session.total_decode_steps += recognizer.decode_available(&session.stream);
+        session.total_chunks_fed += 1;
+        consumed += chunk.len();
+    }
+
+    consumed
+}
+
+fn finalize_streaming_decode(
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    session: &mut StreamingCoreSession,
+    sample_rate_hz: i32,
+    chunk_num_samples: usize,
+) -> usize {
+    let mut decode_steps = 0usize;
+    let _ = flush_streaming_audio_tail(session);
+    feed_streaming_pending_chunks(
+        recognizer,
+        session,
+        sample_rate_hz,
+        chunk_num_samples,
+        false,
+    );
+
+    let tail_padding_num_samples =
+        ((sample_rate_hz.max(1) as usize) * STREAMING_TAIL_PADDING_MS as usize / 1000).max(1);
+    let tail_padding = vec![0.0f32; tail_padding_num_samples];
+    recognizer.accept_waveform(&session.stream, sample_rate_hz, &tail_padding);
+    decode_steps += recognizer.decode_available(&session.stream);
+    recognizer.input_finished(&session.stream);
+    decode_steps += recognizer.decode_available(&session.stream);
+    session.total_decode_steps += decode_steps;
+    decode_steps
+}
+
+#[derive(Debug, Clone)]
+struct PreparedStreamingCommit {
+    final_online_raw_text: String,
+    prepared_final_candidate: String,
+    display_text_before_final: String,
+    final_text: String,
+    commit_source: StreamingCommitSource,
+    final_decode_steps: usize,
+    final_drain_elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamingReleaseDrainStats {
+    grace_added_samples: usize,
+    stop_added_samples: usize,
+    grace_wait_elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedStreamingPartial {
+    raw_text: String,
+    online_prepared_text: String,
+    display_text: String,
+    source: &'static str,
+    stable_chars: usize,
+    frozen_chars: usize,
+    volatile_chars: usize,
+    rejected_prefix_rewrite: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedFastStreamingPartial {
+    display_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingAiRewriteCandidate {
+    frozen_prefix: String,
+    current_tail: String,
+}
+
+#[derive(Debug)]
+struct StreamingAiRewriteOutcome {
+    request_key: String,
+    candidate: StreamingAiRewriteCandidate,
+    rewritten_tail: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingAiRewriteDisplayUpdate {
+    request_key: String,
+    display_text: String,
+}
+
+fn prepare_final_streaming_commit(
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+    session: &mut StreamingCoreSession,
+    sample_rate_hz: i32,
+    chunk_num_samples: usize,
+    rewrite_enabled: bool,
+) -> PreparedStreamingCommit {
+    let final_drain_started_at = Instant::now();
+    let final_decode_steps =
+        finalize_streaming_decode(recognizer, session, sample_rate_hz, chunk_num_samples);
+    let final_drain_elapsed_ms = final_drain_started_at.elapsed().as_millis();
+    let final_online_raw_text = recognizer
+        .get_result(&session.stream)
+        .map(|result| result.text.trim().to_string())
+        .unwrap_or_default();
+    let (prepared_final_candidate, candidate_source) =
+        prepare_streaming_output_text(&final_online_raw_text, rewrite_enabled, punctuator);
+    let display_text_before_final = effective_streaming_display_text(session);
+    let selected_commit = select_final_streaming_commit_text(
+        &display_text_before_final,
+        &prepared_final_candidate,
+        candidate_source,
+    );
+    let commit_source = selected_commit.source;
+    let final_text = selected_commit.text.to_string();
+
+    PreparedStreamingCommit {
+        final_online_raw_text,
+        prepared_final_candidate,
+        display_text_before_final,
+        final_text,
+        commit_source,
+        final_decode_steps,
+        final_drain_elapsed_ms,
     }
 }
 
-fn emit_streaming_partial_if_changed(
+fn update_streaming_partial_state(
+    runtime: &AppRuntime,
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
-    stream: &ainput_asr::StreamingZipformerStream,
-    sample_rate_hz: i32,
-    captured_samples: &[f32],
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+    session: &mut StreamingCoreSession,
     rewrite_enabled: bool,
-    last_partial: &mut String,
-    last_prepared_preview: &mut String,
-    proxy: &EventLoopProxy<AppEvent>,
-) -> Result<()> {
-    let audio_duration_ms = audio_duration_ms(sample_rate_hz, captured_samples.len());
-    let activity = analyze_recent_audio_activity(captured_samples, sample_rate_hz, 700);
+    total_audio_duration_ms: u64,
+) -> Result<Option<PreparedStreamingPartial>> {
+    let sample_rate_hz = session.sample_rate_hz;
+    let activity = analyze_recent_audio_activity(&session.captured_samples, sample_rate_hz, 500);
+    if session.awaiting_post_rollover_speech && !should_skip_streaming_preview(&activity) {
+        session.awaiting_post_rollover_speech = false;
+    }
     if should_skip_streaming_preview(&activity) {
         tracing::debug!(
-            samples = captured_samples.len(),
-            audio_duration_ms,
+            samples = session.captured_samples.len(),
+            audio_duration_ms = total_audio_duration_ms,
             peak_abs = format_args!("{:.6}", activity.peak_abs),
             rms = format_args!("{:.6}", activity.rms),
             active_ratio = format_args!("{:.4}", activity.active_ratio),
             "skip streaming preview because audio still looks like background noise"
         );
-        return Ok(());
+        return Ok(None);
     }
 
-    let result_started_at = Instant::now();
-    let Some(result) = recognizer.get_result(stream) else {
-        return Ok(());
-    };
-    let result_elapsed_ms = result_started_at.elapsed().as_millis();
-    let text = result.text.trim().to_string();
-    if text.is_empty() {
-        tracing::info!(
-            samples = captured_samples.len(),
-            audio_duration_ms,
-            result_elapsed_ms,
-            "streaming preview produced empty text"
-        );
-        return Ok(());
-    }
-
-    if should_drop_streaming_preview_result(&text, &activity) {
-        tracing::info!(
-            samples = captured_samples.len(),
-            audio_duration_ms,
-            result_elapsed_ms,
-            raw_text = %text,
+    let online_raw_text = recognizer
+        .get_result(&session.stream)
+        .map(|result| result.text.trim().to_string())
+        .unwrap_or_default();
+    let online_prepared_text = if online_raw_text.is_empty() {
+        String::new()
+    } else if should_drop_streaming_preview_result(&online_raw_text, &activity) {
+        tracing::debug!(
+            samples = session.captured_samples.len(),
+            audio_duration_ms = total_audio_duration_ms,
+            raw_text = %online_raw_text,
             peak_abs = format_args!("{:.6}", activity.peak_abs),
             rms = format_args!("{:.6}", activity.rms),
             active_ratio = format_args!("{:.4}", activity.active_ratio),
             "drop low-signal streaming preview text"
         );
+        String::new()
+    } else {
+        prepare_streaming_preview_text(&online_raw_text, rewrite_enabled, punctuator)
+    };
+
+    let current_display_text = effective_streaming_display_text(session);
+    let selected_preview =
+        select_streaming_preview_text(&current_display_text, &online_prepared_text);
+    let preview_source = selected_preview.source;
+    let mut selected_preview_text = selected_preview.text.to_string();
+    if !session.rolled_over_prefix.is_empty()
+        && !selected_preview_text.starts_with(&session.rolled_over_prefix)
+        && can_append_segment_only_candidate(&selected_preview_text, &session.rolled_over_prefix)
+    {
+        selected_preview_text = format!("{}{}", session.rolled_over_prefix, selected_preview_text);
+    }
+    if selected_preview_text.is_empty() {
+        tracing::debug!(
+            samples = session.captured_samples.len(),
+            audio_duration_ms = total_audio_duration_ms,
+            raw_text = %online_raw_text,
+            "streaming preview produced no usable corrected text"
+        );
+        return Ok(None);
+    }
+    if preview_source != "held_display" {
+        selected_preview_text =
+            maybe_apply_streaming_ai_rewrite(runtime, session, &selected_preview_text)?;
+    }
+
+    let selected_raw_text = if preview_source == "held_display" {
+        current_display_text.clone()
+    } else {
+        online_raw_text.clone()
+    };
+    if session.last_raw_partial == selected_raw_text
+        && session.last_display_text == selected_preview_text
+    {
+        return Ok(None);
+    }
+
+    Ok(apply_streaming_partial_update(
+        session,
+        &selected_raw_text,
+        &selected_preview_text,
+        &online_prepared_text,
+        preview_source,
+    ))
+}
+
+fn prepare_fast_streaming_partial(
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    session: &mut StreamingCoreSession,
+    _total_audio_duration_ms: u64,
+) -> Option<PreparedFastStreamingPartial> {
+    if !session.last_display_text.is_empty() {
+        return None;
+    }
+
+    let sample_rate_hz = session.sample_rate_hz;
+    let activity = analyze_recent_audio_activity(&session.captured_samples, sample_rate_hz, 500);
+    if should_skip_streaming_preview(&activity) {
+        return None;
+    }
+
+    let online_raw_text = recognizer
+        .get_result(&session.stream)
+        .map(|result| result.text.trim().to_string())
+        .unwrap_or_default();
+    if online_raw_text.is_empty()
+        || should_drop_streaming_preview_result(&online_raw_text, &activity)
+    {
+        return None;
+    }
+
+    let fast_candidate = ainput_rewrite::normalize_streaming_preview(&online_raw_text);
+    if fast_candidate.is_empty() {
+        return None;
+    }
+
+    let current_display_text = if session.last_fast_preview_text.is_empty() {
+        effective_streaming_display_text(session)
+    } else {
+        session.last_fast_preview_text.clone()
+    };
+    let selected_preview = select_streaming_preview_text(&current_display_text, &fast_candidate);
+    let selected_text = selected_preview.text.trim();
+    if selected_text.is_empty() || session.last_fast_preview_text == selected_text {
+        return None;
+    }
+
+    session.last_fast_preview_text = selected_text.to_string();
+    Some(PreparedFastStreamingPartial {
+        display_text: selected_text.to_string(),
+    })
+}
+
+fn emit_streaming_partial_if_changed(
+    runtime: &AppRuntime,
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+    session: &mut StreamingCoreSession,
+    rewrite_enabled: bool,
+    proxy: &EventLoopProxy<AppEvent>,
+    total_audio_duration_ms: u64,
+) -> Result<()> {
+    if let Some(fast_update) =
+        prepare_fast_streaming_partial(recognizer, session, total_audio_duration_ms)
+    {
+        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingRawPartial(
+            fast_update.display_text,
+        )));
+    }
+
+    let Some(update) = update_streaming_partial_state(
+        runtime,
+        recognizer,
+        punctuator,
+        session,
+        rewrite_enabled,
+        total_audio_duration_ms,
+    )?
+    else {
+        return Ok(());
+    };
+
+    tracing::debug!(
+        samples = session.captured_samples.len(),
+        audio_duration_ms = total_audio_duration_ms,
+        decode_steps = session.total_decode_steps,
+        total_chunks_fed = session.total_chunks_fed,
+        selected_preview_source = update.source,
+        stable_chars = update.stable_chars,
+        frozen_chars = update.frozen_chars,
+        volatile_chars = update.volatile_chars,
+        rejected_frozen_edit = update.rejected_prefix_rewrite,
+        raw_text = %update.raw_text,
+        online_prepared_text = %update.online_prepared_text,
+        prepared_text = %update.display_text,
+        "streaming partial updated"
+    );
+    session.last_fast_preview_text = update.display_text.clone();
+    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
+        raw_text: update.raw_text,
+        prepared_text: update.display_text,
+    }));
+    Ok(())
+}
+
+fn maybe_apply_streaming_ai_rewrite(
+    runtime: &AppRuntime,
+    session: &mut StreamingCoreSession,
+    selected_preview_text: &str,
+) -> Result<String> {
+    let Some(ai_rewriter) = runtime.ai_rewriter.as_ref() else {
+        tracing::debug!("streaming AI rewrite skipped because client is unavailable");
+        return Ok(selected_preview_text.trim().to_string());
+    };
+    let config = &runtime.config.voice.streaming.ai_rewrite;
+    let _ = poll_streaming_ai_rewrite_result(session, config);
+    let trimmed_preview = selected_preview_text.trim();
+    if trimmed_preview.is_empty() {
+        tracing::info!("streaming AI rewrite skipped because preview text is empty");
+        return Ok(trimmed_preview.to_string());
+    }
+
+    let effective_min_visible_chars = effective_ai_rewrite_min_visible_chars(config.min_visible_chars);
+    let Some(candidate) =
+        build_streaming_ai_rewrite_candidate(selected_preview_text, effective_min_visible_chars)
+    else {
+        let (_, current_tail) = split_frozen_prefix(trimmed_preview);
+        tracing::info!(
+            preview_chars = trimmed_preview.chars().count(),
+            current_tail_chars = visible_text_char_count(&current_tail),
+            min_visible_chars = effective_min_visible_chars,
+            current_tail = %short_log_text(&current_tail, 120),
+            "streaming AI rewrite skipped because current tail is too short"
+        );
+        return Ok(trimmed_preview.to_string());
+    };
+
+    let request_key = format!("{}\n{}", candidate.frozen_prefix, candidate.current_tail);
+    if session.last_ai_rewrite_input == request_key {
+        if !session.last_ai_rewrite_output.is_empty() {
+            tracing::info!(
+                request_key = %short_log_text(&request_key, 120),
+                rewritten_tail = %short_log_text(&session.last_ai_rewrite_output, 120),
+                "streaming AI rewrite reused cached output"
+            );
+            return Ok(format!(
+                "{}{}",
+                candidate.frozen_prefix, session.last_ai_rewrite_output
+            ));
+        }
+        tracing::info!(
+            request_key = %short_log_text(&request_key, 120),
+            "streaming AI rewrite reused cached miss"
+        );
+        return Ok(trimmed_preview.to_string());
+    }
+    if session.ai_rewrite_inflight_input == request_key {
+        tracing::info!(
+            request_key = %short_log_text(&request_key, 120),
+            "streaming AI rewrite skipped because same request is already inflight"
+        );
+        return Ok(trimmed_preview.to_string());
+    }
+    if session.ai_rewrite_result_rx.is_some() {
+        tracing::info!("streaming AI rewrite skipped because another request result is pending");
+        return Ok(trimmed_preview.to_string());
+    }
+
+    let now = Instant::now();
+    if session
+        .last_ai_rewrite_at
+        .is_some_and(|last| now.duration_since(last) < Duration::from_millis(config.debounce_ms))
+    {
+        tracing::info!(
+            debounce_ms = config.debounce_ms,
+            request_key = %short_log_text(&request_key, 120),
+            "streaming AI rewrite skipped because debounce window is active"
+        );
+        return Ok(trimmed_preview.to_string());
+    }
+    session.last_ai_rewrite_at = Some(now);
+    spawn_streaming_ai_rewrite_request(
+        runtime,
+        session,
+        ai_rewriter.clone(),
+        candidate,
+        request_key,
+    );
+    Ok(selected_preview_text.trim().to_string())
+}
+
+fn spawn_streaming_ai_rewrite_request(
+    runtime: &AppRuntime,
+    session: &mut StreamingCoreSession,
+    ai_rewriter: Arc<crate::ai_rewrite::AiRewriteClient>,
+    candidate: StreamingAiRewriteCandidate,
+    request_key: String,
+) {
+    let (result_tx, result_rx) = mpsc::channel();
+    let context = runtime.output_controller.inspect_context_snapshot();
+    session.ai_rewrite_inflight_input = request_key.clone();
+    session.ai_rewrite_result_rx = Some(result_rx);
+    tracing::info!(
+        request_key = %short_log_text(&request_key, 120),
+        frozen_prefix = %short_log_text(&candidate.frozen_prefix, 120),
+        current_tail = %short_log_text(&candidate.current_tail, 120),
+        process_name = context.process_name.as_deref().unwrap_or("unknown"),
+        context_kind = ?context.kind,
+        "streaming AI rewrite request queued"
+    );
+
+    std::thread::spawn(move || {
+        let outcome = match ai_rewriter.rewrite_tail(AiRewriteRequest {
+            frozen_prefix: candidate.frozen_prefix.clone(),
+            current_tail: candidate.current_tail.clone(),
+            context,
+        }) {
+            Ok(response) => StreamingAiRewriteOutcome {
+                request_key,
+                candidate,
+                rewritten_tail: response.map(|value| value.rewritten_tail),
+                error: None,
+            },
+            Err(error) => StreamingAiRewriteOutcome {
+                request_key,
+                candidate,
+                rewritten_tail: None,
+                error: Some(error.to_string()),
+            },
+        };
+        let _ = result_tx.send(outcome);
+    });
+}
+
+fn poll_streaming_ai_rewrite_result(
+    session: &mut StreamingCoreSession,
+    config: &ainput_shell::StreamingAiRewriteConfig,
+) -> Option<StreamingAiRewriteDisplayUpdate> {
+    let Some(result_rx) = session.ai_rewrite_result_rx.take() else {
+        return None;
+    };
+
+    match result_rx.try_recv() {
+        Ok(outcome) => {
+            session.ai_rewrite_inflight_input.clear();
+            session.last_ai_rewrite_input = outcome.request_key;
+            session.last_ai_rewrite_output.clear();
+
+            if let Some(error) = outcome.error {
+                tracing::warn!(
+                    request_key = %short_log_text(&session.last_ai_rewrite_input, 120),
+                    error = %error,
+                    "streaming AI rewrite failed asynchronously; keep online preview"
+                );
+                return None;
+            }
+
+            let Some(raw_tail) = outcome.rewritten_tail else {
+                tracing::info!(
+                    request_key = %short_log_text(&session.last_ai_rewrite_input, 120),
+                    "streaming AI rewrite completed with empty response"
+                );
+                return None;
+            };
+            if let Some(rewritten_tail) = sanitize_ai_rewrite_output(
+                &outcome.candidate.frozen_prefix,
+                &outcome.candidate.current_tail,
+                &raw_tail,
+                effective_ai_rewrite_min_visible_chars(config.min_visible_chars),
+                config.max_output_chars,
+            ) {
+                tracing::info!(
+                    request_key = %short_log_text(&session.last_ai_rewrite_input, 120),
+                    raw_tail = %short_log_text(&raw_tail, 120),
+                    rewritten_tail = %short_log_text(&rewritten_tail, 120),
+                    "streaming AI rewrite result adopted"
+                );
+                session.last_ai_rewrite_output = rewritten_tail;
+                return Some(StreamingAiRewriteDisplayUpdate {
+                    request_key: session.last_ai_rewrite_input.clone(),
+                    display_text: format!(
+                        "{}{}",
+                        outcome.candidate.frozen_prefix, session.last_ai_rewrite_output
+                    ),
+                });
+            } else {
+                tracing::info!(
+                    request_key = %short_log_text(&session.last_ai_rewrite_input, 120),
+                    raw_tail = %short_log_text(&raw_tail, 120),
+                    "streaming AI rewrite result rejected by sanitizer"
+                );
+            }
+            None
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            session.ai_rewrite_result_rx = Some(result_rx);
+            None
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            session.ai_rewrite_inflight_input.clear();
+            tracing::warn!("streaming AI rewrite result channel disconnected");
+            None
+        }
+    }
+}
+
+fn drain_final_streaming_ai_rewrite(
+    runtime: &AppRuntime,
+    session: &mut StreamingCoreSession,
+    proxy: &EventLoopProxy<AppEvent>,
+) -> Result<()> {
+    let current_display = effective_streaming_display_text(session);
+    if current_display.trim().is_empty() {
         return Ok(());
     }
 
-    let prepared_text = build_streaming_prepared_preview(&text, rewrite_enabled);
-    if *last_partial == text && *last_prepared_preview == prepared_text {
-        return Ok(());
+    session.last_ai_rewrite_at = None;
+    let preview_after_cached_rewrite =
+        maybe_apply_streaming_ai_rewrite(runtime, session, &current_display)?;
+    if preview_after_cached_rewrite != current_display {
+        emit_streaming_partial_override(
+            session,
+            &current_display,
+            &preview_after_cached_rewrite,
+            "ai_rewrite_cached",
+            proxy,
+        );
     }
+
+    let wait_started_at = Instant::now();
+    let wait_budget = Duration::from_millis(STREAMING_FINAL_AI_REWRITE_WAIT_MS);
+    let config = &runtime.config.voice.streaming.ai_rewrite;
+    let mut received_result = false;
+
+    while wait_started_at.elapsed() < wait_budget {
+        if apply_ready_streaming_ai_rewrite_result(session, config, proxy) {
+            received_result = true;
+            break;
+        }
+        if session.ai_rewrite_result_rx.is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(STREAMING_RELEASE_POLL_INTERVAL_MS));
+    }
+
+    if !received_result {
+        received_result = apply_ready_streaming_ai_rewrite_result(session, config, proxy);
+    }
+
     tracing::info!(
-        samples = captured_samples.len(),
-        audio_duration_ms,
-        result_elapsed_ms,
-        result_is_final = result.is_final,
-        raw_text = %text,
-        prepared_text = %prepared_text,
-        "streaming partial updated"
+        waited_ms = wait_started_at.elapsed().as_millis(),
+        received_result,
+        pending_after_wait = session.ai_rewrite_result_rx.is_some(),
+        "streaming final AI rewrite wait finished"
     );
-    *last_partial = text.clone();
-    if *last_prepared_preview != prepared_text {
-        *last_prepared_preview = prepared_text.clone();
-    }
-    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
-        raw_text: text,
-        prepared_text,
-    }));
+
     Ok(())
+}
+
+fn apply_ready_streaming_ai_rewrite_result(
+    session: &mut StreamingCoreSession,
+    config: &ainput_shell::StreamingAiRewriteConfig,
+    proxy: &EventLoopProxy<AppEvent>,
+) -> bool {
+    let Some(update) = poll_streaming_ai_rewrite_result(session, config) else {
+        return false;
+    };
+
+    emit_streaming_partial_override(
+        session,
+        &update.display_text,
+        &update.display_text,
+        "ai_rewrite_async",
+        proxy,
+    );
+    tracing::info!(
+        request_key = %short_log_text(&update.request_key, 120),
+        display_text = %short_log_text(&update.display_text, 120),
+        "streaming AI rewrite result synced into HUD before final commit"
+    );
+    true
+}
+
+fn emit_streaming_partial_override(
+    session: &mut StreamingCoreSession,
+    raw_text: &str,
+    display_text: &str,
+    source: &'static str,
+    proxy: &EventLoopProxy<AppEvent>,
+) {
+    let Some(update) =
+        apply_streaming_partial_update(session, raw_text, display_text, display_text, source)
+    else {
+        return;
+    };
+
+    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
+        raw_text: update.raw_text,
+        prepared_text: update.display_text,
+    }));
+}
+
+fn emit_streaming_final_preview_sync(
+    session: &mut StreamingCoreSession,
+    final_text: &str,
+    proxy: &EventLoopProxy<AppEvent>,
+) {
+    let final_trimmed = final_text.trim();
+    if final_trimmed.is_empty() || session.last_display_text == final_trimmed {
+        return;
+    }
+
+    session.last_raw_partial = final_trimmed.to_string();
+    session.last_display_text = final_trimmed.to_string();
+    session.last_fast_preview_text = final_trimmed.to_string();
+
+    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
+        raw_text: final_trimmed.to_string(),
+        prepared_text: final_trimmed.to_string(),
+    }));
+}
+
+fn apply_streaming_partial_update(
+    session: &mut StreamingCoreSession,
+    raw_text: &str,
+    candidate_display_text: &str,
+    online_prepared_text: &str,
+    source: &'static str,
+) -> Option<PreparedStreamingPartial> {
+    let update = session.state.apply_online_partial(candidate_display_text)?;
+    if update.rejected_prefix_rewrite && session.last_display_text == update.display_text {
+        return None;
+    }
+
+    session.last_raw_partial = raw_text.to_string();
+    session.last_display_text = update.display_text.clone();
+    session.last_fast_preview_text = update.display_text.clone();
+    session.partial_updates += 1;
+
+    Some(PreparedStreamingPartial {
+        raw_text: raw_text.to_string(),
+        online_prepared_text: online_prepared_text.to_string(),
+        display_text: update.display_text,
+        source,
+        stable_chars: update.stable_chars,
+        frozen_chars: update.frozen_chars,
+        volatile_chars: update.volatile_chars,
+        rejected_prefix_rewrite: update.rejected_prefix_rewrite,
+    })
+}
+
+fn build_streaming_ai_rewrite_candidate(
+    display_text: &str,
+    min_visible_chars: usize,
+) -> Option<StreamingAiRewriteCandidate> {
+    let trimmed = display_text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (frozen_prefix, current_tail) = split_frozen_prefix(trimmed);
+    if visible_text_char_count(&current_tail) < min_visible_chars.max(1) {
+        return None;
+    }
+
+    Some(StreamingAiRewriteCandidate {
+        frozen_prefix,
+        current_tail: current_tail.trim().to_string(),
+    })
+}
+
+fn effective_ai_rewrite_min_visible_chars(configured_min_visible_chars: usize) -> usize {
+    configured_min_visible_chars.clamp(2, 48)
+}
+
+fn sanitize_ai_rewrite_output(
+    frozen_prefix: &str,
+    current_tail: &str,
+    rewritten_text: &str,
+    min_visible_chars: usize,
+    max_output_chars: usize,
+) -> Option<String> {
+    let mut candidate = rewritten_text
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'))
+        .trim()
+        .to_string();
+
+    for prefix in ["改写后：", "改写后:", "当前尾巴：", "当前尾巴:"] {
+        if let Some(stripped) = candidate.strip_prefix(prefix) {
+            candidate = stripped.trim().to_string();
+        }
+    }
+
+    let frozen_prefix = frozen_prefix.trim();
+    if !frozen_prefix.is_empty() && candidate.starts_with(frozen_prefix) {
+        candidate = candidate[frozen_prefix.len()..].trim().to_string();
+    }
+
+    if candidate.is_empty() {
+        tracing::info!("streaming AI rewrite sanitizer rejected empty candidate");
+        return None;
+    }
+
+    let visible_chars = visible_text_char_count(&candidate);
+    if visible_chars < min_visible_chars.max(1) || visible_chars > max_output_chars.max(8) {
+        tracing::info!(
+            visible_chars,
+            min_visible_chars = min_visible_chars.max(1),
+            max_output_chars = max_output_chars.max(8),
+            candidate = %short_log_text(&candidate, 120),
+            "streaming AI rewrite sanitizer rejected candidate because visible length is out of range"
+        );
+        return None;
+    }
+
+    if candidate == current_tail.trim() {
+        return Some(candidate);
+    }
+
+    Some(candidate)
+}
+
+fn short_log_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let mut shortened = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        shortened.push_str("...");
+    }
+    shortened
+}
+
+fn reset_streaming_ai_rewrite_cache(session: &mut StreamingCoreSession) {
+    session.ai_rewrite_result_rx = None;
+    session.ai_rewrite_inflight_input.clear();
+    session.last_ai_rewrite_input.clear();
+    session.last_ai_rewrite_output.clear();
+    session.last_ai_rewrite_at = None;
+}
+
+fn maybe_rollover_streaming_segment_core(
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+    session: &mut StreamingCoreSession,
+    rewrite_enabled: bool,
+    total_audio_duration_ms: u64,
+) -> Option<String> {
+    let activity =
+        analyze_recent_audio_activity(&session.captured_samples, session.sample_rate_hz, 500);
+    if session.awaiting_post_rollover_speech {
+        if should_skip_streaming_preview(&activity) {
+            return None;
+        }
+        session.awaiting_post_rollover_speech = false;
+    }
+
+    if !recognizer.is_endpoint(&session.stream) {
+        return None;
+    }
+
+    let current_display = effective_streaming_display_text(session);
+    if visible_text_char_count(&current_display) == 0 {
+        recognizer.reset(&session.stream);
+        session.last_raw_partial.clear();
+        session.last_fast_preview_text.clear();
+        session.last_display_text.clear();
+        reset_streaming_ai_rewrite_cache(session);
+        return None;
+    }
+
+    let current_raw_text = recognizer
+        .get_result(&session.stream)
+        .map(|result| result.text.trim().to_string())
+        .unwrap_or_default();
+    let committed_text =
+        prepare_streaming_pause_boundary_text(&current_display, rewrite_enabled, punctuator);
+    let committed_text = if committed_text.is_empty() {
+        ensure_terminal_sentence_boundary(&current_display)
+    } else {
+        committed_text
+    };
+
+    let update = session.state.freeze_with_committed_text(&committed_text);
+    session.rolled_over_prefix = update.display_text.clone();
+    session.awaiting_post_rollover_speech = true;
+    session.last_raw_partial.clear();
+    session.last_fast_preview_text.clear();
+    session.last_display_text = update.display_text.clone();
+    reset_streaming_ai_rewrite_cache(session);
+    recognizer.reset(&session.stream);
+
+    tracing::info!(
+        audio_duration_ms = total_audio_duration_ms,
+        endpoint_raw_text = %current_raw_text,
+        endpoint_text_before_reset = %current_display,
+        endpoint_committed_text = %update.display_text,
+        frozen_chars = update.frozen_chars,
+        volatile_chars = update.volatile_chars,
+        "streaming endpoint detected; rolled over to next segment"
+    );
+
+    Some(update.display_text)
+}
+
+fn select_streaming_preview_text<'a>(
+    current_display: &'a str,
+    online_prepared: &'a str,
+) -> StreamingTextChoice<'a> {
+    let current_trimmed = current_display.trim();
+    let online_trimmed = online_prepared.trim();
+    let candidate = if visible_text_char_count(online_trimmed) > 0 {
+        StreamingTextChoice {
+            source: "online",
+            text: online_trimmed,
+        }
+    } else {
+        StreamingTextChoice {
+            source: "none",
+            text: "",
+        }
+    };
+
+    if candidate.text.is_empty() || current_trimmed.is_empty() {
+        return candidate;
+    }
+
+    let current_visible = visible_text_char_count(current_trimmed);
+    let candidate_visible = visible_text_char_count(candidate.text);
+    if current_visible >= 6
+        && candidate_visible + STREAMING_PREVIEW_SHORTFALL_TOLERANCE_CHARS < current_visible
+        && !is_segment_only_streaming_candidate(current_trimmed, candidate.text)
+    {
+        let common_prefix_chars = longest_common_prefix_chars(current_trimmed, candidate.text);
+        if common_prefix_chars + STREAMING_PREVIEW_SHORTFALL_TOLERANCE_CHARS < current_visible {
+            return StreamingTextChoice {
+                source: "held_display",
+                text: current_trimmed,
+            };
+        }
+    }
+
+    candidate
+}
+
+fn select_streaming_commit_text<'a>(
+    display_text: &'a str,
+    final_candidate: &'a str,
+    final_candidate_source: StreamingCommitSource,
+) -> StreamingCommitChoice<'a> {
+    let display_trimmed = display_text.trim();
+    let candidate_trimmed = final_candidate.trim();
+    let selected_candidate = if visible_text_char_count(candidate_trimmed) > 0 {
+        StreamingCommitChoice {
+            source: final_candidate_source,
+            text: candidate_trimmed,
+        }
+    } else {
+        StreamingCommitChoice {
+            source: StreamingCommitSource::StreamingState,
+            text: "",
+        }
+    };
+
+    if display_trimmed.is_empty() {
+        return selected_candidate;
+    }
+
+    if selected_candidate.text.is_empty() {
+        return StreamingCommitChoice {
+            source: StreamingCommitSource::StreamingState,
+            text: display_trimmed,
+        };
+    }
+
+    let display_visible = visible_text_char_count(display_trimmed);
+    let selected_visible = visible_text_char_count(selected_candidate.text);
+    if selected_visible + STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS < display_visible
+        && !is_segment_only_streaming_candidate(display_trimmed, selected_candidate.text)
+    {
+        return StreamingCommitChoice {
+            source: StreamingCommitSource::StreamingState,
+            text: display_trimmed,
+        };
+    }
+
+    let common_prefix_chars = longest_common_prefix_chars(display_trimmed, selected_candidate.text);
+    if common_prefix_chars < 4
+        && display_visible > selected_visible
+        && !is_segment_only_streaming_candidate(display_trimmed, selected_candidate.text)
+    {
+        return StreamingCommitChoice {
+            source: StreamingCommitSource::StreamingState,
+            text: display_trimmed,
+        };
+    }
+
+    selected_candidate
+}
+
+fn select_final_streaming_commit_text<'a>(
+    display_text: &'a str,
+    final_candidate: &'a str,
+    final_candidate_source: StreamingCommitSource,
+) -> StreamingCommitChoice<'a> {
+    let display_trimmed = display_text.trim();
+    let candidate_trimmed = final_candidate.trim();
+    if !display_trimmed.is_empty() {
+        if !candidate_trimmed.is_empty() && candidate_trimmed.starts_with(display_trimmed) {
+            let suffix = &candidate_trimmed[display_trimmed.len()..];
+            let suffix_chars = suffix.chars().count();
+            if suffix_chars > 0 && suffix_chars <= 4 {
+                return StreamingCommitChoice {
+                    source: final_candidate_source,
+                    text: candidate_trimmed,
+                };
+            }
+        }
+        if !candidate_trimmed.is_empty() {
+            let display_visible = visible_text_char_count(display_trimmed);
+            let candidate_visible = visible_text_char_count(candidate_trimmed);
+            let common_prefix_chars = longest_common_prefix_chars(display_trimmed, candidate_trimmed);
+            let visible_gap = display_visible.abs_diff(candidate_visible);
+            if candidate_visible >= display_visible
+                && common_prefix_chars + STREAMING_FINAL_SIMILAR_TAIL_MARGIN_CHARS
+                    >= display_visible.min(candidate_visible)
+                && visible_gap <= 2
+            {
+                return StreamingCommitChoice {
+                    source: final_candidate_source,
+                    text: candidate_trimmed,
+                };
+            }
+        }
+        return StreamingCommitChoice {
+            source: StreamingCommitSource::StreamingState,
+            text: display_trimmed,
+        };
+    }
+
+    select_streaming_commit_text(display_trimmed, candidate_trimmed, final_candidate_source)
+}
+
+fn is_segment_only_streaming_candidate(current_display: &str, candidate_text: &str) -> bool {
+    let (frozen_prefix, _) = split_frozen_prefix(current_display.trim());
+    can_append_segment_only_candidate(candidate_text, &frozen_prefix)
+}
+
+fn effective_streaming_display_text(session: &StreamingCoreSession) -> String {
+    merge_rolled_over_prefix(
+        &session.rolled_over_prefix,
+        session.state.full_text().trim(),
+    )
+}
+
+fn merge_rolled_over_prefix(rolled_over_prefix: &str, current_display: &str) -> String {
+    let current_display = current_display.trim();
+    if rolled_over_prefix.is_empty()
+        || current_display.is_empty()
+        || current_display.starts_with(rolled_over_prefix)
+    {
+        return current_display.to_string();
+    }
+
+    if can_append_segment_only_candidate(current_display, rolled_over_prefix) {
+        return format!("{}{}", rolled_over_prefix, current_display);
+    }
+
+    current_display.to_string()
+}
+
+fn prepare_streaming_pause_boundary_text(
+    text: &str,
+    rewrite_enabled: bool,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+) -> String {
+    let (prepared, _) = prepare_streaming_output_text(text, rewrite_enabled, punctuator);
+    ensure_terminal_sentence_boundary(if prepared.trim().is_empty() {
+        text
+    } else {
+        &prepared
+    })
+}
+
+fn ensure_terminal_sentence_boundary(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || has_terminal_sentence_boundary(trimmed) {
+        return trimmed.to_string();
+    }
+
+    format!("{trimmed}。")
+}
+
+fn has_terminal_sentence_boundary(text: &str) -> bool {
+    text.chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；'))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -791,7 +2541,7 @@ fn should_skip_as_silence(activity: &AudioActivity) -> bool {
 }
 
 fn should_skip_streaming_preview(activity: &AudioActivity) -> bool {
-    activity.peak_abs < 0.0075 || (activity.rms < 0.0020 && activity.active_ratio < 0.015)
+    activity.peak_abs < 0.0065 || (activity.rms < 0.0018 && activity.active_ratio < 0.012)
 }
 
 fn should_drop_low_signal_result(text: &str, activity: &AudioActivity) -> bool {
@@ -818,8 +2568,7 @@ fn should_drop_streaming_preview_result(text: &str, activity: &AudioActivity) ->
         return true;
     }
 
-    let char_count = stripped.chars().count();
-    if activity.rms < 0.0035 && activity.active_ratio < 0.03 && char_count <= 4 {
+    if activity.rms < 0.0018 && activity.active_ratio < 0.01 && stripped.chars().count() <= 1 {
         return true;
     }
 
@@ -866,22 +2615,58 @@ fn normalize_audio_level(raw_level: f32) -> f32 {
     (raw_level * 6.5).sqrt().clamp(0.0, 1.0)
 }
 
+fn read_wav_samples(wav_path: &Path) -> Result<(i32, Vec<f32>)> {
+    let mut reader = hound::WavReader::open(wav_path)
+        .with_context(|| format!("read wav file {}", wav_path.display()))?;
+    let spec = reader.spec();
+    let sample_rate_hz =
+        i32::try_from(spec.sample_rate).context("wav sample rate does not fit in i32")?;
+    let raw_samples = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("decode wav samples {}", wav_path.display()))?,
+        (hound::SampleFormat::Int, 8) => reader
+            .samples::<i8>()
+            .map(|sample| sample.map(|value| f32::from(value) / f32::from(i8::MAX)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("decode wav samples {}", wav_path.display()))?,
+        (hound::SampleFormat::Int, 16) => reader
+            .samples::<i16>()
+            .map(|sample| sample.map(|value| f32::from(value) / f32::from(i16::MAX)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("decode wav samples {}", wav_path.display()))?,
+        (hound::SampleFormat::Int, 24) | (hound::SampleFormat::Int, 32) => reader
+            .samples::<i32>()
+            .map(|sample| sample.map(|value| value as f32 / i32::MAX as f32))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("decode wav samples {}", wav_path.display()))?,
+        _ => bail!(
+            "unsupported wav format: sample_format={:?}, bits_per_sample={}",
+            spec.sample_format,
+            spec.bits_per_sample
+        ),
+    };
+
+    let channels = usize::from(spec.channels.max(1));
+    if channels == 1 {
+        return Ok((sample_rate_hz, raw_samples));
+    }
+
+    let mut mixed = Vec::with_capacity(raw_samples.len() / channels + 1);
+    for frame in raw_samples.chunks(channels) {
+        let sum: f32 = frame.iter().copied().sum();
+        mixed.push(sum / frame.len() as f32);
+    }
+    Ok((sample_rate_hz, mixed))
+}
+
 fn audio_duration_ms(sample_rate_hz: i32, samples_len: usize) -> u64 {
     if sample_rate_hz <= 0 {
         return 0;
     }
 
     ((samples_len as f64 / sample_rate_hz as f64) * 1000.0).round() as u64
-}
-
-fn streaming_preview_interval(runtime: &AppRuntime) -> Duration {
-    Duration::from_millis((runtime.config.voice.streaming.chunk_ms as u64).clamp(160, 1200))
-}
-
-fn streaming_preview_min_samples(sample_rate_hz: i32, chunk_ms: u64) -> usize {
-    let effective_sample_rate = sample_rate_hz.max(1) as usize;
-    let effective_chunk_ms = chunk_ms.clamp(160, 1200) as usize;
-    ((effective_sample_rate * effective_chunk_ms) / 1000).max(effective_sample_rate / 5)
 }
 
 fn current_timestamp() -> String {
@@ -906,47 +2691,129 @@ fn streaming_delivery_label(delivery: OutputDelivery) -> &'static str {
     }
 }
 
-fn build_streaming_prepared_preview(current_partial: &str, rewrite_enabled: bool) -> String {
-    if rewrite_enabled {
-        let rewritten_segments = ainput_rewrite::rewrite_streaming_text(current_partial);
-        if rewritten_segments.is_empty() {
-            ainput_rewrite::normalize_streaming_preview(current_partial)
-        } else {
-            rewritten_segments.join("")
-        }
-    } else {
-        ainput_rewrite::normalize_streaming_preview(current_partial)
+fn prepare_streaming_preview_text(
+    current_partial: &str,
+    rewrite_enabled: bool,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+) -> String {
+    let normalized = ainput_rewrite::normalize_streaming_preview(current_partial);
+    if !rewrite_enabled {
+        return normalized;
     }
+
+    apply_streaming_punctuation(&normalized, punctuator, false)
 }
 
-fn build_streaming_output_text(runtime: &AppRuntime, final_text: &str) -> String {
-    if runtime.config.voice.streaming.rewrite_enabled {
-        ainput_rewrite::rewrite_streaming_text(final_text).join("")
-    } else {
-        ainput_rewrite::normalize_transcription(final_text)
+fn prepare_streaming_output_text(
+    final_text: &str,
+    rewrite_enabled: bool,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+) -> (String, StreamingCommitSource) {
+    if final_text.trim().is_empty() {
+        return (String::new(), StreamingCommitSource::OnlineFinal);
     }
+
+    let normalized = ainput_rewrite::normalize_transcription(final_text);
+    let prepared = if rewrite_enabled {
+        apply_streaming_punctuation(&normalized, punctuator, true)
+    } else {
+        normalized
+    };
+    let source = if prepared != final_text {
+        StreamingCommitSource::StreamingTailRepair
+    } else {
+        StreamingCommitSource::OnlineFinal
+    };
+    (prepared, source)
+}
+
+fn apply_streaming_punctuation(
+    normalized_text: &str,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+    finalize: bool,
+) -> String {
+    let normalized = normalized_text.trim();
+    if normalized.is_empty() {
+        return String::new();
+    }
+
+    let Some(punctuator) = punctuator else {
+        return normalized.to_string();
+    };
+
+    let (frozen_prefix, latest_sentence) = split_frozen_prefix(normalized);
+    let target_text = latest_sentence.trim();
+    if target_text.is_empty() {
+        return normalized.to_string();
+    }
+
+    let punctuated_latest = match punctuator.add_punctuation(target_text) {
+        Ok(text) => text,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                text = %target_text,
+                "streaming punctuation failed; keeping normalized text"
+            );
+            return normalized.to_string();
+        }
+    };
+
+    let punctuated_latest = ainput_rewrite::normalize_transcription(&punctuated_latest);
+    let punctuated_latest = if finalize {
+        punctuated_latest
+    } else {
+        strip_trailing_terminal_sentence_punctuation(&punctuated_latest)
+    };
+
+    format!("{}{}", frozen_prefix, punctuated_latest)
+        .trim()
+        .to_string()
+}
+
+fn strip_trailing_terminal_sentence_punctuation(text: &str) -> String {
+    text.trim_end_matches(|ch: char| {
+        matches!(ch, '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；')
+    })
+    .trim_end()
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioActivity, analyze_recent_audio_activity, build_streaming_prepared_preview,
+        AudioActivity, StreamingCommitSource, StreamingResampler, analyze_recent_audio_activity,
+        build_streaming_ai_rewrite_candidate, effective_ai_rewrite_min_visible_chars,
+        ensure_terminal_sentence_boundary,
+        merge_rolled_over_prefix, prepare_streaming_output_text,
+        prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
+        sanitize_ai_rewrite_output, select_final_streaming_commit_text,
+        select_streaming_commit_text, select_streaming_preview_text,
         should_drop_streaming_preview_result, should_skip_streaming_preview,
+        strip_trailing_terminal_sentence_punctuation,
     };
 
     #[test]
-    fn streaming_preview_keeps_full_partial_with_rewrite() {
+    fn streaming_preview_falls_back_to_normalized_text_without_punctuator() {
         assert_eq!(
-            build_streaming_prepared_preview("帮我看一下这个功能有没有问题", true),
-            "帮我看一下这个功能有没有问题。"
+            prepare_streaming_preview_text("嗯， 帮我看一下 这个功能", true, None),
+            "帮我看一下 这个功能"
         );
     }
 
     #[test]
     fn streaming_preview_can_skip_rewrite() {
         assert_eq!(
-            build_streaming_prepared_preview("嗯， 帮我看一下 这个功能", false),
+            prepare_streaming_preview_text("嗯， 帮我看一下 这个功能", false, None),
             "帮我看一下 这个功能"
+        );
+    }
+
+    #[test]
+    fn preview_strips_only_trailing_terminal_punctuation() {
+        assert_eq!(
+            strip_trailing_terminal_sentence_punctuation("第一句，第二句。"),
+            "第一句，第二句"
         );
     }
 
@@ -958,7 +2825,7 @@ mod tests {
             active_ratio: 0.004,
         };
         assert!(should_skip_streaming_preview(&activity));
-        assert!(should_drop_streaming_preview_result("喂喂", &activity));
+        assert!(should_drop_streaming_preview_result("喂", &activity));
     }
 
     #[test]
@@ -983,4 +2850,197 @@ mod tests {
         assert!(activity.peak_abs >= 0.05);
         assert!(activity.active_ratio > 0.1);
     }
+
+    #[test]
+    fn commit_text_prefers_display_when_final_candidate_is_too_short() {
+        assert_eq!(
+            select_streaming_commit_text(
+                "帮我看一下这里有没有问题",
+                "帮我看一下",
+                StreamingCommitSource::OnlineFinal
+            )
+            .text,
+            "帮我看一下这里有没有问题"
+        );
+    }
+
+    #[test]
+    fn preview_text_holds_existing_display_when_candidate_regresses() {
+        let selected = select_streaming_preview_text("帮我看一下这里有没有问题", "帮我看");
+        assert_eq!(selected.source, "held_display");
+        assert_eq!(selected.text, "帮我看一下这里有没有问题");
+    }
+
+    #[test]
+    fn preview_text_accepts_latest_sentence_only_candidate() {
+        let selected =
+            select_streaming_preview_text("第一句已经稳定。第二句还在继续", "第三句开始");
+        assert_eq!(selected.source, "online");
+        assert_eq!(selected.text, "第三句开始");
+    }
+
+    #[test]
+    fn weak_but_real_preview_is_not_dropped_too_early() {
+        let activity = AudioActivity {
+            peak_abs: 0.014,
+            rms: 0.0031,
+            active_ratio: 0.0204,
+        };
+        assert!(!should_drop_streaming_preview_result("我不知", &activity));
+    }
+
+    #[test]
+    fn streaming_preview_accepts_weaker_but_real_speech_sooner() {
+        let activity = AudioActivity {
+            peak_abs: 0.0068,
+            rms: 0.0019,
+            active_ratio: 0.0125,
+        };
+        assert!(!should_skip_streaming_preview(&activity));
+    }
+
+    #[test]
+    fn prepare_streaming_output_marks_tail_repair_source() {
+        let (prepared, source) = prepare_streaming_output_text("你好 ", true, None);
+        assert_eq!(prepared, "你好");
+        assert_eq!(source, StreamingCommitSource::StreamingTailRepair);
+    }
+
+    #[test]
+    fn ai_rewrite_candidate_only_targets_latest_tail() {
+        let candidate = build_streaming_ai_rewrite_candidate("第一句已经稳定。第二句先是错字", 2)
+            .expect("candidate");
+        assert_eq!(candidate.frozen_prefix, "第一句已经稳定。");
+        assert_eq!(candidate.current_tail, "第二句先是错字");
+    }
+
+    #[test]
+    fn ai_rewrite_min_visible_chars_is_capped_to_short_tail_floor() {
+        assert_eq!(effective_ai_rewrite_min_visible_chars(1), 2);
+        assert_eq!(effective_ai_rewrite_min_visible_chars(2), 2);
+        assert_eq!(effective_ai_rewrite_min_visible_chars(6), 6);
+    }
+
+    #[test]
+    fn ai_rewrite_rejects_too_short_output() {
+        assert_eq!(
+            sanitize_ai_rewrite_output("第一句已经稳定。", "第二句先是错字", "好", 2, 20),
+            None
+        );
+    }
+
+    #[test]
+    fn ai_rewrite_strips_echoed_prefix() {
+        assert_eq!(
+            sanitize_ai_rewrite_output(
+                "第一句已经稳定。",
+                "第二句先是错字",
+                "第一句已经稳定。第二句已经修正",
+                2,
+                20
+            ),
+            Some("第二句已经修正".to_string())
+        );
+    }
+
+    #[test]
+    fn commit_text_accepts_latest_sentence_only_candidate() {
+        let selected = select_streaming_commit_text(
+            "第一句已经稳定。第二句还在继续",
+            "第三句最终修正。",
+            StreamingCommitSource::OnlineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::OnlineFinal);
+        assert_eq!(selected.text, "第三句最终修正。");
+    }
+
+    #[test]
+    fn final_commit_prefers_hud_display_text_when_present() {
+        let selected = select_final_streaming_commit_text(
+            "第一句已经稳定。第二句 HUD 已经改好了",
+            "第二句最终模型候选",
+            StreamingCommitSource::OnlineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::StreamingState);
+        assert_eq!(selected.text, "第一句已经稳定。第二句 HUD 已经改好了");
+    }
+
+    #[test]
+    fn final_commit_accepts_short_same_stream_suffix_extension() {
+        let selected = select_final_streaming_commit_text(
+            "我有一个问",
+            "我有一个问题",
+            StreamingCommitSource::OnlineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::OnlineFinal);
+        assert_eq!(selected.text, "我有一个问题");
+    }
+
+    #[test]
+    fn final_commit_accepts_similar_tail_when_candidate_is_one_char_longer() {
+        let selected = select_final_streaming_commit_text(
+            "最后一个字总会漏",
+            "最后一个字总会漏掉",
+            StreamingCommitSource::OnlineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::OnlineFinal);
+        assert_eq!(selected.text, "最后一个字总会漏掉");
+    }
+
+    #[test]
+    fn final_commit_keeps_display_when_candidate_regresses_to_shorter_text() {
+        let selected = select_final_streaming_commit_text(
+            "我有一个问题",
+            "我有一个问",
+            StreamingCommitSource::OnlineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::StreamingState);
+        assert_eq!(selected.text, "我有一个问题");
+    }
+
+    #[test]
+    fn ensure_terminal_sentence_boundary_adds_full_stop_when_missing() {
+        assert_eq!(
+            ensure_terminal_sentence_boundary("第一句还没结束"),
+            "第一句还没结束。"
+        );
+        assert_eq!(
+            ensure_terminal_sentence_boundary("第一句已经结束。"),
+            "第一句已经结束。"
+        );
+    }
+
+    #[test]
+    fn pause_boundary_text_forces_terminal_punctuation() {
+        assert_eq!(
+            prepare_streaming_pause_boundary_text("第一句还没标点", false, None),
+            "第一句还没标点。"
+        );
+    }
+
+    #[test]
+    fn pause_boundary_text_preserves_existing_prefix() {
+        assert_eq!(
+            prepare_streaming_pause_boundary_text("第一句已经稳定。第二句继续", false, None),
+            "第一句已经稳定。第二句继续。"
+        );
+    }
+
+    #[test]
+    fn effective_display_restores_missing_rollover_prefix() {
+        assert_eq!(
+            merge_rolled_over_prefix("第一句已经稳定。", "第二句继续"),
+            "第一句已经稳定。第二句继续"
+        );
+    }
+
+    #[test]
+    fn streaming_resampler_does_not_drain_past_buffer_end() {
+        let mut resampler = StreamingResampler::new(48_000, 16_000);
+        let input = vec![0.25f32; 12_446];
+        let output = resampler.process(&input);
+        assert!(!output.is_empty());
+    }
 }
+
+

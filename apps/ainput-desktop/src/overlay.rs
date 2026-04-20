@@ -46,6 +46,8 @@ const CLICK_ALPHA_MAX: u8 = 208;
 const CLICK_LIFETIME: Duration = Duration::from_millis(420);
 const CLICK_OUTER_COLOR: COLORREF = COLORREF(0x001A8CFF);
 const CLICK_INNER_COLOR: COLORREF = COLORREF(0x00FFFFFF);
+const HUD_CHAR_STREAM_INTERVAL: Duration = Duration::from_millis(14);
+const HUD_LISTENING_PLACEHOLDER: &str = "请说话";
 
 pub struct RecordingOverlay {
     base_x: i32,
@@ -62,6 +64,10 @@ pub struct RecordingOverlay {
 
     hud_window: HudWindow,
     hud_message: String,
+    hud_stream: HudMicrostreamState,
+    hud_placeholder_active: bool,
+    hud_char_streaming: bool,
+    hud_last_char_tick_at: Instant,
     hud_persistent: bool,
     hud_hold_until: Option<Instant>,
     hud_visibility: f32,
@@ -86,6 +92,23 @@ struct HudWindow {
     brush: HBRUSH,
     font: HFONT,
     style: HudStyle,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HudMicrostreamState {
+    committed_prefix: String,
+    target_suffix: String,
+    display_suffix: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg(test)]
+struct HudRetargetStats {
+    committed_chars: usize,
+    diff_prefix_chars: usize,
+    target_chars: usize,
+    display_chars: usize,
+    target_changed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +282,10 @@ impl RecordingOverlay {
                 voice_level_current: 0.0,
                 hud_window,
                 hud_message: String::new(),
+                hud_stream: HudMicrostreamState::default(),
+                hud_placeholder_active: false,
+                hud_char_streaming: false,
+                hud_last_char_tick_at: Instant::now(),
                 hud_persistent: false,
                 hud_hold_until: None,
                 hud_visibility: 0.0,
@@ -298,10 +325,11 @@ impl RecordingOverlay {
             }
         };
 
-        let preview_text = if self.hud_message.trim().is_empty() {
-            "请说话"
+        let preview_message = self.current_hud_preview_text();
+        let preview_text = if preview_message.trim().is_empty() {
+            HUD_LISTENING_PLACEHOLDER
         } else {
-            self.hud_message.as_str()
+            preview_message.as_str()
         };
         new_hud_window.set_text(preview_text);
         if self.hud_shown {
@@ -331,21 +359,48 @@ impl RecordingOverlay {
         self.voice_pulse_enabled = enabled;
     }
 
-    pub fn show_status_hud(&mut self, message: &str, persistent: bool) {
+    pub fn show_status_hud(&mut self, message: &str, persistent: bool, char_streaming: bool) {
         self.suppress_voice_bar_immediately();
 
-        if self.hud_message != message {
-            self.hud_message = message.to_string();
-            self.hud_window.set_text(message);
+        let message = message.trim();
+        let now = Instant::now();
+
+        if !char_streaming {
+            self.hud_placeholder_active = message == HUD_LISTENING_PLACEHOLDER;
+            if self.hud_placeholder_active {
+                self.hud_stream.clear();
+                self.hud_message = message.to_string();
+                self.hud_window.set_text(message);
+            } else if self.hud_stream.display_message() != message || self.hud_message != message {
+                self.hud_stream.set_immediate(message);
+                self.hud_message = message.to_string();
+                self.hud_window.set_text(message);
+            }
+            self.hud_char_streaming = false;
+            self.hud_last_char_tick_at = now;
+        } else {
+            self.hud_placeholder_active = false;
+            if self.hud_stream.display_message() != message || self.hud_message != message {
+                self.hud_stream.set_immediate(message);
+                self.hud_message = message.to_string();
+                self.hud_window.set_text_streaming(message);
+            }
+            // Streaming partials now snap to the latest text immediately.
+            // This removes the extra UI-side lag that made the HUD look slower
+            // than the recognizer itself.
+            self.hud_char_streaming = false;
+            self.hud_last_char_tick_at = now;
         }
 
         self.hud_persistent = persistent;
-        self.hud_hold_until = Some(Instant::now() + self.hud_window.style.display_min);
+        self.hud_hold_until = Some(now + self.hud_window.style.display_min);
     }
 
     pub fn clear_status_hud(&mut self) {
         self.hud_persistent = false;
         self.hud_hold_until = Some(Instant::now());
+        self.hud_placeholder_active = false;
+        self.hud_char_streaming = false;
     }
 
     pub fn update_automation_feedback(
@@ -368,7 +423,10 @@ impl RecordingOverlay {
         let should_show = persistent || overlay_hint.is_some();
 
         if should_show && self.hud_message != message {
+            self.hud_placeholder_active = false;
             self.hud_message = message.to_string();
+            self.hud_stream.set_immediate(message);
+            self.hud_char_streaming = false;
             self.hud_window.set_text(message);
         }
 
@@ -486,6 +544,8 @@ impl RecordingOverlay {
     }
 
     fn tick_hud(&mut self) {
+        self.advance_hud_char_stream();
+
         let should_show = hud_should_show(self.hud_persistent, self.hud_hold_until, Instant::now());
         self.hud_visibility = smooth_step(
             self.hud_visibility,
@@ -507,6 +567,37 @@ impl RecordingOverlay {
         if self.hud_visibility < 0.01 && self.hud_shown && !should_show {
             self.hud_window.hide();
             self.hud_shown = false;
+        }
+    }
+
+    fn advance_hud_char_stream(&mut self) {
+        if !self.hud_char_streaming {
+            return;
+        }
+
+        if !self.hud_stream.has_pending_chars() {
+            self.hud_char_streaming = false;
+            return;
+        }
+
+        let now = Instant::now();
+        if now.duration_since(self.hud_last_char_tick_at) < HUD_CHAR_STREAM_INTERVAL {
+            return;
+        }
+
+        self.hud_stream.advance_one_char();
+        let next_display = self.hud_stream.display_message();
+        self.hud_window.set_text(&next_display);
+        self.hud_last_char_tick_at = now;
+
+        tracing::trace!(
+            hud_display_chars = next_display.chars().count(),
+            hud_target_chars = self.hud_stream.target_message().chars().count(),
+            "hud_microstream_started"
+        );
+
+        if !self.hud_stream.has_pending_chars() {
+            self.hud_char_streaming = false;
         }
     }
 
@@ -575,6 +666,16 @@ impl RecordingOverlay {
             let _ = ShowWindow(self.click_outer_window.hwnd, SW_HIDE);
             let _ = ShowWindow(self.click_inner_window.hwnd, SW_HIDE);
         }
+    }
+
+    fn current_hud_preview_text(&self) -> String {
+        resolve_hud_preview_text(
+            self.hud_placeholder_active,
+            &self.hud_stream.display_message(),
+            &self.hud_stream.target_message(),
+            self.hud_char_streaming,
+            &self.hud_message,
+        )
     }
 }
 
@@ -886,6 +987,14 @@ impl HudWindow {
         }
     }
 
+    fn set_text_streaming(&self, text: &str) {
+        self.resize_to_fit_streaming(text);
+        let text = HSTRING::from(text);
+        unsafe {
+            let _ = SetWindowTextW(self.text_hwnd, &text);
+        }
+    }
+
     fn resize_to_fit(&self, text: &str) {
         let work_area = work_area_rect();
         let available_width = (work_area.right - work_area.left - HUD_SCREEN_MARGIN_PX * 2)
@@ -901,6 +1010,68 @@ impl HudWindow {
             measure_hud_text(self.text_hwnd, self.font, text, max_text_width, &self.style);
         let hud_width = (text_width + self.style.padding_x_px * 2)
             .clamp(self.style.min_width_px, available_width);
+        let hud_height = (text_height + self.style.padding_y_px * 2)
+            .clamp(self.style.min_height_px, available_height);
+
+        let base_x = match self.style.anchor {
+            HudAnchor::BottomLeft => work_area.left + HUD_SCREEN_MARGIN_PX,
+            HudAnchor::BottomCenter => {
+                work_area.left + ((work_area.right - work_area.left - hud_width) / 2)
+            }
+        };
+        let base_y = work_area.bottom - hud_height - HUD_SCREEN_MARGIN_PX;
+        let hud_x = clamp_i32(
+            base_x + self.style.offset_x_px,
+            work_area.left + HUD_SCREEN_MARGIN_PX,
+            (work_area.right - hud_width - HUD_SCREEN_MARGIN_PX).max(work_area.left),
+        );
+        let hud_y = clamp_i32(
+            base_y + self.style.offset_y_px,
+            work_area.top + HUD_SCREEN_MARGIN_PX,
+            (work_area.bottom - hud_height - HUD_SCREEN_MARGIN_PX).max(work_area.top),
+        );
+
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                hud_x,
+                hud_y,
+                hud_width,
+                hud_height,
+                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0),
+            );
+            let _ = apply_rounded_region(
+                self.hwnd,
+                hud_width,
+                hud_height,
+                self.style.corner_radius_px,
+            );
+            let _ = SetWindowPos(
+                self.text_hwnd,
+                None,
+                self.style.padding_x_px,
+                self.style.padding_y_px,
+                (hud_width - self.style.padding_x_px * 2).max(1),
+                (hud_height - self.style.padding_y_px * 2).max(1),
+                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOZORDER.0),
+            );
+        }
+    }
+
+    fn resize_to_fit_streaming(&self, text: &str) {
+        let work_area = work_area_rect();
+        let available_width = (work_area.right - work_area.left - HUD_SCREEN_MARGIN_PX * 2)
+            .max(self.style.min_width_px);
+        let available_height = (work_area.bottom - work_area.top - HUD_SCREEN_MARGIN_PX * 2)
+            .max(self.style.min_height_px);
+        let hud_width = self
+            .style
+            .width_px
+            .clamp(self.style.min_width_px, available_width);
+        let max_text_width = (hud_width - self.style.padding_x_px * 2).max(1);
+        let (_, text_height) =
+            measure_hud_text(self.text_hwnd, self.font, text, max_text_width, &self.style);
         let hud_height = (text_height + self.style.padding_y_px * 2)
             .clamp(self.style.min_height_px, available_height);
 
@@ -1024,6 +1195,187 @@ fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
     value.clamp(min, max)
 }
 
+#[cfg(test)]
+fn longest_common_prefix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+fn take_prefix_chars(text: &str, char_count: usize) -> String {
+    text.chars().take(char_count).collect()
+}
+
+fn resolve_hud_preview_text(
+    placeholder_active: bool,
+    display_message: &str,
+    target_message: &str,
+    char_streaming: bool,
+    hud_message: &str,
+) -> String {
+    if placeholder_active {
+        return HUD_LISTENING_PLACEHOLDER.to_string();
+    }
+
+    if !display_message.trim().is_empty() {
+        return display_message.to_string();
+    }
+
+    if char_streaming && !target_message.trim().is_empty() {
+        return target_message.to_string();
+    }
+
+    hud_message.to_string()
+}
+
+#[cfg(test)]
+fn drop_prefix_chars(text: &str, char_count: usize) -> String {
+    text.chars().skip(char_count).collect()
+}
+
+#[cfg(test)]
+fn split_committed_prefix(text: &str) -> (String, String) {
+    let mut committed_end = 0usize;
+    let mut boundary_seen = false;
+
+    for (index, ch) in text.char_indices() {
+        let char_end = index + ch.len_utf8();
+        if is_sentence_commit_char(ch) {
+            committed_end = char_end;
+            boundary_seen = true;
+            continue;
+        }
+        if boundary_seen && is_sentence_trailing_char(ch) {
+            committed_end = char_end;
+        }
+    }
+
+    let (committed, live) = text.split_at(committed_end);
+    (committed.to_string(), live.to_string())
+}
+
+#[cfg(test)]
+fn is_sentence_commit_char(ch: char) -> bool {
+    matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';')
+}
+
+#[cfg(test)]
+fn is_sentence_trailing_char(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\t'
+            | '\n'
+            | '\r'
+            | '"'
+            | '\''
+            | '”'
+            | '’'
+            | ')'
+            | '）'
+            | ']'
+            | '】'
+            | '>'
+            | '》'
+            | '〉'
+            | '」'
+            | '』'
+    )
+}
+
+impl HudMicrostreamState {
+    fn clear(&mut self) {
+        self.committed_prefix.clear();
+        self.target_suffix.clear();
+        self.display_suffix.clear();
+    }
+
+    fn set_immediate(&mut self, message: &str) {
+        self.committed_prefix = message.to_string();
+        self.target_suffix.clear();
+        self.display_suffix.clear();
+    }
+
+    fn display_message(&self) -> String {
+        format!("{}{}", self.committed_prefix, self.display_suffix)
+    }
+
+    fn target_message(&self) -> String {
+        format!("{}{}", self.committed_prefix, self.target_suffix)
+    }
+
+    fn has_pending_chars(&self) -> bool {
+        self.display_suffix != self.target_suffix
+    }
+
+    #[cfg(test)]
+    fn retarget(&mut self, message: &str) -> HudRetargetStats {
+        let previous_target_message = self.target_message();
+        let previous_target_suffix = self.target_suffix.clone();
+        let previous_display_suffix = self.display_suffix.clone();
+        let previous_committed_prefix = self.committed_prefix.clone();
+        let (candidate_committed_prefix, candidate_suffix) = split_committed_prefix(message);
+
+        let mut working_target_suffix = previous_target_suffix;
+        let mut working_display_suffix = previous_display_suffix;
+        if candidate_committed_prefix.starts_with(&previous_committed_prefix)
+            && candidate_committed_prefix.chars().count()
+                > previous_committed_prefix.chars().count()
+        {
+            let committed_growth = candidate_committed_prefix
+                .strip_prefix(&previous_committed_prefix)
+                .unwrap_or("");
+            let overlap_target_chars =
+                longest_common_prefix_chars(&working_target_suffix, committed_growth);
+            let overlap_display_chars =
+                longest_common_prefix_chars(&working_display_suffix, committed_growth);
+            self.committed_prefix = candidate_committed_prefix.clone();
+            working_target_suffix = drop_prefix_chars(&working_target_suffix, overlap_target_chars);
+            working_display_suffix =
+                drop_prefix_chars(&working_display_suffix, overlap_display_chars);
+        }
+
+        let next_target_suffix = message
+            .strip_prefix(&self.committed_prefix)
+            .map(str::to_string)
+            .unwrap_or(candidate_suffix);
+        let diff_prefix_chars =
+            longest_common_prefix_chars(&working_target_suffix, &next_target_suffix);
+
+        let next_display_suffix = if next_target_suffix.starts_with(&working_target_suffix) {
+            working_display_suffix
+        } else {
+            let preserved_chars = working_display_suffix
+                .chars()
+                .count()
+                .max(diff_prefix_chars)
+                .min(next_target_suffix.chars().count());
+            take_prefix_chars(&next_target_suffix, preserved_chars)
+        };
+
+        self.target_suffix = next_target_suffix;
+        self.display_suffix = next_display_suffix;
+
+        HudRetargetStats {
+            committed_chars: self.committed_prefix.chars().count(),
+            diff_prefix_chars,
+            target_chars: self.target_message().chars().count(),
+            display_chars: self.display_message().chars().count(),
+            target_changed: previous_target_message != self.target_message(),
+        }
+    }
+
+    fn advance_one_char(&mut self) {
+        if self.display_suffix == self.target_suffix {
+            return;
+        }
+
+        let next_char_count =
+            (self.display_suffix.chars().count() + 1).min(self.target_suffix.chars().count());
+        self.display_suffix = take_prefix_chars(&self.target_suffix, next_char_count);
+    }
+}
+
 fn parse_color_ref(value: &str, fallback: &str) -> COLORREF {
     parse_color_ref_hex(value)
         .unwrap_or_else(|| parse_color_ref_hex(fallback).unwrap_or(COLORREF(0x00111111)))
@@ -1077,5 +1429,86 @@ mod tests {
             now
         ));
         assert!(!hud_should_show(false, None, now));
+    }
+
+    #[test]
+    fn longest_common_prefix_chars_stops_at_first_difference() {
+        assert_eq!(
+            longest_common_prefix_chars("帮我看一下这里", "帮我看一下那个"),
+            5
+        );
+        assert_eq!(longest_common_prefix_chars("Claude", "Clarity"), 3);
+    }
+
+    #[test]
+    fn take_prefix_chars_returns_expected_character_count() {
+        assert_eq!(take_prefix_chars("帮我看一下这个问题", 4), "帮我看一");
+        assert_eq!(take_prefix_chars("Claude Code", 6), "Claude");
+    }
+
+    #[test]
+    fn split_committed_prefix_freezes_completed_sentence() {
+        assert_eq!(
+            split_committed_prefix("这是第一句。这里是第二句"),
+            ("这是第一句。".to_string(), "这里是第二句".to_string())
+        );
+        assert_eq!(
+            split_committed_prefix("他说：“这句已经结束。”然后继续"),
+            ("他说：“这句已经结束。”".to_string(), "然后继续".to_string())
+        );
+    }
+
+    #[test]
+    fn hud_microstream_keeps_committed_sentence_stable_when_target_grows() {
+        let mut state = HudMicrostreamState::default();
+        let _ = state.retarget("这是第一句。这里是第二");
+        assert_eq!(state.display_message(), "这是第一句。");
+
+        while state.has_pending_chars() {
+            state.advance_one_char();
+        }
+        assert_eq!(state.display_message(), "这是第一句。这里是第二");
+
+        let _ = state.retarget("这是第一句。这里是第二句话");
+        assert_eq!(state.committed_prefix, "这是第一句。");
+        assert!(state.display_message().starts_with("这是第一句。"));
+        assert!(!state.display_message().is_empty());
+    }
+
+    #[test]
+    fn hud_microstream_replaces_corrected_suffix_without_rewinding_to_short_prefix() {
+        let mut state = HudMicrostreamState::default();
+        let _ = state.retarget("这是第一句。帮我看一下这里有木");
+        while state.has_pending_chars() {
+            state.advance_one_char();
+        }
+        assert_eq!(state.display_message(), "这是第一句。帮我看一下这里有木");
+
+        let _ = state.retarget("这是第一句。帮我看一下这里有没有问题");
+        assert_eq!(state.committed_prefix, "这是第一句。");
+        assert_eq!(state.display_message(), "这是第一句。帮我看一下这里有没");
+        assert!(state.has_pending_chars());
+    }
+
+    #[test]
+    fn resolve_hud_preview_text_does_not_pollute_stream_with_placeholder() {
+        assert_eq!(
+            resolve_hud_preview_text(true, "", "", false, HUD_LISTENING_PLACEHOLDER),
+            HUD_LISTENING_PLACEHOLDER
+        );
+        assert_eq!(
+            resolve_hud_preview_text(false, "", "问题一模一样", true, HUD_LISTENING_PLACEHOLDER),
+            "问题一模一样"
+        );
+        assert_eq!(
+            resolve_hud_preview_text(
+                false,
+                "问题一",
+                "问题一模一样",
+                true,
+                HUD_LISTENING_PLACEHOLDER
+            ),
+            "问题一"
+        );
     }
 }

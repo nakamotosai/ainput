@@ -1,19 +1,28 @@
 param(
-    [string]$Version = "1.0.14-preview.6"
+    [string]$Version = "1.0.0-preview.5"
 )
 
 $ErrorActionPreference = "Stop"
 
 $packageName = "ainput-$Version"
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = if ((Split-Path -Leaf $PSScriptRoot) -eq "scripts") {
+    Split-Path -Parent $PSScriptRoot
+} else {
+    $PSScriptRoot
+}
 $distRoot = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distRoot $packageName
 $zipPath = Join-Path $distRoot "$packageName.zip"
 $modelSource = Join-Path $repoRoot "models\sense-voice\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 $modelTarget = Join-Path $packageDir "models\sense-voice"
-$streamingModelSource = Join-Path $repoRoot "models\streaming-zipformer-small-bilingual-zh-en"
-$streamingModelTarget = Join-Path $packageDir "models\streaming-zipformer-small-bilingual-zh-en"
+$streamingModelName = "sherpa-onnx-streaming-paraformer-bilingual-zh-en"
+$streamingModelSource = Join-Path $repoRoot ("models\" + $streamingModelName)
+$streamingModelTarget = Join-Path $packageDir ("models\" + $streamingModelName)
+$streamingPunctuationModelName = "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+$streamingPunctuationModelSource = Join-Path $repoRoot ("models\punctuation\" + $streamingPunctuationModelName)
+$streamingPunctuationModelTarget = Join-Path $packageDir ("models\punctuation\" + $streamingPunctuationModelName)
 $packageExe = Join-Path $packageDir "ainput-desktop.exe"
+$releaseExe = Join-Path $repoRoot "target\release\ainput-desktop.exe"
 
 function Get-PreferredConfigSource {
     param(
@@ -90,6 +99,167 @@ function Copy-HudOverlayTemplateWithValues {
     Set-Content -Path $DestinationPath -Value $content -Encoding Unicode
 }
 
+function Sync-MainConfigSectionKeys {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$CanonicalConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$SectionName,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Keys,
+        [hashtable]$ForcedValues = @{}
+    )
+
+    $lines = [System.IO.File]::ReadAllLines($ConfigPath, [System.Text.Encoding]::UTF8)
+    $mutableLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        $mutableLines.Add($line) | Out-Null
+    }
+    $canonicalLines = [System.IO.File]::ReadAllLines($CanonicalConfigPath, [System.Text.Encoding]::UTF8)
+    $canonicalSectionLines = New-Object System.Collections.Generic.List[string]
+    $insideSection = $false
+    $insideCanonicalSection = $false
+    $updatedKeys = @{}
+    $sectionStartIndex = -1
+    $sectionEndIndex = -1
+
+    foreach ($canonicalLine in $canonicalLines) {
+        if ($canonicalLine -match ('^\s*\[' + [regex]::Escape($SectionName) + '\]\s*$')) {
+            $insideCanonicalSection = $true
+            continue
+        }
+        if ($insideCanonicalSection -and $canonicalLine -match '^\s*\[') {
+            break
+        }
+        if ($insideCanonicalSection) {
+            $canonicalSectionLines.Add($canonicalLine)
+        }
+    }
+
+    if ($canonicalSectionLines.Count -eq 0) {
+        throw "failed to find canonical section [$SectionName] in $CanonicalConfigPath"
+    }
+
+    for ($i = 0; $i -lt $mutableLines.Count; $i++) {
+        $line = $mutableLines[$i]
+        if ($line -match ('^\s*\[' + [regex]::Escape($SectionName) + '\]\s*$')) {
+            $insideSection = $true
+            $sectionStartIndex = $i
+            continue
+        }
+        if ($insideSection -and $line -match '^\s*\[') {
+            $insideSection = $false
+            $sectionEndIndex = $i
+        }
+        if (-not $insideSection) {
+            continue
+        }
+
+        foreach ($key in $Keys) {
+            if ($line -notmatch ('^\s*' + [regex]::Escape($key) + '\s*=')) {
+                continue
+            }
+
+            if ($ForcedValues.ContainsKey($key)) {
+                $mutableLines[$i] = $ForcedValues[$key]
+            } else {
+                $canonicalLine = $canonicalSectionLines |
+                    Where-Object { $_ -match ('^\s*' + [regex]::Escape($key) + '\s*=') } |
+                    Select-Object -First 1
+                if ([string]::IsNullOrWhiteSpace($canonicalLine)) {
+                    throw "failed to find canonical $key in [$SectionName] of $CanonicalConfigPath"
+                }
+                $mutableLines[$i] = $canonicalLine
+            }
+
+            $updatedKeys[$key] = $true
+            break
+        }
+    }
+
+    if ($sectionStartIndex -lt 0) {
+        throw "failed to find section [$SectionName] in $ConfigPath"
+    }
+    if ($sectionEndIndex -lt 0) {
+        $sectionEndIndex = $mutableLines.Count
+    }
+
+    $insertLines = New-Object System.Collections.Generic.List[string]
+    foreach ($key in $Keys) {
+        if ($updatedKeys.ContainsKey($key)) {
+            continue
+        }
+
+        if ($ForcedValues.ContainsKey($key)) {
+            $insertLines.Add($ForcedValues[$key]) | Out-Null
+            continue
+        }
+
+        $canonicalLine = $canonicalSectionLines |
+            Where-Object { $_ -match ('^\s*' + [regex]::Escape($key) + '\s*=') } |
+            Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace($canonicalLine)) {
+            throw "failed to find canonical $key in [$SectionName] of $CanonicalConfigPath"
+        }
+        $insertLines.Add($canonicalLine) | Out-Null
+    }
+
+    for ($offset = 0; $offset -lt $insertLines.Count; $offset++) {
+        $mutableLines.Insert($sectionEndIndex + $offset, $insertLines[$offset])
+    }
+
+    [System.IO.File]::WriteAllLines($ConfigPath, $mutableLines, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+function Sync-ConfigCommentBeforeKey {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$CanonicalConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    $lines = [System.IO.File]::ReadAllLines($ConfigPath, [System.Text.Encoding]::UTF8)
+    $mutableLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        $mutableLines.Add($line) | Out-Null
+    }
+    $canonicalLines = [System.IO.File]::ReadAllLines($CanonicalConfigPath, [System.Text.Encoding]::UTF8)
+    $keyPattern = '^\s*' + [regex]::Escape($Key) + '\s*='
+    $canonicalKeyIndex = -1
+    for ($i = 0; $i -lt $canonicalLines.Length; $i++) {
+        if ($canonicalLines[$i] -match $keyPattern) {
+            $canonicalKeyIndex = $i
+            break
+        }
+    }
+
+    if ($canonicalKeyIndex -le 0) {
+        throw "failed to find canonical key [$Key] in $CanonicalConfigPath"
+    }
+
+    $canonicalCommentLine = $canonicalLines[$canonicalKeyIndex - 1]
+    if ([string]::IsNullOrWhiteSpace($canonicalCommentLine) -or $canonicalCommentLine -notmatch '^\s*#') {
+        throw "failed to find canonical comment before [$Key] in $CanonicalConfigPath"
+    }
+
+    for ($i = 1; $i -lt $mutableLines.Count; $i++) {
+        if ($mutableLines[$i] -match $keyPattern) {
+            if ($mutableLines[$i - 1] -match '^\s*#') {
+                $mutableLines[$i - 1] = $canonicalCommentLine
+            } else {
+                $mutableLines.Insert($i, $canonicalCommentLine)
+            }
+            [System.IO.File]::WriteAllLines($ConfigPath, $mutableLines, (New-Object System.Text.UTF8Encoding($true)))
+            return
+        }
+    }
+}
+
 function Remove-ItemWithRetry {
     param(
         [Parameter(Mandatory = $true)]
@@ -117,6 +287,83 @@ function Remove-ItemWithRetry {
     throw $lastError
 }
 
+function Get-PreferredStreamingComponent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModelDir,
+        [Parameter(Mandatory = $true)]
+        [string]$Component
+    )
+
+    $int8 = Get-ChildItem $ModelDir -File -Filter ($Component + "*.int8.onnx") -ErrorAction SilentlyContinue |
+        Sort-Object Name |
+        Select-Object -First 1
+    if ($int8) {
+        return $int8.FullName
+    }
+
+    $fallback = Get-ChildItem $ModelDir -File -Filter ($Component + "*.onnx") -ErrorAction SilentlyContinue |
+        Sort-Object Name |
+        Select-Object -First 1
+    if ($fallback) {
+        return $fallback.FullName
+    }
+
+    return $null
+}
+
+function Copy-StreamingModelRuntimeFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDir,
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDir
+    )
+
+    if (!(Test-Path $SourceDir)) {
+        throw "missing streaming model directory: $SourceDir"
+    }
+
+    $tokensFile = Join-Path $SourceDir "tokens.txt"
+    if (!(Test-Path $tokensFile)) {
+        throw "missing streaming tokens file: $tokensFile"
+    }
+
+    $components = @("encoder", "decoder", "joiner")
+    $copied = New-Object System.Collections.Generic.HashSet[string]
+
+    Copy-Item $tokensFile (Join-Path $TargetDir "tokens.txt") -Force
+    foreach ($component in $components) {
+        $sourceFile = Get-PreferredStreamingComponent -ModelDir $SourceDir -Component $component
+        if ([string]::IsNullOrWhiteSpace($sourceFile)) {
+            if ($component -eq "joiner") {
+                continue
+            }
+            throw "missing streaming $component model in $SourceDir"
+        }
+
+        $fileName = [System.IO.Path]::GetFileName($sourceFile)
+        if ($copied.Add($fileName)) {
+            Copy-Item $sourceFile (Join-Path $TargetDir $fileName) -Force
+        }
+    }
+}
+
+Write-Host "Building release binary before packaging..."
+Push-Location $repoRoot
+try {
+    & cargo build -p ainput-desktop --release
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    Pop-Location
+}
+
+if (!(Test-Path $releaseExe)) {
+    throw "missing release binary after build: $releaseExe"
+}
+
 Get-Process ainput-desktop -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $packageExe } |
     Stop-Process -Force
@@ -135,7 +382,13 @@ if (Test-Path $packageDir) {
 }
 
 if (Test-Path $zipPath) {
-    Remove-ItemWithRetry -Path $zipPath
+    try {
+        Remove-ItemWithRetry -Path $zipPath
+    } catch {
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $zipPath = Join-Path $distRoot "$packageName-$timestamp.zip"
+        Write-Warning "existing zip is locked; writing archive to $zipPath instead"
+    }
 }
 
 $mainConfigSource = Get-PreferredConfigSource `
@@ -149,12 +402,37 @@ New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "config") | Out-Null
 New-Item -ItemType Directory -Force -Path $modelTarget | Out-Null
 New-Item -ItemType Directory -Force -Path $streamingModelTarget | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "models\punctuation") | Out-Null
+New-Item -ItemType Directory -Force -Path $streamingPunctuationModelTarget | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "logs") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "assets") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") | Out-Null
 
-Copy-Item (Join-Path $repoRoot "target\release\ainput-desktop.exe") (Join-Path $packageDir "ainput-desktop.exe") -Force
+Copy-Item $releaseExe (Join-Path $packageDir "ainput-desktop.exe") -Force
 Copy-Item $mainConfigSource (Join-Path $packageDir "config\ainput.toml") -Force
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming" `
+    -Keys @("model_dir", "rewrite_enabled", "punctuation_model_dir", "punctuation_num_threads", "chunk_ms") `
+    -ForcedValues @{
+        model_dir = ('model_dir = "models/' + $streamingModelName + '"')
+        punctuation_model_dir = ('punctuation_model_dir = "models/punctuation/' + $streamingPunctuationModelName + '"')
+    }
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.ai_rewrite" `
+    -Keys @("enabled", "endpoint_url", "model", "api_key_env", "timeout_ms", "debounce_ms", "min_visible_chars", "max_context_chars", "max_output_chars")
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "asr" `
+    -Keys @("model_dir", "provider", "sample_rate_hz", "language", "use_itn", "num_threads")
+Sync-ConfigCommentBeforeKey `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -Key "fps"
 Copy-HudOverlayTemplateWithValues `
     -TemplatePath (Join-Path $repoRoot "config\hud-overlay.toml") `
     -SourcePath $hudConfigSource `
@@ -164,8 +442,11 @@ Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "as
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
 Copy-Item (Join-Path $repoRoot "data\terms\base_terms.json") (Join-Path $packageDir "data\terms\base_terms.json") -Force
 Copy-Item $modelSource $modelTarget -Recurse -Force
-Copy-Item $streamingModelSource $streamingModelTarget -Recurse -Force
-
+if (!(Test-Path $streamingPunctuationModelSource)) {
+    throw "missing streaming punctuation model directory: $streamingPunctuationModelSource"
+}
+Copy-StreamingModelRuntimeFiles -SourceDir $streamingModelSource -TargetDir $streamingModelTarget
+Copy-Item (Join-Path $streamingPunctuationModelSource "*") $streamingPunctuationModelTarget -Recurse -Force
 Set-Content -Path (Join-Path $packageDir "run-ainput.bat") -Encoding ASCII -Value @(
     "@echo off",
     "setlocal",
@@ -180,7 +461,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "Start:",
     "1. Double-click run-ainput.bat",
     "2. The app will stay in the system tray",
-    "3. Hold Alt+Z to talk; press Alt+X to capture; press F1/F2 to record video; press F8/F9/F10 for automation, F7 to pause or resume playback, Esc to stop the current automation flow",
+    "3. Fast voice mode uses your configured hotkey; streaming voice mode uses hold Ctrl to talk and submits on release; press Alt+X to capture; press F1/F2 to record video; press F8/F9/F10 for automation, F7 to pause or resume playback, Esc to stop the current automation flow",
     "",
     "Files:",
     "- ainput-desktop.exe: main app",
@@ -189,7 +470,8 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- config\ainput.toml: main config",
     "- config\hud-overlay.toml: HUD parameter document",
     "- models\\sense-voice\\: fast voice recognition model",
-    "- models\\streaming-zipformer-small-bilingual-zh-en\\: streaming voice recognition model",
+    ("- models\\" + $streamingModelName + "\\: streaming voice recognition model"),
+    ("- models\\punctuation\\" + $streamingPunctuationModelName + "\\: streaming punctuation model"),
     "- assets\app-icon.ico: tray icon resource",
     "- data\terms\base_terms.json: built-in AI terms",
     "- logs\: runtime logs",
@@ -198,7 +480,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
-    "- Streaming voice shows a bottom-center HUD above the taskbar while the hotkey is held, and submits the rewritten full text only after release",
+    "- Streaming voice now uses hold Ctrl to trigger the local streaming paraformer model, and submits the finalized text after release",
     "- You can open config\hud-overlay.toml directly from the tray menu to adjust font size, color, width, and position",
     "- Saving config\hud-overlay.toml hot-reloads the HUD immediately",
     "- New preview packages reuse the latest dist config files when available so HUD settings are kept",
@@ -219,3 +501,4 @@ Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $zipPath -Fo
 
 Write-Output $packageDir
 Write-Output $zipPath
+

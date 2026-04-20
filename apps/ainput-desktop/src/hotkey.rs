@@ -10,14 +10,14 @@ use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEINPUT,
-    SendInput, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE,
-    VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8,
-    VK_F9, VK_F10, VK_F11, VK_F12, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT,
-    VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2,
-    VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_PAUSE,
-    VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
-    VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL,
+    VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3,
+    VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_HOME, VK_INSERT,
+    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK,
+    VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7,
+    VK_NUMPAD8, VK_NUMPAD9, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
@@ -30,6 +30,7 @@ use winit::event_loop::EventLoopProxy;
 const HOTKEY_CONTROL_MESSAGE: u32 = WM_APP + 7;
 const MOUSE_MIDDLE_HOLD_DELAY_MS: u64 = 200;
 const VOICE_HOTKEY_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const MODIFIER_ONLY_VOICE_TRIGGER_DELAY_MS: u64 = 70;
 
 #[derive(Clone, Copy)]
 pub enum HotkeyState {
@@ -99,6 +100,9 @@ static MOUSE_MIDDLE_ENABLED: AtomicBool = AtomicBool::new(true);
 static MOUSE_MIDDLE_DOWN: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MOUSE_MIDDLE_TOKEN: AtomicU64 = AtomicU64::new(0);
+static MODIFIER_ONLY_VOICE_PENDING: AtomicBool = AtomicBool::new(false);
+static MODIFIER_ONLY_VOICE_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
+static MODIFIER_ONLY_VOICE_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 impl GlobalHotkeyMonitor {
     pub fn start(
@@ -172,6 +176,18 @@ impl GlobalHotkeyMonitor {
     }
 }
 
+pub fn set_voice_input_binding(voice_input: &str) -> Result<()> {
+    let parsed = parse_hotkey(voice_input)
+        .map_err(|error| anyhow!("invalid voice hotkey {voice_input}: {error}"))?;
+    if let Some(lock) = HOTKEY_CONFIG.get() {
+        let mut guard = lock
+            .write()
+            .map_err(|_| anyhow!("hotkey config write lock poisoned"))?;
+        guard.voice = parsed;
+    }
+    Ok(())
+}
+
 pub fn set_mouse_middle_enabled(enabled: bool) {
     MOUSE_MIDDLE_ENABLED.store(enabled, Ordering::Relaxed);
     if !enabled {
@@ -237,6 +253,8 @@ pub fn reset_hotkey_state() {
     AUTOMATION_CANCEL_ACTIVE.store(false, Ordering::Relaxed);
     MOUSE_MIDDLE_DOWN.store(false, Ordering::Relaxed);
     MOUSE_MIDDLE_ACTIVE.store(false, Ordering::Relaxed);
+    MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
+    MODIFIER_ONLY_VOICE_PASSTHROUGH.store(false, Ordering::Relaxed);
 }
 
 impl Drop for GlobalHotkeyMonitor {
@@ -262,7 +280,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         update_modifier_state(vk, is_down, is_up);
 
         if matches!(vk, VIRTUAL_KEY(0x58) | VK_MENU | VK_LMENU | VK_RMENU) && (is_down || is_up) {
-            tracing::info!(
+            tracing::debug!(
                 event_vk = vk.0,
                 scan_code = keyboard.scanCode,
                 flags = keyboard.flags.0,
@@ -278,6 +296,14 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         }
 
         if let Some(config) = current_config() {
+            if config.voice.key.is_none() {
+                if let Some(result) =
+                    handle_modifier_only_voice_hotkey(vk, is_down, is_up, &config.voice)
+                {
+                    return result;
+                }
+            }
+
             if vk == VK_F1 && is_down && !RECORDING_START_ACTIVE.swap(true, Ordering::Relaxed) {
                 send_hotkey_state(HotkeyState::RecordingStartTriggered);
                 return LRESULT(1);
@@ -425,6 +451,98 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
+fn handle_modifier_only_voice_hotkey(
+    vk: VIRTUAL_KEY,
+    is_down: bool,
+    is_up: bool,
+    voice: &ParsedHotkey,
+) -> Option<LRESULT> {
+    if !voice.modifiers.any() {
+        return None;
+    }
+
+    let relevant_modifier = voice.modifiers.contains_vk(vk);
+    let exact_match = voice.modifiers.exactly_pressed();
+    let passthrough = MODIFIER_ONLY_VOICE_PASSTHROUGH.load(Ordering::Relaxed);
+    let pending = MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed);
+    let active = VOICE_ACTIVE.load(Ordering::Relaxed);
+
+    if passthrough {
+        if is_up && relevant_modifier && voice.modifiers.fully_released() {
+            MODIFIER_ONLY_VOICE_PASSTHROUGH.store(false, Ordering::Relaxed);
+        }
+        return None;
+    }
+
+    if is_down && !relevant_modifier {
+        if pending || active {
+            cancel_modifier_only_voice_capture(voice, active);
+        }
+        return None;
+    }
+
+    if is_down && relevant_modifier && exact_match {
+        if !pending && !active {
+            arm_modifier_only_voice_pending(voice.modifiers);
+        }
+        return Some(LRESULT(1));
+    }
+
+    if is_down && relevant_modifier {
+        if pending || active {
+            cancel_modifier_only_voice_capture(voice, active);
+        }
+        return None;
+    }
+
+    if is_up && relevant_modifier {
+        MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
+        if active && VOICE_ACTIVE.swap(false, Ordering::Relaxed) {
+            send_hotkey_state(HotkeyState::VoiceReleased);
+            return Some(LRESULT(1));
+        }
+        if pending || exact_match {
+            return Some(LRESULT(1));
+        }
+    }
+
+    None
+}
+
+fn arm_modifier_only_voice_pending(modifiers: HotkeyModifiers) {
+    MODIFIER_ONLY_VOICE_PENDING.store(true, Ordering::Relaxed);
+    let token = MODIFIER_ONLY_VOICE_TOKEN.fetch_add(1, Ordering::Relaxed) + 1;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(MODIFIER_ONLY_VOICE_TRIGGER_DELAY_MS));
+        if MODIFIER_ONLY_VOICE_TOKEN.load(Ordering::Relaxed) != token {
+            return;
+        }
+        if MODIFIER_ONLY_VOICE_PASSTHROUGH.load(Ordering::Relaxed) {
+            return;
+        }
+        if !MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed) {
+            return;
+        }
+        if !modifiers.exactly_pressed() {
+            MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
+            return;
+        }
+        MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
+        if !VOICE_ACTIVE.swap(true, Ordering::Relaxed) {
+            send_hotkey_state(HotkeyState::VoicePressed);
+        }
+    });
+}
+
+fn cancel_modifier_only_voice_capture(voice: &ParsedHotkey, active: bool) {
+    MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
+    MODIFIER_ONLY_VOICE_PASSTHROUGH.store(true, Ordering::Relaxed);
+    if active && VOICE_ACTIVE.swap(false, Ordering::Relaxed) {
+        send_hotkey_state(HotkeyState::VoiceReleased);
+    }
+    synthesize_modifier_keydowns(voice.modifiers);
+}
+
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code != HC_ACTION as i32 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
@@ -512,6 +630,13 @@ impl HotkeyModifiers {
             && (!self.win || WIN_DOWN.load(Ordering::Relaxed))
     }
 
+    fn exactly_pressed(self) -> bool {
+        self.ctrl == CTRL_DOWN.load(Ordering::Relaxed)
+            && self.alt == ALT_DOWN.load(Ordering::Relaxed)
+            && self.shift == SHIFT_DOWN.load(Ordering::Relaxed)
+            && self.win == WIN_DOWN.load(Ordering::Relaxed)
+    }
+
     fn any_released_requirement(self) -> bool {
         (self.ctrl && !CTRL_DOWN.load(Ordering::Relaxed))
             || (self.alt && !ALT_DOWN.load(Ordering::Relaxed))
@@ -524,6 +649,13 @@ impl HotkeyModifiers {
             && (!self.alt || !ALT_DOWN.load(Ordering::Relaxed))
             && (!self.shift || !SHIFT_DOWN.load(Ordering::Relaxed))
             && (!self.win || !WIN_DOWN.load(Ordering::Relaxed))
+    }
+
+    fn contains_vk(self, vk: VIRTUAL_KEY) -> bool {
+        (self.ctrl && matches!(vk, VK_CONTROL | VK_LCONTROL | VK_RCONTROL))
+            || (self.alt && matches!(vk, VK_MENU | VK_LMENU | VK_RMENU))
+            || (self.shift && matches!(vk, VK_SHIFT | VK_LSHIFT | VK_RSHIFT))
+            || (self.win && matches!(vk, VK_LWIN | VK_RWIN))
     }
 }
 
@@ -681,6 +813,37 @@ fn synthesize_middle_click() {
     ];
 
     let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+}
+
+fn synthesize_modifier_keydowns(modifiers: HotkeyModifiers) {
+    let mut inputs = Vec::new();
+    if modifiers.ctrl {
+        inputs.push(keyboard_input(VK_LCONTROL));
+    }
+    if modifiers.alt {
+        inputs.push(keyboard_input(VK_LMENU));
+    }
+    if modifiers.shift {
+        inputs.push(keyboard_input(VK_LSHIFT));
+    }
+    if modifiers.win {
+        inputs.push(keyboard_input(VK_LWIN));
+    }
+    if !inputs.is_empty() {
+        let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    }
+}
+
+fn keyboard_input(vk: VIRTUAL_KEY) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                ..Default::default()
+            },
+        },
+    }
 }
 
 fn send_hotkey_state(state: HotkeyState) {

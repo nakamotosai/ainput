@@ -65,7 +65,24 @@ pub struct StreamingVoiceConfig {
     pub model_dir: String,
     pub panel_enabled: bool,
     pub rewrite_enabled: bool,
+    pub punctuation_model_dir: String,
+    pub punctuation_num_threads: i32,
     pub chunk_ms: u32,
+    pub ai_rewrite: StreamingAiRewriteConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingAiRewriteConfig {
+    pub enabled: bool,
+    pub endpoint_url: String,
+    pub model: String,
+    pub api_key_env: String,
+    pub timeout_ms: u64,
+    pub debounce_ms: u64,
+    pub min_visible_chars: usize,
+    pub max_context_chars: usize,
+    pub max_output_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,7 +208,28 @@ impl Default for StreamingVoiceConfig {
             model_dir: "models/streaming-zipformer-small-bilingual-zh-en".to_string(),
             panel_enabled: true,
             rewrite_enabled: true,
-            chunk_ms: 320,
+            punctuation_model_dir:
+                "models/punctuation/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+                    .to_string(),
+            punctuation_num_threads: 1,
+            chunk_ms: 60,
+            ai_rewrite: StreamingAiRewriteConfig::default(),
+        }
+    }
+}
+
+impl Default for StreamingAiRewriteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+            model: "Qwen3-0.6B".to_string(),
+            api_key_env: String::new(),
+            timeout_ms: 260,
+            debounce_ms: 260,
+            min_visible_chars: 8,
+            max_context_chars: 80,
+            max_output_chars: 96,
         }
     }
 }
@@ -770,8 +808,46 @@ panel_enabled = {streaming_panel_enabled}
 # 是否启用流式短句整理。
 rewrite_enabled = {streaming_rewrite_enabled}
 
-# 流式预览刷新间隔（毫秒）。
+# 流式标点模型目录。
+punctuation_model_dir = "{streaming_punctuation_model_dir}"
+
+# 流式标点模型线程数。
+punctuation_num_threads = {streaming_punctuation_num_threads}
+
+# 流式音频块时长（毫秒）。
+# 数值越小，HUD 更新会更勤；数值越大，吞吐更稳但刷新会更慢。
 chunk_ms = {streaming_chunk_ms}
+
+[voice.streaming.ai_rewrite]
+# 是否启用本地 AI 实时改写。
+# 只会改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
+enabled = {streaming_ai_rewrite_enabled}
+
+# 本地 OpenAI 兼容接口地址。
+# 例如 llama.cpp server、vLLM 或别的本地兼容服务。
+endpoint_url = "{streaming_ai_rewrite_endpoint_url}"
+
+# 改写模型名称。
+model = "{streaming_ai_rewrite_model}"
+
+# 可选：从哪个环境变量读取 API Key。
+# 纯本地服务通常留空即可。
+api_key_env = "{streaming_ai_rewrite_api_key_env}"
+
+# 单次 AI 改写超时（毫秒）。
+timeout_ms = {streaming_ai_rewrite_timeout_ms}
+
+# 两次 AI 改写之间的最小间隔（毫秒）。
+debounce_ms = {streaming_ai_rewrite_debounce_ms}
+
+# 至少累计多少个可见字，才触发 AI 改写。
+min_visible_chars = {streaming_ai_rewrite_min_visible_chars}
+
+# 发送给模型的冻结前缀最大字符数。
+max_context_chars = {streaming_ai_rewrite_max_context_chars}
+
+# 允许模型返回的尾巴最大字符数。
+max_output_chars = {streaming_ai_rewrite_max_output_chars}
 
 [capture]
 # 是否启用截图主功能。
@@ -795,7 +871,7 @@ record_audio = {recording_audio}
 # 是否录制鼠标移动。
 capture_mouse = {recording_capture_mouse}
 
-# 录屏帧率预设，只支持 30 / 60 / 90。
+# 录屏帧率预设，只支持 30 / 60 / 90 / 144。
 fps = {recording_fps}
 
 # 录屏画质预设。
@@ -871,7 +947,38 @@ file_name = "{log_file_name}"
         streaming_model_dir = config.voice.streaming.model_dir,
         streaming_panel_enabled = config.voice.streaming.panel_enabled,
         streaming_rewrite_enabled = config.voice.streaming.rewrite_enabled,
+        streaming_punctuation_model_dir = config.voice.streaming.punctuation_model_dir,
+        streaming_punctuation_num_threads = config.voice.streaming.punctuation_num_threads,
         streaming_chunk_ms = config.voice.streaming.chunk_ms,
+        streaming_ai_rewrite_enabled = config.voice.streaming.ai_rewrite.enabled,
+        streaming_ai_rewrite_endpoint_url = config
+            .voice
+            .streaming
+            .ai_rewrite
+            .endpoint_url
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        streaming_ai_rewrite_model = config
+            .voice
+            .streaming
+            .ai_rewrite
+            .model
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        streaming_ai_rewrite_api_key_env = config
+            .voice
+            .streaming
+            .ai_rewrite
+            .api_key_env
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        streaming_ai_rewrite_timeout_ms = config.voice.streaming.ai_rewrite.timeout_ms,
+        streaming_ai_rewrite_debounce_ms = config.voice.streaming.ai_rewrite.debounce_ms,
+        streaming_ai_rewrite_min_visible_chars =
+            config.voice.streaming.ai_rewrite.min_visible_chars,
+        streaming_ai_rewrite_max_context_chars =
+            config.voice.streaming.ai_rewrite.max_context_chars,
+        streaming_ai_rewrite_max_output_chars = config.voice.streaming.ai_rewrite.max_output_chars,
         capture_enabled = config.capture.enabled,
         auto_save_to_desktop = config.capture.auto_save_to_desktop,
         automation_repeat_count = config.automation.repeat_count,
@@ -1229,14 +1336,32 @@ text_color = "#111111"
 # 旧坏格式 background_alpha = 255
 "##;
 
-        let config = toml::from_str::<HudOverlayConfigFile>(&normalize_legacy_hud_overlay_text(raw))
-            .expect("parse salvaged hud config")
-            .into_config();
+        let config =
+            toml::from_str::<HudOverlayConfigFile>(&normalize_legacy_hud_overlay_text(raw))
+                .expect("parse salvaged hud config")
+                .into_config();
 
         assert_eq!(config.width_px, 900);
         assert_eq!(config.min_width_px, 260);
         assert_eq!(config.font_height_px, 72);
         assert_eq!(config.background_alpha, 255);
+    }
+
+    #[test]
+    fn render_config_file_contains_streaming_ai_rewrite_section() {
+        let rendered = render_config_file(&AppConfig::default());
+        assert!(rendered.contains("[voice.streaming.ai_rewrite]"));
+        assert!(rendered.contains("endpoint_url = \"http://127.0.0.1:8080/v1/chat/completions\""));
+        assert!(rendered.contains("model = \"Qwen3-0.6B\""));
+    }
+
+    #[test]
+    fn streaming_ai_rewrite_defaults_are_disabled_but_present() {
+        let config = StreamingAiRewriteConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.timeout_ms, 260);
+        assert_eq!(config.debounce_ms, 260);
+        assert_eq!(config.max_output_chars, 96);
     }
 
     fn temp_runtime_paths(label: &str) -> RuntimePaths {

@@ -14,14 +14,14 @@ use ffmpeg::{
     ActiveVideoCapture, mux_audio_video, mux_video_only, probe_media, render_with_watermark,
     resolve_ffmpeg_path,
 };
-use selection::{CaptureRegion, RecordingFrame, choose_region_interactive};
+use selection::{CaptureRegion, RecordingFrame, active_monitor_count, choose_region_interactive};
 use serde::{Deserialize, Serialize};
 
 pub use selection::configure_dpi_awareness;
 
 pub const START_HOTKEY: &str = "F1";
 pub const STOP_HOTKEY: &str = "F2";
-pub const FPS_PRESETS: [u32; 3] = [30, 60, 90];
+pub const FPS_PRESETS: [u32; 4] = [30, 60, 90, 144];
 pub const WATERMARK_POSITION_PRESETS: [WatermarkPosition; 6] = [
     WatermarkPosition::LeftTop,
     WatermarkPosition::RightTop,
@@ -118,6 +118,13 @@ struct RecordingSession {
     audio: Option<ActiveAudioCapture>,
     video: Option<ActiveVideoCapture>,
     runtime_config: RecordingConfig,
+    audio_requested: bool,
+}
+
+struct StoppedRecording {
+    output_path: PathBuf,
+    audio_requested: bool,
+    audio_included: bool,
 }
 
 impl Default for RecordingConfig {
@@ -155,7 +162,7 @@ impl Default for RecordingSnapshot {
 
 impl RecordingConfig {
     pub fn normalize(&mut self) {
-        if !matches!(self.fps, 30 | 60 | 90) {
+        if !matches!(self.fps, 30 | 60 | 90 | 144) {
             self.fps = 60;
         }
     }
@@ -354,14 +361,18 @@ fn begin_recording_impl(inner: Arc<ServiceInner>, runtime_config: RecordingConfi
     let region = normalize_region_for_encoder(region)?;
     let session = RecordingSession::start(&inner.ffmpeg_path, region, runtime_config)?;
     let output_path = session.output_path.clone();
+    let audio_requested = session.audio_requested;
+    let audio_available = session.audio.is_some();
 
     {
         let mut state = inner.state.lock().map_err(|_| anyhow!("录屏状态锁失败"))?;
         state.snapshot = RecordingSnapshot {
             activity: RecordingActivity::Recording,
-            status_line: format!(
-                "录屏：录制中 {}x{}，按 {} 停止，按 Esc 取消",
-                region.width, region.height, STOP_HOTKEY
+            status_line: recording_status_line(
+                region.width,
+                region.height,
+                audio_requested,
+                audio_available,
             ),
             output_path: Some(output_path.clone()),
         };
@@ -380,13 +391,17 @@ fn begin_recording_impl(inner: Arc<ServiceInner>, runtime_config: RecordingConfi
 }
 
 fn stop_recording_impl(inner: Arc<ServiceInner>, session: RecordingSession) -> Result<()> {
-    let output = session.stop()?;
+    let stopped = session.stop()?;
     inner.update_snapshot(RecordingSnapshot {
         activity: RecordingActivity::Idle,
-        status_line: format!("录屏：已完成 {}", output.display()),
-        output_path: Some(output.clone()),
+        status_line: recording_completed_status_line(
+            &stopped.output_path,
+            stopped.audio_requested,
+            stopped.audio_included,
+        ),
+        output_path: Some(stopped.output_path.clone()),
     });
-    tracing::info!(output = %output.display(), "recording finished");
+    tracing::info!(output = %stopped.output_path.display(), "recording finished");
     Ok(())
 }
 
@@ -396,6 +411,7 @@ impl RecordingSession {
         region: CaptureRegion,
         runtime_config: RecordingConfig,
     ) -> Result<Self> {
+        let audio_requested = runtime_config.record_audio;
         let output_path = default_output_path()?;
         let temp_dir = std::env::temp_dir().join(format!("ainput-record-{}", timestamp_millis()));
         fs::create_dir_all(&temp_dir)
@@ -409,9 +425,11 @@ impl RecordingSession {
             match ActiveAudioCapture::start_loopback(temp_audio.clone()) {
                 Ok(audio) => Some(audio),
                 Err(error) => {
-                    frame.close();
-                    let _ = cleanup_temp_dir(&temp_dir);
-                    return Err(error);
+                    tracing::warn!(
+                        error = %error,
+                        "system audio capture unavailable; continue recording without audio"
+                    );
+                    None
                 }
             }
         } else {
@@ -422,6 +440,7 @@ impl RecordingSession {
         let video = match ActiveVideoCapture::start(
             ffmpeg_path,
             region,
+            active_monitor_count(),
             runtime_config.fps,
             runtime_config.capture_mouse,
             runtime_config.quality,
@@ -449,10 +468,11 @@ impl RecordingSession {
             audio,
             video: Some(video),
             runtime_config,
+            audio_requested,
         })
     }
 
-    fn stop(mut self) -> Result<PathBuf> {
+    fn stop(mut self) -> Result<StoppedRecording> {
         self.close_frame();
 
         let video = self
@@ -469,17 +489,43 @@ impl RecordingSession {
 
         let mut audio_path_for_output = None;
         if let Some(audio) = self.audio.take() {
-            let audio_path = audio.stop()?;
-            if !audio_path.exists() {
-                self.cleanup_partial_outputs();
-                return Err(anyhow!("系统音频文件未生成"));
-            }
-            let audio_summary = probe_media(&self.ffmpeg_path, &audio_path)?;
-            let audio_file_size = fs::metadata(&audio_path)
-                .map(|meta| meta.len())
-                .unwrap_or(0);
-            if audio_summary.audio_streams > 0 && audio_file_size > 128 {
-                audio_path_for_output = Some(audio_path);
+            match audio.stop() {
+                Ok(audio_path) => {
+                    if !audio_path.exists() {
+                        tracing::warn!(
+                            "system audio file missing after stop; export video without audio"
+                        );
+                    } else {
+                        match probe_media(&self.ffmpeg_path, &audio_path) {
+                            Ok(audio_summary) => {
+                                let audio_file_size = fs::metadata(&audio_path)
+                                    .map(|meta| meta.len())
+                                    .unwrap_or(0);
+                                if audio_summary.audio_streams > 0 && audio_file_size > 128 {
+                                    audio_path_for_output = Some(audio_path);
+                                } else {
+                                    tracing::warn!(
+                                        audio_streams = audio_summary.audio_streams,
+                                        audio_file_size,
+                                        "system audio output unusable; export video without audio"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "system audio probe failed; export video without audio"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "system audio capture stop failed; export video without audio"
+                    );
+                }
             }
         }
 
@@ -496,15 +542,24 @@ impl RecordingSession {
             self.cleanup_partial_outputs();
             return Err(anyhow!("生成的 mp4 没有视频流"));
         }
+        verify_output_video_fps(&output_summary, self.runtime_config.fps, &self.output_path)?;
 
         if let Err(error) = cleanup_temp_dir(&self.temp_dir) {
             tracing::warn!(error = %error, "cleanup recording temp dir failed");
         }
         tracing::info!(
             seconds = self.started_at.elapsed().as_secs_f32(),
+            target_fps = self.runtime_config.fps,
+            measured_fps = output_summary.video_fps.unwrap_or_default(),
+            frame_count = output_summary.video_frame_count.unwrap_or_default(),
+            audio_included = audio_path_for_output.is_some(),
             "recording session stopped"
         );
-        Ok(self.output_path)
+        Ok(StoppedRecording {
+            output_path: self.output_path,
+            audio_requested: self.audio_requested,
+            audio_included: audio_path_for_output.is_some(),
+        })
     }
 
     fn abort(mut self) {
@@ -547,12 +602,82 @@ fn render_output(
             output_path,
             &config.watermark,
             config.quality,
+            config.fps,
         )
     } else if let Some(audio_path) = audio_path {
         mux_audio_video(ffmpeg_path, temp_video, audio_path, 0.0, output_path)
     } else {
         mux_video_only(ffmpeg_path, temp_video, output_path)
     }
+}
+
+fn verify_output_video_fps(
+    summary: &ffmpeg::MediaSummary,
+    target_fps: u32,
+    output_path: &Path,
+) -> Result<()> {
+    let Some(measured_fps) = summary.video_fps else {
+        return Ok(());
+    };
+
+    if (measured_fps - target_fps as f64).abs() > 0.5 {
+        return Err(anyhow!(
+            "录屏输出帧率不符合目标: target={}fps actual={:.3}fps file={}",
+            target_fps,
+            measured_fps,
+            output_path.display()
+        ));
+    }
+
+    if let (Some(frame_count), Some(duration_secs)) =
+        (summary.video_frame_count, summary.video_duration_secs)
+        && duration_secs >= 1.0
+    {
+        let effective_fps = frame_count as f64 / duration_secs;
+        let tolerance = (target_fps as f64 * 0.08).max(2.0);
+        if (effective_fps - target_fps as f64).abs() > tolerance {
+            return Err(anyhow!(
+                "录屏帧数密度不符合目标: target={}fps effective={:.3}fps frames={} duration={:.3}s file={}",
+                target_fps,
+                effective_fps,
+                frame_count,
+                duration_secs,
+                output_path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn recording_status_line(
+    width: i32,
+    height: i32,
+    audio_requested: bool,
+    audio_available: bool,
+) -> String {
+    let audio_suffix = if audio_requested && !audio_available {
+        "，系统音频不可用，已切到无声录屏"
+    } else {
+        ""
+    };
+    format!(
+        "录屏：录制中 {}x{}{}，按 {} 停止，按 Esc 取消",
+        width, height, audio_suffix, STOP_HOTKEY
+    )
+}
+
+fn recording_completed_status_line(
+    output: &Path,
+    audio_requested: bool,
+    audio_included: bool,
+) -> String {
+    let audio_suffix = if audio_requested && !audio_included {
+        "（无系统音频）"
+    } else {
+        ""
+    };
+    format!("录屏：已完成{} {}", audio_suffix, output.display())
 }
 
 fn cleanup_temp_dir(path: &Path) -> Result<()> {
@@ -624,4 +749,55 @@ fn normalize_region_for_encoder(mut region: CaptureRegion) -> Result<CaptureRegi
     }
 
     Ok(region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecordingConfig, recording_completed_status_line, recording_status_line};
+    use std::path::Path;
+
+    #[test]
+    fn recording_config_keeps_144_fps() {
+        let mut config = RecordingConfig {
+            fps: 144,
+            ..RecordingConfig::default()
+        };
+        config.normalize();
+        assert_eq!(config.fps, 144);
+    }
+
+    #[test]
+    fn recording_config_rejects_unknown_fps() {
+        let mut config = RecordingConfig {
+            fps: 120,
+            ..RecordingConfig::default()
+        };
+        config.normalize();
+        assert_eq!(config.fps, 60);
+    }
+
+    #[test]
+    fn recording_status_line_mentions_silent_fallback_when_audio_unavailable() {
+        assert_eq!(
+            recording_status_line(1920, 1080, true, false),
+            "录屏：录制中 1920x1080，系统音频不可用，已切到无声录屏，按 F2 停止，按 Esc 取消"
+        );
+        assert_eq!(
+            recording_status_line(1920, 1080, true, true),
+            "录屏：录制中 1920x1080，按 F2 停止，按 Esc 取消"
+        );
+    }
+
+    #[test]
+    fn completed_status_line_marks_missing_audio_track() {
+        let output = Path::new(r"C:\Users\sai\Desktop\ainput-record.mp4");
+        assert_eq!(
+            recording_completed_status_line(output, true, false),
+            r"录屏：已完成（无系统音频） C:\Users\sai\Desktop\ainput-record.mp4"
+        );
+        assert_eq!(
+            recording_completed_status_line(output, true, true),
+            r"录屏：已完成 C:\Users\sai\Desktop\ainput-record.mp4"
+        );
+    }
 }

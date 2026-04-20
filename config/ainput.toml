@@ -61,16 +61,52 @@ history_limit = 500
 enabled = true
 
 # 流式 ASR 模型目录。
-model_dir = "models/streaming-zipformer-small-bilingual-zh-en"
+model_dir = "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 
 # 是否显示流式语音面板。
 panel_enabled = true
 
-# 是否启用流式短句整理。
+# 是否启用流式文本整理。
 rewrite_enabled = true
 
-# 流式预览刷新间隔（毫秒）。
-chunk_ms = 500
+# 流式标点模型目录。
+punctuation_model_dir = "models/punctuation/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+
+# 流式标点模型线程数。
+punctuation_num_threads = 1
+
+# 流式音频块时长（毫秒）。
+# 数值越小，HUD 更新会更勤；数值越大，吞吐更稳但刷新会更慢。
+chunk_ms = 60
+
+[voice.streaming.ai_rewrite]
+# 是否启用 AI 实时改写。
+enabled = true
+
+# 云端 OpenAI 兼容改写服务地址。
+endpoint_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+# 改写模型。
+model = "openai/gpt-oss-20b"
+
+# 鉴权环境变量名。
+api_key_env = "AINPUT_AI_REWRITE_API_KEY"
+
+# 单次改写请求超时（毫秒）。
+# 云端接口正常情况下会更快，但仍给足一点尾部缓冲。
+timeout_ms = 1800
+
+# 两次改写之间的最短间隔（毫秒）。
+debounce_ms = 160
+
+# 至少有多少可见字符时才触发 AI 改写。
+min_visible_chars = 2
+
+# 发送给改写器的前文最多保留多少字符。
+max_context_chars = 64
+
+# 改写结果最多保留多少字符。
+max_output_chars = 48
 
 [capture]
 # 是否启用截图主功能。
@@ -94,7 +130,7 @@ record_audio = true
 # 是否录制鼠标移动。
 capture_mouse = true
 
-# 录屏帧率预设，只支持 30 / 60 / 90。
+# 录屏帧率预设，只支持 30 / 60 / 90 / 144。
 fps = 60
 
 # 录屏画质预设。
@@ -153,3 +189,4 @@ level = "info"
 
 # 主日志文件名。
 file_name = "ainput.log"
+

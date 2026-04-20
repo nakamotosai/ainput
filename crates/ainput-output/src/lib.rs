@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use ainput_data::{LearningStatus, TermCatalog};
 use anyhow::{Context, Result, anyhow};
-use arboard::Clipboard;
+use arboard::{Clipboard, ImageData};
 use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings,
@@ -37,6 +37,7 @@ const SENTENCE_FINAL_EMOJI_RULES: &[(&str, &str)] = &[
 ];
 const DEFAULT_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(35);
 const CHROME_ALT_MENU_DISMISS_DELAY: Duration = Duration::from_millis(30);
+const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone, Copy)]
 pub enum OutputDelivery {
@@ -72,6 +73,17 @@ pub enum OutputContextKind {
     EditableWithContentOnRight,
     EditableAtEnd,
     Unknown,
+}
+
+enum ClipboardBackup {
+    Empty,
+    Text(String),
+    Html {
+        html: String,
+        alt_text: Option<String>,
+    },
+    Image(ImageData<'static>),
+    FileList(Vec<PathBuf>),
 }
 
 pub struct OutputController {
@@ -211,6 +223,19 @@ impl OutputController {
         &self.root_dir
     }
 
+    pub fn inspect_context_snapshot(&self) -> OutputContextSnapshot {
+        match inspect_output_context() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to inspect caret context for AI rewrite");
+                OutputContextSnapshot {
+                    process_name: None,
+                    kind: OutputContextKind::Unknown,
+                }
+            }
+        }
+    }
+
     fn apply_term_corrections(&self, text: &str) -> Result<String> {
         let catalog = self
             .term_catalog
@@ -233,6 +258,7 @@ fn paste_via_clipboard(
     context: &OutputContextSnapshot,
     config: &OutputConfig,
 ) -> Result<()> {
+    let backup = ClipboardBackup::capture();
     let clipboard_started_at = Instant::now();
     copy_to_clipboard(text)?;
     let clipboard_elapsed_ms = clipboard_started_at.elapsed().as_millis();
@@ -256,6 +282,10 @@ fn paste_via_clipboard(
     enigo.key(Key::V, Click).context("send v key")?;
     enigo.key(Key::Control, Release).context("release ctrl")?;
     let key_send_elapsed_ms = key_send_started_at.elapsed().as_millis();
+    thread::sleep(CLIPBOARD_RESTORE_DELAY);
+    if let Err(error) = backup.restore() {
+        tracing::warn!(error = %error, "restore clipboard after direct paste failed");
+    }
     tracing::info!(
         clipboard_elapsed_ms,
         controller_elapsed_ms,
@@ -266,6 +296,67 @@ fn paste_via_clipboard(
     );
 
     Ok(())
+}
+
+impl ClipboardBackup {
+    fn capture() -> Self {
+        let mut clipboard = match Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(_) => return Self::Empty,
+        };
+
+        if let Ok(file_list) = clipboard.get().file_list() {
+            return Self::FileList(file_list);
+        }
+
+        if let Ok(html) = clipboard.get().html() {
+            let alt_text = clipboard.get().text().ok();
+            return Self::Html { html, alt_text };
+        }
+
+        if let Ok(image) = clipboard.get().image() {
+            return Self::Image(image);
+        }
+
+        if let Ok(text) = clipboard.get().text() {
+            return Self::Text(text);
+        }
+
+        Self::Empty
+    }
+
+    fn restore(&self) -> Result<()> {
+        let mut clipboard = Clipboard::new().context("open clipboard for restore")?;
+        match self {
+            Self::Empty => {
+                clipboard
+                    .clear()
+                    .context("clear clipboard after direct paste")?;
+            }
+            Self::Text(text) => {
+                clipboard
+                    .set_text(text.clone())
+                    .context("restore text clipboard after direct paste")?;
+            }
+            Self::Html { html, alt_text } => {
+                clipboard
+                    .set_html(html.as_str(), alt_text.as_deref())
+                    .context("restore html clipboard after direct paste")?;
+            }
+            Self::Image(image) => {
+                clipboard
+                    .set_image(image.clone())
+                    .context("restore image clipboard after direct paste")?;
+            }
+            Self::FileList(paths) => {
+                clipboard
+                    .set()
+                    .file_list(paths)
+                    .context("restore file list clipboard after direct paste")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for OutputConfig {
@@ -543,9 +634,9 @@ impl Drop for ComApartment {
 mod tests {
     use super::{
         DEFAULT_PASTE_STABILIZE_DELAY, OutputConfig, OutputContextKind, OutputContextSnapshot,
-        apply_voice_actions,
-        ensure_trailing_period, has_terminal_punctuation, prepare_text_for_delivery_in_context,
-        replace_sentence_final_emoji_trigger, should_clear_alt_menu_focus, strip_trailing_period,
+        apply_voice_actions, ensure_trailing_period, has_terminal_punctuation,
+        prepare_text_for_delivery_in_context, replace_sentence_final_emoji_trigger,
+        should_clear_alt_menu_focus, strip_trailing_period,
     };
 
     #[test]
