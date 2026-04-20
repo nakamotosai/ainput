@@ -24,20 +24,22 @@ use crate::streaming_state::{
 use crate::{AppEvent, AppRuntime, hotkey};
 
 const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
-const STREAMING_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(70);
 const STREAMING_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(15);
 const STREAMING_TAIL_PADDING_MS: u64 = 300;
-const STREAMING_RELEASE_GRACE_MS: u64 = 160;
-const STREAMING_RELEASE_MIN_WAIT_MS: u64 = 40;
-const STREAMING_RELEASE_IDLE_SETTLE_MS: u64 = 60;
+const STREAMING_RELEASE_GRACE_MS: u64 = 120;
+const STREAMING_RELEASE_MIN_WAIT_MS: u64 = 24;
+const STREAMING_RELEASE_IDLE_SETTLE_MS: u64 = 32;
 const STREAMING_RELEASE_POLL_INTERVAL_MS: u64 = 8;
 const STREAMING_FINAL_AI_REWRITE_WAIT_MS: u64 = 320;
 const STREAMING_PREVIEW_SHORTFALL_TOLERANCE_CHARS: usize = 3;
 const STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS: usize = 3;
-const STREAMING_FINAL_SIMILAR_TAIL_MARGIN_CHARS: usize = 1;
 const STREAMING_PREROLL_MS: u64 = 180;
 const STREAMING_ENDPOINT_TRAILING_SILENCE_SECS: f32 = 10.0;
 const STREAMING_ENDPOINT_MAX_UTTERANCE_SECS: f32 = 20.0;
+const STREAMING_FIRST_PARTIAL_TARGET_MS: u128 = 300;
+const STREAMING_FIRST_PARTIAL_HARD_MS: u128 = 450;
+const STREAMING_RELEASE_TO_COMMIT_TARGET_MS: u128 = 220;
+const STREAMING_RELEASE_TO_COMMIT_HARD_MS: u128 = 450;
 
 pub(crate) enum WorkerEvent {
     Ready(WorkerKind),
@@ -49,7 +51,6 @@ pub(crate) enum WorkerEvent {
     Delivered,
     ClipboardFallback,
     StreamingStarted,
-    StreamingRawPartial(String),
     StreamingPartial {
         raw_text: String,
         prepared_text: String,
@@ -107,6 +108,7 @@ struct StreamingCoreSession {
     total_decode_steps: usize,
     total_chunks_fed: usize,
     partial_updates: usize,
+    first_partial_at: Option<Instant>,
     started_at: Instant,
 }
 
@@ -216,6 +218,7 @@ impl StreamingCoreSession {
             total_decode_steps: 0,
             total_chunks_fed: 0,
             partial_updates: 0,
+            first_partial_at: None,
             started_at: Instant::now(),
         }
     }
@@ -639,20 +642,21 @@ pub(crate) fn streaming_push_to_talk_worker(
                             )));
                             continue;
                         };
-                        let release_drain = match finish_streaming_recording(&mut session, recording)
-                        {
-                            Ok(stats) => stats,
-                            Err(error) => {
-                                tracing::error!(
-                                    error = %error,
-                                    "failed to finalize streaming recording on hotkey release"
-                                );
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("结束流式录音失败：{error}"),
-                                )));
-                                continue;
-                            }
-                        };
+                        let release_started_at = Instant::now();
+                        let release_drain =
+                            match finish_streaming_recording(&mut session, recording) {
+                                Ok(stats) => stats,
+                                Err(error) => {
+                                    tracing::error!(
+                                        error = %error,
+                                        "failed to finalize streaming recording on hotkey release"
+                                    );
+                                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                        format!("结束流式录音失败：{error}"),
+                                    )));
+                                    continue;
+                                }
+                            };
                         let sample_rate_hz = session.sample_rate_hz;
                         let chunk_samples = streaming_chunk_num_samples(
                             sample_rate_hz,
@@ -722,9 +726,11 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 final_online_raw_text = %prepared_commit.final_online_raw_text,
                                 prepared_final_candidate = %prepared_commit.prepared_final_candidate,
                                 display_text_before_final = %prepared_commit.display_text_before_final,
+                                candidate_display_text = %prepared_commit.candidate_display_text,
                                 selected_commit_source = prepared_commit.commit_source.as_str(),
-                                final_drain_elapsed_ms = prepared_commit.final_drain_elapsed_ms,
+                                final_decode_elapsed_ms = prepared_commit.final_decode_elapsed_ms,
                                 final_decode_steps = prepared_commit.final_decode_steps,
+                                rejected_prefix_rewrite = prepared_commit.rejected_prefix_rewrite,
                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
                                 rms = format_args!("{:.6}", activity.rms),
                                 active_ratio = format_args!("{:.4}", activity.active_ratio),
@@ -734,13 +740,10 @@ pub(crate) fn streaming_push_to_talk_worker(
                             continue;
                         }
 
-                        let final_state = session
-                            .state
-                            .finalize_from_streaming(&prepared_commit.final_text);
-                        if final_state.display_text != prepared_commit.display_text_before_final {
+                        if prepared_commit.final_text != prepared_commit.display_text_before_final {
                             emit_streaming_final_preview_sync(
                                 &mut session,
-                                &final_state.display_text,
+                                &prepared_commit.final_text,
                                 &proxy,
                             );
                         }
@@ -751,27 +754,15 @@ pub(crate) fn streaming_push_to_talk_worker(
                             final_online_raw_text = %prepared_commit.final_online_raw_text,
                             display_text_before_final = %prepared_commit.display_text_before_final,
                             prepared_final_candidate = %prepared_commit.prepared_final_candidate,
+                            candidate_display_text = %prepared_commit.candidate_display_text,
                             selected_commit_source = prepared_commit.commit_source.as_str(),
-                            commit_text = %final_state.display_text,
+                            commit_text = %prepared_commit.final_text,
                             final_decode_steps = prepared_commit.final_decode_steps,
-                            final_drain_elapsed_ms = prepared_commit.final_drain_elapsed_ms,
+                            final_decode_elapsed_ms = prepared_commit.final_decode_elapsed_ms,
+                            rejected_prefix_rewrite = prepared_commit.rejected_prefix_rewrite,
                             total_decode_steps = session.total_decode_steps,
                             "streaming final transcription ready"
                         );
-
-                        let hotkey_release_wait_started_at = Instant::now();
-                        let modifiers_released = hotkey::wait_for_voice_hotkey_release(
-                            STREAMING_OUTPUT_HOTKEY_RELEASE_TIMEOUT,
-                        );
-                        let hotkey_release_wait_elapsed_ms =
-                            hotkey_release_wait_started_at.elapsed().as_millis();
-                        if !modifiers_released {
-                            tracing::warn!(
-                                waited_ms = hotkey_release_wait_elapsed_ms,
-                                hotkey = %runtime.config.hotkeys.voice_input,
-                                "streaming output started before all modifiers fully released"
-                            );
-                        }
 
                         let output_config = OutputConfig {
                             prefer_direct_paste: runtime.config.voice.prefer_direct_paste,
@@ -783,13 +774,13 @@ pub(crate) fn streaming_push_to_talk_worker(
                         let output_started_at = Instant::now();
                         let delivery = match runtime
                             .output_controller
-                            .deliver_text(&final_state.display_text, &output_config)
+                            .deliver_text(&prepared_commit.final_text, &output_config)
                         {
                             Ok(delivery) => {
                                 if matches!(delivery, OutputDelivery::ClipboardOnly) {
                                     let _ = proxy.send_event(AppEvent::Worker(
                                         WorkerEvent::StreamingClipboardFallback(
-                                            final_state.display_text.clone(),
+                                            prepared_commit.final_text.clone(),
                                         ),
                                     ));
                                 }
@@ -803,14 +794,18 @@ pub(crate) fn streaming_push_to_talk_worker(
                             }
                         };
                         let output_elapsed_ms = output_started_at.elapsed().as_millis();
+                        let release_to_commit_elapsed_ms = release_started_at.elapsed().as_millis();
+                        let first_partial_elapsed_ms = session
+                            .first_partial_at
+                            .map(|instant| instant.duration_since(session.started_at).as_millis());
 
                         runtime
                             .shared_state
-                            .set_last_voice_text(final_state.display_text.clone());
+                            .set_last_voice_text(prepared_commit.final_text.clone());
                         runtime.maintenance.persist_voice_result(VoiceHistoryEntry {
                             timestamp: current_timestamp(),
                             delivery_label: streaming_delivery_label(delivery),
-                            text: final_state.display_text.clone(),
+                            text: prepared_commit.final_text.clone(),
                         });
                         let pipeline_elapsed_ms = session.started_at.elapsed().as_millis();
                         let realtime_factor = if captured_audio_duration_ms > 0 {
@@ -820,20 +815,26 @@ pub(crate) fn streaming_push_to_talk_worker(
                         };
                         tracing::info!(
                             ?delivery,
-                            text = %final_state.display_text,
+                            text = %prepared_commit.final_text,
                             audio_duration_ms = captured_audio_duration_ms,
-                            final_drain_elapsed_ms = prepared_commit.final_drain_elapsed_ms,
+                            first_partial_elapsed_ms,
+                            release_tail_elapsed_ms = release_drain.grace_wait_elapsed_ms,
+                            final_decode_elapsed_ms = prepared_commit.final_decode_elapsed_ms,
                             final_decode_steps = prepared_commit.final_decode_steps,
                             total_decode_steps = session.total_decode_steps,
-                            hotkey_release_wait_elapsed_ms,
                             output_elapsed_ms,
+                            release_to_commit_elapsed_ms,
                             pipeline_elapsed_ms,
                             realtime_factor = format_args!("{realtime_factor:.3}"),
                             "streaming transcription delivered"
                         );
+                        log_streaming_timing_gate_results(
+                            first_partial_elapsed_ms,
+                            release_to_commit_elapsed_ms,
+                        );
 
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFinal(
-                            final_state.display_text,
+                            prepared_commit.final_text,
                         )));
                     }
                 }
@@ -953,14 +954,7 @@ pub(crate) fn probe_streaming_live_session(
         chunk_samples,
         runtime.config.voice.streaming.rewrite_enabled,
     );
-    let final_text = if prepared_commit.final_text.is_empty() {
-        session.state.full_text().to_string()
-    } else {
-        session
-            .state
-            .finalize_from_streaming(&prepared_commit.final_text)
-            .display_text
-    };
+    let final_text = prepared_commit.final_text.clone();
 
     Ok(StreamingLiveProbeReport {
         seconds_requested: seconds.max(1),
@@ -1082,14 +1076,7 @@ pub(crate) fn replay_streaming_wav(
         stream_chunk_num_samples,
         runtime.config.voice.streaming.rewrite_enabled,
     );
-    let final_text = if prepared_commit.final_text.is_empty() {
-        session.state.full_text().to_string()
-    } else {
-        session
-            .state
-            .finalize_from_streaming(&prepared_commit.final_text)
-            .display_text
-    };
+    let final_text = prepared_commit.final_text.clone();
     let final_visible_chars = visible_text_char_count(&final_text);
     let expected_text = expected_text.map(str::to_string);
     let expected_visible_chars = min_visible_chars.or_else(|| {
@@ -1512,10 +1499,12 @@ struct PreparedStreamingCommit {
     final_online_raw_text: String,
     prepared_final_candidate: String,
     display_text_before_final: String,
+    candidate_display_text: String,
     final_text: String,
     commit_source: StreamingCommitSource,
     final_decode_steps: usize,
-    final_drain_elapsed_ms: u128,
+    final_decode_elapsed_ms: u128,
+    rejected_prefix_rewrite: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1535,11 +1524,6 @@ struct PreparedStreamingPartial {
     frozen_chars: usize,
     volatile_chars: usize,
     rejected_prefix_rewrite: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PreparedFastStreamingPartial {
-    display_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1570,10 +1554,10 @@ fn prepare_final_streaming_commit(
     chunk_num_samples: usize,
     rewrite_enabled: bool,
 ) -> PreparedStreamingCommit {
-    let final_drain_started_at = Instant::now();
+    let final_decode_started_at = Instant::now();
     let final_decode_steps =
         finalize_streaming_decode(recognizer, session, sample_rate_hz, chunk_num_samples);
-    let final_drain_elapsed_ms = final_drain_started_at.elapsed().as_millis();
+    let final_decode_elapsed_ms = final_decode_started_at.elapsed().as_millis();
     let final_online_raw_text = recognizer
         .get_result(&session.stream)
         .map(|result| result.text.trim().to_string())
@@ -1581,22 +1565,73 @@ fn prepare_final_streaming_commit(
     let (prepared_final_candidate, candidate_source) =
         prepare_streaming_output_text(&final_online_raw_text, rewrite_enabled, punctuator);
     let display_text_before_final = effective_streaming_display_text(session);
-    let selected_commit = select_final_streaming_commit_text(
+    let resolved_commit = resolve_final_streaming_commit(
+        session,
         &display_text_before_final,
         &prepared_final_candidate,
         candidate_source,
     );
-    let commit_source = selected_commit.source;
-    let final_text = selected_commit.text.to_string();
 
     PreparedStreamingCommit {
         final_online_raw_text,
         prepared_final_candidate,
         display_text_before_final,
+        candidate_display_text: resolved_commit.candidate_display_text,
+        final_text: resolved_commit.final_text,
+        commit_source: resolved_commit.commit_source,
+        final_decode_steps,
+        final_decode_elapsed_ms,
+        rejected_prefix_rewrite: resolved_commit.rejected_prefix_rewrite,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedStreamingCommit {
+    candidate_display_text: String,
+    final_text: String,
+    commit_source: StreamingCommitSource,
+    rejected_prefix_rewrite: bool,
+}
+
+fn resolve_final_streaming_commit(
+    session: &mut StreamingCoreSession,
+    display_text_before_final: &str,
+    prepared_final_candidate: &str,
+    candidate_source: StreamingCommitSource,
+) -> ResolvedStreamingCommit {
+    let display_trimmed = display_text_before_final.trim().to_string();
+    let candidate_trimmed = prepared_final_candidate.trim();
+
+    let (candidate_display_text, rejected_prefix_rewrite) = if candidate_trimmed.is_empty() {
+        (String::new(), false)
+    } else {
+        let mut candidate_state = session.state.clone();
+        let candidate_delta = candidate_state.finalize_from_streaming(candidate_trimmed);
+        if candidate_delta.rejected_prefix_rewrite {
+            (String::new(), true)
+        } else {
+            (
+                merge_rolled_over_prefix(&session.rolled_over_prefix, candidate_state.full_text()),
+                false,
+            )
+        }
+    };
+
+    let selected_commit =
+        select_streaming_commit_text(&display_trimmed, &candidate_display_text, candidate_source);
+    let final_text = selected_commit.text.trim().to_string();
+    let commit_source = if final_text == display_trimmed {
+        StreamingCommitSource::StreamingState
+    } else {
+        selected_commit.source
+    };
+    let _ = session.state.freeze_with_committed_text(&final_text);
+
+    ResolvedStreamingCommit {
+        candidate_display_text,
         final_text,
         commit_source,
-        final_decode_steps,
-        final_drain_elapsed_ms,
+        rejected_prefix_rewrite,
     }
 }
 
@@ -1695,7 +1730,7 @@ fn prepare_fast_streaming_partial(
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
     session: &mut StreamingCoreSession,
     _total_audio_duration_ms: u64,
-) -> Option<PreparedFastStreamingPartial> {
+) -> Option<PreparedStreamingPartial> {
     if !session.last_display_text.is_empty() {
         return None;
     }
@@ -1732,10 +1767,13 @@ fn prepare_fast_streaming_partial(
         return None;
     }
 
-    session.last_fast_preview_text = selected_text.to_string();
-    Some(PreparedFastStreamingPartial {
-        display_text: selected_text.to_string(),
-    })
+    apply_streaming_partial_update(
+        session,
+        &online_raw_text,
+        selected_text,
+        &fast_candidate,
+        "fast_online",
+    )
 }
 
 fn emit_streaming_partial_if_changed(
@@ -1750,9 +1788,25 @@ fn emit_streaming_partial_if_changed(
     if let Some(fast_update) =
         prepare_fast_streaming_partial(recognizer, session, total_audio_duration_ms)
     {
-        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingRawPartial(
-            fast_update.display_text,
-        )));
+        tracing::debug!(
+            samples = session.captured_samples.len(),
+            audio_duration_ms = total_audio_duration_ms,
+            decode_steps = session.total_decode_steps,
+            total_chunks_fed = session.total_chunks_fed,
+            selected_preview_source = fast_update.source,
+            stable_chars = fast_update.stable_chars,
+            frozen_chars = fast_update.frozen_chars,
+            volatile_chars = fast_update.volatile_chars,
+            rejected_frozen_edit = fast_update.rejected_prefix_rewrite,
+            raw_text = %fast_update.raw_text,
+            online_prepared_text = %fast_update.online_prepared_text,
+            prepared_text = %fast_update.display_text,
+            "streaming fast partial updated"
+        );
+        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
+            raw_text: fast_update.raw_text,
+            prepared_text: fast_update.display_text,
+        }));
     }
 
     let Some(update) = update_streaming_partial_state(
@@ -1807,7 +1861,8 @@ fn maybe_apply_streaming_ai_rewrite(
         return Ok(trimmed_preview.to_string());
     }
 
-    let effective_min_visible_chars = effective_ai_rewrite_min_visible_chars(config.min_visible_chars);
+    let effective_min_visible_chars =
+        effective_ai_rewrite_min_visible_chars(config.min_visible_chars);
     let Some(candidate) =
         build_streaming_ai_rewrite_candidate(selected_preview_text, effective_min_visible_chars)
     else {
@@ -2122,6 +2177,9 @@ fn apply_streaming_partial_update(
     session.last_raw_partial = raw_text.to_string();
     session.last_display_text = update.display_text.clone();
     session.last_fast_preview_text = update.display_text.clone();
+    if session.first_partial_at.is_none() && !update.display_text.trim().is_empty() {
+        session.first_partial_at = Some(Instant::now());
+    }
     session.partial_updates += 1;
 
     Some(PreparedStreamingPartial {
@@ -2384,49 +2442,6 @@ fn select_streaming_commit_text<'a>(
     selected_candidate
 }
 
-fn select_final_streaming_commit_text<'a>(
-    display_text: &'a str,
-    final_candidate: &'a str,
-    final_candidate_source: StreamingCommitSource,
-) -> StreamingCommitChoice<'a> {
-    let display_trimmed = display_text.trim();
-    let candidate_trimmed = final_candidate.trim();
-    if !display_trimmed.is_empty() {
-        if !candidate_trimmed.is_empty() && candidate_trimmed.starts_with(display_trimmed) {
-            let suffix = &candidate_trimmed[display_trimmed.len()..];
-            let suffix_chars = suffix.chars().count();
-            if suffix_chars > 0 && suffix_chars <= 4 {
-                return StreamingCommitChoice {
-                    source: final_candidate_source,
-                    text: candidate_trimmed,
-                };
-            }
-        }
-        if !candidate_trimmed.is_empty() {
-            let display_visible = visible_text_char_count(display_trimmed);
-            let candidate_visible = visible_text_char_count(candidate_trimmed);
-            let common_prefix_chars = longest_common_prefix_chars(display_trimmed, candidate_trimmed);
-            let visible_gap = display_visible.abs_diff(candidate_visible);
-            if candidate_visible >= display_visible
-                && common_prefix_chars + STREAMING_FINAL_SIMILAR_TAIL_MARGIN_CHARS
-                    >= display_visible.min(candidate_visible)
-                && visible_gap <= 2
-            {
-                return StreamingCommitChoice {
-                    source: final_candidate_source,
-                    text: candidate_trimmed,
-                };
-            }
-        }
-        return StreamingCommitChoice {
-            source: StreamingCommitSource::StreamingState,
-            text: display_trimmed,
-        };
-    }
-
-    select_streaming_commit_text(display_trimmed, candidate_trimmed, final_candidate_source)
-}
-
 fn is_segment_only_streaming_candidate(current_display: &str, candidate_text: &str) -> bool {
     let (frozen_prefix, _) = split_frozen_prefix(current_display.trim());
     can_append_segment_only_candidate(candidate_text, &frozen_prefix)
@@ -2677,6 +2692,43 @@ fn current_timestamp() -> String {
     now.to_string()
 }
 
+fn log_streaming_timing_gate_results(
+    first_partial_elapsed_ms: Option<u128>,
+    release_to_commit_elapsed_ms: u128,
+) {
+    if let Some(first_partial_elapsed_ms) = first_partial_elapsed_ms {
+        let gate_status = if first_partial_elapsed_ms <= STREAMING_FIRST_PARTIAL_TARGET_MS {
+            "target_pass"
+        } else if first_partial_elapsed_ms <= STREAMING_FIRST_PARTIAL_HARD_MS {
+            "hard_pass"
+        } else {
+            "hard_fail"
+        };
+        tracing::info!(
+            first_partial_elapsed_ms,
+            target_ms = STREAMING_FIRST_PARTIAL_TARGET_MS,
+            hard_ms = STREAMING_FIRST_PARTIAL_HARD_MS,
+            gate_status,
+            "streaming first-partial timing gate evaluated"
+        );
+    }
+
+    let gate_status = if release_to_commit_elapsed_ms <= STREAMING_RELEASE_TO_COMMIT_TARGET_MS {
+        "target_pass"
+    } else if release_to_commit_elapsed_ms <= STREAMING_RELEASE_TO_COMMIT_HARD_MS {
+        "hard_pass"
+    } else {
+        "hard_fail"
+    };
+    tracing::info!(
+        release_to_commit_elapsed_ms,
+        target_ms = STREAMING_RELEASE_TO_COMMIT_TARGET_MS,
+        hard_ms = STREAMING_RELEASE_TO_COMMIT_HARD_MS,
+        gate_status,
+        "streaming release-to-commit timing gate evaluated"
+    );
+}
+
 fn delivery_label(delivery: OutputDelivery) -> &'static str {
     match delivery {
         OutputDelivery::DirectPaste => "voice_direct_paste",
@@ -2784,11 +2836,9 @@ mod tests {
     use super::{
         AudioActivity, StreamingCommitSource, StreamingResampler, analyze_recent_audio_activity,
         build_streaming_ai_rewrite_candidate, effective_ai_rewrite_min_visible_chars,
-        ensure_terminal_sentence_boundary,
-        merge_rolled_over_prefix, prepare_streaming_output_text,
+        ensure_terminal_sentence_boundary, merge_rolled_over_prefix, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
-        sanitize_ai_rewrite_output, select_final_streaming_commit_text,
-        select_streaming_commit_text, select_streaming_preview_text,
+        sanitize_ai_rewrite_output, select_streaming_commit_text, select_streaming_preview_text,
         should_drop_streaming_preview_result, should_skip_streaming_preview,
         strip_trailing_terminal_sentence_punctuation,
     };
@@ -2955,50 +3005,6 @@ mod tests {
     }
 
     #[test]
-    fn final_commit_prefers_hud_display_text_when_present() {
-        let selected = select_final_streaming_commit_text(
-            "第一句已经稳定。第二句 HUD 已经改好了",
-            "第二句最终模型候选",
-            StreamingCommitSource::OnlineFinal,
-        );
-        assert_eq!(selected.source, StreamingCommitSource::StreamingState);
-        assert_eq!(selected.text, "第一句已经稳定。第二句 HUD 已经改好了");
-    }
-
-    #[test]
-    fn final_commit_accepts_short_same_stream_suffix_extension() {
-        let selected = select_final_streaming_commit_text(
-            "我有一个问",
-            "我有一个问题",
-            StreamingCommitSource::OnlineFinal,
-        );
-        assert_eq!(selected.source, StreamingCommitSource::OnlineFinal);
-        assert_eq!(selected.text, "我有一个问题");
-    }
-
-    #[test]
-    fn final_commit_accepts_similar_tail_when_candidate_is_one_char_longer() {
-        let selected = select_final_streaming_commit_text(
-            "最后一个字总会漏",
-            "最后一个字总会漏掉",
-            StreamingCommitSource::OnlineFinal,
-        );
-        assert_eq!(selected.source, StreamingCommitSource::OnlineFinal);
-        assert_eq!(selected.text, "最后一个字总会漏掉");
-    }
-
-    #[test]
-    fn final_commit_keeps_display_when_candidate_regresses_to_shorter_text() {
-        let selected = select_final_streaming_commit_text(
-            "我有一个问题",
-            "我有一个问",
-            StreamingCommitSource::OnlineFinal,
-        );
-        assert_eq!(selected.source, StreamingCommitSource::StreamingState);
-        assert_eq!(selected.text, "我有一个问题");
-    }
-
-    #[test]
     fn ensure_terminal_sentence_boundary_adds_full_stop_when_missing() {
         assert_eq!(
             ensure_terminal_sentence_boundary("第一句还没结束"),
@@ -3042,5 +3048,3 @@ mod tests {
         assert!(!output.is_empty());
     }
 }
-
-

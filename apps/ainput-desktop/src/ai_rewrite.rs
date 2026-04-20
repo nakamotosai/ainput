@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use ainput_output::{OutputContextKind, OutputContextSnapshot};
 use ainput_shell::StreamingAiRewriteConfig;
-use anyhow::{anyhow, Context, Result};
-use reqwest::blocking::Client;
+use anyhow::{Context, Result, anyhow};
 use reqwest::Url;
+use reqwest::blocking::Client;
 use serde::Serialize;
 
 const AI_REWRITE_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
@@ -564,8 +564,8 @@ fn short_log_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_user_prompt, openai_reasoning_effort, take_last_chars, AiRewriteRequest,
-        OutputContextKind, OutputContextSnapshot,
+        AiRewriteRequest, OutputContextKind, OutputContextSnapshot, build_user_prompt,
+        openai_reasoning_effort, take_last_chars,
     };
 
     #[test]

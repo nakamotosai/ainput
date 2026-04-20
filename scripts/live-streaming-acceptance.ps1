@@ -10,7 +10,7 @@ Set-Location $repoRoot
 
 if ([string]::IsNullOrWhiteSpace($ExePath)) {
     if ([string]::IsNullOrWhiteSpace($Version)) {
-        throw "必须提供 -ExePath 或 -Version，例如：.\scripts\live-streaming-acceptance.ps1 -Version 1.0.0-preview.3"
+        throw "必须提供 -ExePath 或 -Version，例如：.\scripts\live-streaming-acceptance.ps1 -Version 1.0.0-preview.24"
     }
     $ExePath = Join-Path $repoRoot ("dist\ainput-" + $Version + "\ainput-desktop.exe")
 }
@@ -46,7 +46,7 @@ Write-Host "exe: $ExePath"
 Write-Host "runtime root: $runtimeRoot"
 Write-Host ""
 Write-Host "请先启动这个 preview 包，然后按下面句子逐条验收。"
-Write-Host "每一轮都按住 Alt+Z 说完整句，松手确认已上屏，再回来按回车继续。"
+Write-Host "每一轮都按住 Ctrl 说完整句，松手确认已上屏，再回来按回车继续。"
 Write-Host ""
 
 $reportLines = @(

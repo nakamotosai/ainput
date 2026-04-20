@@ -59,7 +59,10 @@ fn main() {
     ainput_recording::configure_dpi_awareness();
     if let Err(error) = try_main() {
         tracing::error!(error = %error, "ainput startup failed");
-        show_error_dialog("ainput 启动失败", &format!("ainput 没有成功启动。\n\n{}", error));
+        show_error_dialog(
+            "ainput 启动失败",
+            &format!("ainput 没有成功启动。\n\n{}", error),
+        );
     }
 }
 
@@ -68,7 +71,7 @@ fn try_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.get(1).map(String::as_str) == Some("transcribe-wav") {
-        let runtime = build_runtime(&bootstrap)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let wav_path = args
             .get(2)
             .ok_or_else(|| anyhow!("usage: ainput-desktop transcribe-wav <path-to-wav>"))?;
@@ -80,7 +83,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("transcribe-streaming-wav") {
-        let runtime = build_runtime(&bootstrap)?;
+        let runtime = build_runtime(&bootstrap, true)?;
         let wav_path = args.get(2).ok_or_else(|| {
             anyhow!("usage: ainput-desktop transcribe-streaming-wav <path-to-wav>")
         })?;
@@ -100,7 +103,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("record-once") {
-        let runtime = build_runtime(&bootstrap)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let seconds = args
             .get(2)
             .map(String::as_str)
@@ -121,7 +124,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("test-ai-rewrite") {
-        let runtime = build_runtime(&bootstrap)?;
+        let runtime = build_runtime(&bootstrap, true)?;
         let current_tail = args.get(2).ok_or_else(|| {
             anyhow!("usage: ainput-desktop test-ai-rewrite <current-tail> [frozen-prefix]")
         })?;
@@ -145,7 +148,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("probe-streaming-live") {
-        let runtime = build_runtime(&bootstrap)?;
+        let runtime = build_runtime(&bootstrap, true)?;
         let seconds = args
             .get(2)
             .and_then(|value| value.parse::<u64>().ok())
@@ -157,7 +160,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("replay-streaming-wav") {
-        let runtime = build_runtime(&bootstrap)?;
+        let runtime = build_runtime(&bootstrap, true)?;
         let wav_path = args.get(2).ok_or_else(|| {
             anyhow!("usage: ainput-desktop replay-streaming-wav <path-to-wav> [expected-text]")
         })?;
@@ -178,7 +181,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("replay-streaming-manifest") {
-        let runtime = build_runtime(&bootstrap)?;
+        let runtime = build_runtime(&bootstrap, true)?;
         let manifest_path = args.get(2).ok_or_else(|| {
             anyhow!("usage: ainput-desktop replay-streaming-manifest <manifest.json>")
         })?;
@@ -259,7 +262,10 @@ fn emit_json_report<T: Serialize>(report: &T) -> Result<()> {
 }
 
 fn run_desktop_app(bootstrap: ainput_shell::Bootstrap) -> Result<()> {
-    let runtime = build_runtime(&bootstrap)?;
+    let runtime = build_runtime(
+        &bootstrap,
+        bootstrap.config.voice.mode == ainput_shell::VoiceMode::Streaming,
+    )?;
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -278,9 +284,10 @@ fn run_desktop_app(bootstrap: ainput_shell::Bootstrap) -> Result<()> {
     Ok(())
 }
 
-fn build_runtime(bootstrap: &ainput_shell::Bootstrap) -> Result<AppRuntime> {
-    ensure_local_ai_rewrite_backend_ready(bootstrap)?;
-
+fn build_runtime(
+    bootstrap: &ainput_shell::Bootstrap,
+    prepare_streaming_ai_rewrite: bool,
+) -> Result<AppRuntime> {
     let output_controller = Arc::new(ainput_output::OutputController::new(
         &bootstrap.runtime_paths.root_dir,
     )?);
@@ -290,33 +297,10 @@ fn build_runtime(bootstrap: &ainput_shell::Bootstrap) -> Result<AppRuntime> {
         bootstrap.config.voice.history_file_name.clone(),
         bootstrap.config.voice.history_limit,
     );
-    let ai_rewriter = match ai_rewrite::AiRewriteClient::from_config(
-        &bootstrap.config.voice.streaming.ai_rewrite,
-    ) {
-        Ok(client) => {
-            let client = client.map(Arc::new);
-            if let Some(ai_rewriter) = &client {
-                tracing::info!(
-                    endpoint_url = %bootstrap.config.voice.streaming.ai_rewrite.endpoint_url,
-                    model = %bootstrap.config.voice.streaming.ai_rewrite.model,
-                    "local AI rewrite client enabled"
-                );
-                let prewarm_client = Arc::clone(ai_rewriter);
-                thread::spawn(move || {
-                    if let Err(error) = prewarm_client.prewarm() {
-                        tracing::warn!(error = %error, "streaming AI rewrite warmup failed");
-                    }
-                });
-            }
-            client
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "failed to initialize local AI rewrite client; keeping streaming fallback path"
-            );
-            None
-        }
+    let ai_rewriter = if prepare_streaming_ai_rewrite {
+        try_prepare_streaming_ai_rewriter(&bootstrap.config.voice.streaming.ai_rewrite)
+    } else {
+        None
     };
 
     Ok(AppRuntime {
@@ -329,8 +313,51 @@ fn build_runtime(bootstrap: &ainput_shell::Bootstrap) -> Result<AppRuntime> {
     })
 }
 
-fn ensure_local_ai_rewrite_backend_ready(bootstrap: &ainput_shell::Bootstrap) -> Result<()> {
-    let ai_config = &bootstrap.config.voice.streaming.ai_rewrite;
+fn try_prepare_streaming_ai_rewriter(
+    ai_config: &ainput_shell::StreamingAiRewriteConfig,
+) -> Option<Arc<ai_rewrite::AiRewriteClient>> {
+    if !ai_config.enabled {
+        return None;
+    }
+
+    if let Err(error) = ensure_local_ai_rewrite_backend_ready(ai_config) {
+        tracing::warn!(
+            error = %error,
+            "failed to prepare streaming AI rewrite backend; keeping streaming fallback path"
+        );
+        return None;
+    }
+
+    match ai_rewrite::AiRewriteClient::from_config(ai_config) {
+        Ok(Some(ai_rewriter)) => {
+            let ai_rewriter = Arc::new(ai_rewriter);
+            tracing::info!(
+                endpoint_url = %ai_config.endpoint_url,
+                model = %ai_config.model,
+                "streaming AI rewrite client enabled"
+            );
+            let prewarm_client = Arc::clone(&ai_rewriter);
+            thread::spawn(move || {
+                if let Err(error) = prewarm_client.prewarm() {
+                    tracing::warn!(error = %error, "streaming AI rewrite warmup failed");
+                }
+            });
+            Some(ai_rewriter)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to initialize streaming AI rewrite client; keeping streaming fallback path"
+            );
+            None
+        }
+    }
+}
+
+fn ensure_local_ai_rewrite_backend_ready(
+    ai_config: &ainput_shell::StreamingAiRewriteConfig,
+) -> Result<()> {
     if !ai_config.enabled {
         return Ok(());
     }
@@ -385,8 +412,9 @@ fn ensure_local_ai_rewrite_backend_ready(bootstrap: &ainput_shell::Bootstrap) ->
 }
 
 fn local_ollama_tags_url(endpoint_url: &str) -> Result<Option<Url>> {
-    let url = Url::parse(endpoint_url.trim())
-        .with_context(|| format!("parse voice.streaming.ai_rewrite.endpoint_url: {endpoint_url}"))?;
+    let url = Url::parse(endpoint_url.trim()).with_context(|| {
+        format!("parse voice.streaming.ai_rewrite.endpoint_url: {endpoint_url}")
+    })?;
     let host = url.host_str().unwrap_or_default();
     let is_local_ollama =
         matches!(host, "127.0.0.1" | "localhost") && url.port_or_known_default() == Some(11434);
@@ -715,6 +743,7 @@ impl DesktopApp {
             return;
         }
 
+        self.ensure_streaming_ai_rewrite_ready();
         let runtime = self.runtime.clone();
         let proxy = self.proxy.clone();
         let shutdown = self.shutdown.clone();
@@ -747,6 +776,15 @@ impl DesktopApp {
             };
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Unavailable(message)));
         });
+    }
+
+    fn ensure_streaming_ai_rewrite_ready(&mut self) {
+        if self.runtime.ai_rewriter.is_some() {
+            return;
+        }
+
+        self.runtime.ai_rewriter =
+            try_prepare_streaming_ai_rewriter(&self.runtime.config.voice.streaming.ai_rewrite);
     }
 
     fn start_overlay_tick_once(&mut self) {
@@ -965,30 +1003,11 @@ impl DesktopApp {
         "状态：流式语音识别中"
     }
 
-    fn streaming_listening_message(&self) -> String {
-        "请说话".to_string()
-    }
-
-    fn streaming_raw_partial_message(text: &str) -> Option<String> {
-        let message = text.trim();
-        if message.is_empty() {
-            None
-        } else {
-            Some(message.to_string())
-        }
-    }
-
-    fn streaming_partial_message(raw_text: &str, prepared_text: &str) -> Option<String> {
+    fn streaming_partial_message(prepared_text: &str) -> Option<String> {
         let message = prepared_text.trim();
         if !message.is_empty() {
             return Some(message.to_string());
         }
-
-        let fallback = raw_text.trim();
-        if !fallback.is_empty() {
-            return Some(fallback.to_string());
-        }
-
         None
     }
 
@@ -1073,11 +1092,6 @@ impl DesktopApp {
             ainput_shell::VoiceMode::Fast => self.start_fast_worker_once(),
             ainput_shell::VoiceMode::Streaming => self.start_streaming_worker_once(),
         }
-    }
-
-    fn prewarm_all_voice_workers(&mut self) {
-        self.start_fast_worker_once();
-        self.start_streaming_worker_once();
     }
 
     fn show_streaming_status_overlay(
@@ -1809,7 +1823,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
         }
 
         self.start_overlay_tick_once();
-        self.prewarm_all_voice_workers();
+        self.prewarm_current_voice_worker();
         if self.hotkey_monitor.is_none() {
             match hotkey::GlobalHotkeyMonitor::start(
                 self.proxy.clone(),
@@ -1832,10 +1846,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     ));
                     show_error_dialog(
                         "ainput 热键初始化失败",
-                        &format!(
-                            "快捷键注册失败，ainput 当前不能正常使用。\n\n{}",
-                            error
-                        ),
+                        &format!("快捷键注册失败，ainput 当前不能正常使用。\n\n{}", error),
                     );
                     return;
                 }
@@ -1918,19 +1929,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 0);
                     self.set_tray_status(self.streaming_status_text());
-                    self.show_streaming_status_overlay(
-                        &self.streaming_listening_message(),
-                        true,
-                        false,
-                    );
-                }
-                WorkerEvent::StreamingRawPartial(text) => {
-                    self.mode = AppMode::Voice;
-                    self.set_tray_visual_state(TrayVisualState::Voice, 0);
-                    self.set_tray_status("状态：流式实时识别中");
-                    if let Some(message) = Self::streaming_raw_partial_message(&text) {
-                        self.show_streaming_status_overlay(&message, true, true);
-                    }
+                    self.clear_streaming_status_overlay();
                 }
                 WorkerEvent::StreamingPartial {
                     raw_text,
@@ -1939,9 +1938,8 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 0);
                     self.set_tray_status("状态：流式实时识别中");
-                    if let Some(message) =
-                        Self::streaming_partial_message(&raw_text, &prepared_text)
-                    {
+                    let _ = raw_text;
+                    if let Some(message) = Self::streaming_partial_message(&prepared_text) {
                         self.show_streaming_status_overlay(&message, true, true);
                     }
                 }
@@ -1988,11 +1986,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                                 self.mode = AppMode::Voice;
                                 self.set_tray_visual_state(TrayVisualState::Voice, 0);
                                 self.set_tray_status(self.streaming_status_text());
-                                self.show_streaming_status_overlay(
-                                    &self.streaming_listening_message(),
-                                    true,
-                                    false,
-                                );
+                                self.clear_streaming_status_overlay();
                                 let _ = self
                                     .send_streaming_worker_command(WorkerCommand::HotkeyPressed);
                             }
@@ -3416,14 +3410,10 @@ mod tests {
     #[test]
     fn streaming_partial_message_prefers_text_and_skips_empty_preview() {
         assert_eq!(
-            DesktopApp::streaming_partial_message("", "  已经识别出来了 "),
+            DesktopApp::streaming_partial_message("  已经识别出来了 "),
             Some("已经识别出来了".to_string())
         );
-        assert_eq!(
-            DesktopApp::streaming_partial_message("原始预览", "   "),
-            Some("原始预览".to_string())
-        );
-        assert_eq!(DesktopApp::streaming_partial_message(" ", "\t"), None);
+        assert_eq!(DesktopApp::streaming_partial_message("   "), None);
+        assert_eq!(DesktopApp::streaming_partial_message("\t"), None);
     }
 }
-

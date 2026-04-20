@@ -205,7 +205,7 @@ impl Default for StreamingVoiceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            model_dir: "models/streaming-zipformer-small-bilingual-zh-en".to_string(),
+            model_dir: "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en".to_string(),
             panel_enabled: true,
             rewrite_enabled: true,
             punctuation_model_dir:
@@ -805,7 +805,7 @@ model_dir = "{streaming_model_dir}"
 # 是否显示流式语音面板。
 panel_enabled = {streaming_panel_enabled}
 
-# 是否启用流式短句整理。
+# 是否启用流式本地短句整理。
 rewrite_enabled = {streaming_rewrite_enabled}
 
 # 流式标点模型目录。
@@ -819,19 +819,20 @@ punctuation_num_threads = {streaming_punctuation_num_threads}
 chunk_ms = {streaming_chunk_ms}
 
 [voice.streaming.ai_rewrite]
-# 是否启用本地 AI 实时改写。
+# 是否启用实验性 AI 尾巴改写。
+# 默认关闭，不属于默认热路径。
 # 只会改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
 enabled = {streaming_ai_rewrite_enabled}
 
-# 本地 OpenAI 兼容接口地址。
-# 例如 llama.cpp server、vLLM 或别的本地兼容服务。
+# 可选：OpenAI 兼容改写服务地址。
+# 默认占位值是本地地址；只有手动打开 enabled 才会使用。
 endpoint_url = "{streaming_ai_rewrite_endpoint_url}"
 
 # 改写模型名称。
 model = "{streaming_ai_rewrite_model}"
 
 # 可选：从哪个环境变量读取 API Key。
-# 纯本地服务通常留空即可。
+# 纯本地服务通常留空；云端实验时再配置。
 api_key_env = "{streaming_ai_rewrite_api_key_env}"
 
 # 单次 AI 改写超时（毫秒）。

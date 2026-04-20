@@ -67,16 +67,21 @@ impl StreamingState {
     pub(crate) fn finalize_from_streaming(&mut self, final_text: &str) -> StreamingDelta {
         let trimmed = final_text.trim();
         let stable_chars = longest_common_prefix_chars(&self.display_text, trimmed);
-        let (frozen_prefix, volatile_sentence) = if trimmed.is_empty() {
-            (self.frozen_prefix.clone(), self.volatile_sentence.clone())
-        } else if match_candidate_after_frozen_prefix(trimmed, &self.frozen_prefix).is_some() {
-            split_frozen_prefix(trimmed)
+        if trimmed.is_empty() {
+            return self.snapshot_delta(stable_chars, false);
+        }
+
+        let next_volatile_sentence = if let Some(remainder) =
+            match_candidate_after_frozen_prefix(trimmed, &self.frozen_prefix)
+        {
+            remainder.to_string()
         } else if can_append_segment_only_candidate(trimmed, &self.frozen_prefix) {
-            (self.frozen_prefix.clone(), trimmed.to_string())
+            trimmed.to_string()
         } else {
-            split_frozen_prefix(trimmed)
+            return self.snapshot_delta(stable_chars, true);
         };
-        self.set_segments(frozen_prefix, volatile_sentence);
+
+        self.set_segments(self.frozen_prefix.clone(), next_volatile_sentence);
         self.snapshot_delta(stable_chars, false)
     }
 
@@ -307,13 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn finalize_from_streaming_keeps_latest_sentence_visible() {
+    fn finalize_from_streaming_updates_latest_sentence_without_freezing_prefix() {
         let mut state = StreamingState::default();
         state.apply_online_partial("第一句已经稳定。第二句先是错字");
         let delta = state.finalize_from_streaming("第一句已经稳定。第二句已经修正。");
         assert_eq!(delta.display_text, "第一句已经稳定。第二句已经修正。");
-        assert_eq!(state.frozen_prefix, "第一句已经稳定。第二句已经修正。");
-        assert_eq!(state.volatile_sentence, "");
+        assert_eq!(state.frozen_prefix, "第一句已经稳定。");
+        assert_eq!(state.volatile_sentence, "第二句已经修正。");
     }
 
     #[test]
@@ -337,6 +342,17 @@ mod tests {
         assert_eq!(delta.display_text, "第一句已经稳定。第二句已经修正。");
         assert_eq!(state.frozen_prefix, "第一句已经稳定。");
         assert_eq!(state.volatile_sentence, "第二句已经修正。");
+    }
+
+    #[test]
+    fn final_candidate_cannot_rewrite_existing_frozen_prefix() {
+        let mut state = StreamingState::default();
+        state.apply_online_partial("第一句已经稳定。第二句继续");
+        let delta = state.finalize_from_streaming("第一行已经稳定。第二句最终修正。");
+        assert!(delta.rejected_prefix_rewrite);
+        assert_eq!(delta.display_text, "第一句已经稳定。第二句继续");
+        assert_eq!(state.frozen_prefix, "第一句已经稳定。");
+        assert_eq!(state.volatile_sentence, "第二句继续");
     }
 
     #[test]

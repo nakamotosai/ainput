@@ -2,21 +2,23 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.23`
+当前预览版本：`1.0.0-preview.24`
+
+本 README 是本项目唯一当前进度标准。
 
 ## 当前预览重点
 
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
 - `流式语音识别` 现在固定走“在线 partial + 最近一句局部修正 + HUD 即最终结果”的单链路，不再把整段离线 rescore 伪装成流式最终提交。
-- `1.0.0-preview.23` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
+- `1.0.0-preview.24` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
 - 流式模式的 HUD 继续保持“只显示文字本身”的单行面板，并保留原有位置、热加载参数和占位符保护。
-- AI 改写已经从本地 Ollama 切到云端 OpenAI-compatible 接口，默认模型是 `openai/gpt-oss-20b`。
-- 松开热键后，worker 会给最后一轮 AI 改写一个短等待窗口，并在真正上屏前再同步一次 HUD，重点收口“最后一个字容易丢”和“HUD 与最终上屏不一致”。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.23\` 与 `dist\ainput-1.0.0-preview.23.zip`。
+- 默认热路径已经收回“本地流式识别 + 本地轻整理 + HUD/最终提交同一状态机”，不再要求外网 AI 改写才能用核心模式。
+- AI rewrite 保留为实验性尾巴改写能力，默认关闭，也不再在 `fast` 模式启动时预热。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.24\` 与 `dist\ainput-1.0.0-preview.24.zip`。
 
-它不做系统级 IME。当前主识别链路仍是本地离线模型；只有 AI 改写默认走云端接口。当前重点是把四条前台主链路做稳：
+它不做系统级 IME。当前默认热路径全部走本地；AI rewrite 只是可选实验链路。当前重点是把四条前台主链路做稳：
 
 1. 按住语音热键开始录音，松开后离线识别并把文本送进当前输入区
 1. 语音支持 `极速语音识别 / 流式语音识别` 双模式，直接从托盘一级菜单切换
@@ -28,7 +30,8 @@
 当前默认热键：
 
 - 自动化暂停 / 继续：`F7`
-- 语音：`Alt+Z`
+- 极速语音：`Alt+Z`
+- 流式按住说话：`Ctrl`
 - 截图：`Alt+X`
 - 录屏开始框选 / 开始录制：`F1`
 - 录屏停止并导出：`F2`
@@ -53,11 +56,11 @@
   - `极速语音识别` 保留原有 `SenseVoice` 离线整段识别
   - `流式语音识别` 使用本地 `sherpa-onnx-streaming-paraformer-bilingual-zh-en` 作为在线流式识别主模型
   - 流式模式按住热键时显示 HUD 面板
-  - 流式模式按住时持续显示流式文字，并默认接入云端 AI 对“最新尾巴”做实时改写
+  - 流式模式按住时持续显示流式文字，默认只走本地识别 + 本地轻整理
   - 流式模式会持续喂入在线音频块，并以“冻结前缀 + 最新一句”共享状态驱动 HUD 和最终提交
   - 默认流式块时长已压到 `60ms`，用于缩短 HUD 首字和增量刷新延迟
   - 流式模式的标点主链来自官方 `ct-transformer` 标点模型；模型缺失时只降级为无标点，不再让整个流式功能启动失败
-  - 云端 AI 改写服务不可用时，只降级回当前轻整理链路，不影响流式识别继续使用
+  - 可选实验 AI rewrite 只允许改“最新尾巴”；服务不可用时只降级回当前轻整理链路
   - HUD 默认停靠在屏幕正下方、任务栏上方
   - 可从托盘右键菜单直接打开 `HUD 参数文档`
   - `config\hud-overlay.toml` 保存后会自动热加载
@@ -183,8 +186,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.0-preview.23\
-dist\ainput-1.0.0-preview.23.zip
+dist\ainput-1.0.0-preview.24\
+dist\ainput-1.0.0-preview.24.zip
 ```
 
 说明：
@@ -222,10 +225,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 #### 流式语音识别
 
 - 在托盘一级菜单切到 `流式语音识别`
-- 按住 `Alt+Z`
+- 按住 `Ctrl`
 - 说话时屏幕正下方 HUD 只显示当前识别文字
 - 如果你正在编辑 `config\hud-overlay.toml`，保存后 HUD 会立刻刷新
-- 松开后程序会收尾、整理整段内容，再一次性写入当前输入框
+- 松开后程序会快速收尾，并把 HUD 当前文本直接提交到输入框
 - 如果直贴失败，会按配置退回到剪贴板
 - 如果想调字号、颜色、宽度或位置，直接在托盘右键点 `打开 HUD 参数文档`
 
@@ -424,33 +427,34 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.23\`
-- 默认启动模式已经切到 `流式语音识别`
-- 当前流式主链是：`Paraformer bilingual zh-en + 官方标点 + HUD 实时显示 + 云端尾巴改写`
-- 默认 AI 改写后端是 `https://integrate.api.nvidia.com/v1/chat/completions`
-- 默认 AI 改写模型是 `openai/gpt-oss-20b`
-- Windows 用户环境变量 `AINPUT_AI_REWRITE_API_KEY` 已经配置到当前测试机
-- `preview.23` 已经完成真机打包，并能从便携目录启动
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.24\`
+- 默认启动模式是 `极速语音识别`
+- 当前流式主链是：`Paraformer bilingual zh-en + 官方标点 + HUD 实时显示 + 尾巴局部修正 + HUD 所见即最终提交`
+- 默认热路径不依赖外网；实验 AI rewrite 默认 `enabled = false`
+- 默认实验 AI rewrite 占位端点是 `http://127.0.0.1:8080/v1/chat/completions`
+- 默认实验 AI rewrite 模型是 `Qwen3-0.6B`
+- `preview.24` 是当前已完成真机打包和固定 wav 回归的新便携版
+- 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
-## 本轮收口验证
+## 本轮收口验证（2026-04-21）
 
-- Windows 真机 `cargo build -p ainput-desktop --release` 已通过
-- Windows 真机 `cargo test -p ainput-desktop final_commit_ --release` 已通过
-- 已成功打包 `dist\ainput-1.0.0-preview.23\` 和 `dist\ainput-1.0.0-preview.23.zip`
-- 已从 `preview.23` 目录真实启动 `ainput-desktop.exe`
-- 启动日志已确认：
-  - 流式 AI 改写客户端已启用
-  - 改写端点是 `integrate.api.nvidia.com`
-  - 改写模型是 `openai/gpt-oss-20b`
-  - 流式 ASR 模型已切到 `streaming-paraformer-bilingual-zh-en`
-  - AI 改写预热请求已成功返回
+- Windows 真机 `cargo fmt --all` 已通过
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop streaming_` 已通过
+- Windows 真机 `cargo test -p ainput-shell streaming_ai_rewrite_` 已通过
+- Windows 真机 `powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1` 已通过
+- Windows 真机 `powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1 -Version 1.0.0-preview.24` 已通过
+- Windows 真机 `.\dist\ainput-1.0.0-preview.24\ainput-desktop.exe bootstrap` 已通过
+- Windows 真机 `python .\scripts\readme_closeout_guard.py .` 已通过
+- 已成功打包 `dist\ainput-1.0.0-preview.24\` 和 `dist\ainput-1.0.0-preview.24.zip`
 
-## 当前已知取舍
+## 当前边界
 
 - 当前默认还是 `CPU` 推理，不走 GPU
-- 当前 AI 改写默认依赖外网和云端接口；如果网络不可用或 key 失效，会降级回无 AI 改写
+- 默认热路径已经不依赖外网；若手动开启实验 AI rewrite，服务不可用时会降级回无 AI 改写
 - 当前 AI 改写只处理“冻结前缀之后的最新尾巴”，不是对整段全文做大模型重写
-- `HUD 即最终结果` 已经尽量收口，但最后几个字、停顿边界和少数应用里的粘贴时机仍然需要继续靠真实前台使用打磨
+- `HUD 即最终结果` 已经做成同一状态机，但最后几个字、停顿边界和少数应用里的粘贴时机仍然需要继续靠真实前台使用打磨
+- `scripts\live-streaming-acceptance.ps1` 仍然是人工热键验收，不是无人值守自动化
 - 语音热键与截图热键已经可配置，但当前仍以编辑 `ainput.toml` 为主
 - 截图热键走 Windows 原生 `RegisterHotKey`
 - 语音为了保留“按住说话/松开停止”的行为，仍需要低层按键监听配合
@@ -461,7 +465,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 
 ## 仓库卫生要求
 
-- 根 `README.md` 是当前项目状态的唯一真相源
+- 根 `README.md` 是唯一当前进度标准
 - 每次影响前台体验、模型、默认配置、发包版本或验收方式的改动，都要同步回写这里
 - 发包收口默认要求同时满足：
   - 相关代码已验证
@@ -510,15 +514,22 @@ cargo build --release -p ainput-desktop
 
 正式版不会弹黑色命令行窗口。
 
+推荐直接用发包脚本按当前工作区版本产出便携包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
+```
+
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.0-preview.23\`
-- `dist\ainput-1.0.0-preview.23.zip`
+- `dist\ainput-1.0.0-preview.24\`
+- `dist\ainput-1.0.0-preview.24.zip`
 
 发包前门禁：
 
-- `.\scripts\streaming-regression.ps1 -Version 1.0.0-preview.23`
-- `.\scripts\live-streaming-acceptance.ps1 -Version 1.0.0-preview.23`
+- `.\scripts\streaming-regression.ps1 -Version 1.0.0-preview.24`
+- `.\scripts\live-streaming-acceptance.ps1 -Version 1.0.0-preview.24`
+- `python .\scripts\readme_closeout_guard.py .`
 
 ## 项目结构
 

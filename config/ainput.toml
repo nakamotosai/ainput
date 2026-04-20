@@ -66,7 +66,7 @@ model_dir = "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 # 是否显示流式语音面板。
 panel_enabled = true
 
-# 是否启用流式文本整理。
+# 是否启用流式本地短句整理。
 rewrite_enabled = true
 
 # 流式标点模型目录。
@@ -80,33 +80,36 @@ punctuation_num_threads = 1
 chunk_ms = 60
 
 [voice.streaming.ai_rewrite]
-# 是否启用 AI 实时改写。
-enabled = true
+# 是否启用实验性 AI 尾巴改写。
+# 默认关闭，不属于默认热路径。
+# 只允许改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
+enabled = false
 
-# 云端 OpenAI 兼容改写服务地址。
-endpoint_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+# 可选：OpenAI 兼容改写服务地址。
+# 默认占位值是本地地址；只有手动打开 enabled 才会使用。
+endpoint_url = "http://127.0.0.1:8080/v1/chat/completions"
 
-# 改写模型。
-model = "openai/gpt-oss-20b"
+# 改写模型名称。
+model = "Qwen3-0.6B"
 
-# 鉴权环境变量名。
-api_key_env = "AINPUT_AI_REWRITE_API_KEY"
+# 可选：鉴权环境变量名。
+# 纯本地服务通常留空；云端实验时再配置。
+api_key_env = ""
 
-# 单次改写请求超时（毫秒）。
-# 云端接口正常情况下会更快，但仍给足一点尾部缓冲。
-timeout_ms = 1800
+# 单次 AI 改写超时（毫秒）。
+timeout_ms = 260
 
 # 两次改写之间的最短间隔（毫秒）。
-debounce_ms = 160
+debounce_ms = 260
 
-# 至少有多少可见字符时才触发 AI 改写。
-min_visible_chars = 2
+# 至少累计多少个可见字，才触发 AI 改写。
+min_visible_chars = 8
 
-# 发送给改写器的前文最多保留多少字符。
-max_context_chars = 64
+# 发送给模型的冻结前缀最大字符数。
+max_context_chars = 80
 
-# 改写结果最多保留多少字符。
-max_output_chars = 48
+# 允许模型返回的尾巴最大字符数。
+max_output_chars = 96
 
 [capture]
 # 是否启用截图主功能。

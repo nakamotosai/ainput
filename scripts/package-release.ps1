@@ -1,15 +1,36 @@
 param(
-    [string]$Version = "1.0.0-preview.5"
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
-
-$packageName = "ainput-$Version"
 $repoRoot = if ((Split-Path -Leaf $PSScriptRoot) -eq "scripts") {
     Split-Path -Parent $PSScriptRoot
 } else {
     $PSScriptRoot
 }
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $cargoTomlPath = Join-Path $repoRoot "Cargo.toml"
+    $insideWorkspacePackage = $false
+    foreach ($line in Get-Content $cargoTomlPath -Encoding UTF8) {
+        if ($line -match '^\s*\[workspace\.package\]\s*$') {
+            $insideWorkspacePackage = $true
+            continue
+        }
+        if ($insideWorkspacePackage -and $line -match '^\s*\[') {
+            break
+        }
+        if ($insideWorkspacePackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') {
+            $Version = $Matches[1]
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        throw "failed to derive workspace package version from $cargoTomlPath"
+    }
+}
+
+$packageName = "ainput-$Version"
 $distRoot = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distRoot $packageName
 $zipPath = Join-Path $distRoot "$packageName.zip"
