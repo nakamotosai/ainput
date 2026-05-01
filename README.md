@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.45`
+当前预览版本：`1.0.0-preview.46`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -11,13 +11,13 @@
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
 - `流式语音识别` 源码主线已切到 V3：在线 partial 进入 `committed / stable / volatile / rewrite candidate` 四层状态，HUD 和最终提交共享同一 revision。
-- `1.0.0-preview.45` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
+- `1.0.0-preview.46` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
 - 流式模式默认不再用应用层短停顿 endpointing 硬切段；真实前台里短停顿会把半句话冻结，导致 HUD 和上屏文本分叉。
 - 流式模式的 HUD 继续保持“只显示文字本身”的单行面板，但内部恢复 target/display 双缓冲逐字追目标，并保留原有位置、热加载参数和占位符保护。
 - 默认热路径已经收回“本地流式识别 + 本地轻整理 + HUD/最终提交同一状态机”，AI 尾巴改写只作为 revision-guarded candidate，不允许覆盖更新文本。
 - AI rewrite 保留为实验性尾巴改写能力，默认关闭，也不再在 `fast` 模式启动时预热。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.45\` 与 `dist\ainput-1.0.0-preview.45.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.46\` 与 `dist\ainput-1.0.0-preview.46.zip`。
 
 它不做系统级 IME。当前默认热路径全部走本地；AI rewrite 只是可选实验链路。当前重点是把四条前台主链路做稳：
 
@@ -445,16 +445,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.45\`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.46\`
 - 默认启动模式是 `极速语音识别`
 - 当前源码流式主链是：`Paraformer bilingual zh-en + HUD raw-normalized 实时显示 + committed/stable/volatile 状态机 + HUD 双缓冲 + revision-guarded 尾巴改写 candidate + 松手 final HUD ack + exact delivery 提交`
 - 默认热路径不依赖外网；实验 AI rewrite 默认 `enabled = false`
 - 默认实验 AI rewrite 占位端点是 `http://127.0.0.1:8080/v1/chat/completions`
 - 默认实验 AI rewrite 模型是 `Qwen3-0.6B`
-- `preview.45` 已用 v12 尾字 / 孤立 `I` / 标点词组修复当前源码重新打包到 `dist\ainput-1.0.0-preview.45\` 与 `dist\ainput-1.0.0-preview.45.zip`
+- `preview.46` 已用 v13 全量审计修复当前源码重新打包到 `dist\ainput-1.0.0-preview.46\` 与 `dist\ainput-1.0.0-preview.46.zip`
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
 ## 本轮收口验证
+
+2026-05-01 preview.46 流式全量 bug 审计与启动误触发修复：
+
+- 本轮只修流式输出基础链路；非流式 `Alt+Z`、流式 `Ctrl` 按住说话、剪贴板 + `Ctrl+V` 主链路均未改；AI 语义改写和 GPU 仍不启用。
+- 新增 `scripts\run-streaming-full-audit.ps1` 与 `specs\streaming-full-bug-audit-v13\`，把包完整性、hotkey、startup idle、v12 replay、selftest、raw corpus、synthetic/wav live E2E、latency benchmark 收成一条总控门禁。
+- 有效基线审计 `1.0.0-preview.45` 发现 P0：启动空闲期间会被残留的 modifier-only 立即触发分支误送 `VoicePressed`，产生短 raw capture；这对应“没按也自己识别一次”的风险。
+- 修复点：删除单独 `Ctrl` 热键的旧通用立即触发分支，只保留“延迟判定 / 组合键取消 / 不吞 Ctrl”的专门路径；新增 hotkey 单测 `modifier_only_ctrl_triggers_only_after_delay`。
+- Windows 真机 `cargo test -p ainput-desktop hotkey -- --nocapture` 已通过，7/7 pass。
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-release.ps1` 已通过，产出 `dist\ainput-1.0.0-preview.46\` 与 `dist\ainput-1.0.0-preview.46.zip`。
+- Windows 真机 `.\scripts\run-streaming-full-audit.ps1 -Version 1.0.0-preview.46 -LatencyRepeats 1 -LiveCaseLimit 3` 已通过为 `pass_with_p2`：P0=0、P1=0、P2=1。
+- `preview.46` 全量门禁通过项：`cargo fmt --check`、`cargo check -p ainput-desktop`、`cargo test hotkey`、`cargo test streaming`、`cargo test ainput-rewrite`、v12 replay、startup idle、streaming selftest、raw corpus、synthetic live E2E、wav live E2E、latency benchmark。
+- `preview.46` startup idle 30 秒已通过，确认不会在空闲启动时自触发录音。
+- `preview.46` raw/synthetic/wav live 已通过，未复现重复上屏、HUD/上屏不一致、明显漏尾字、ghost `I/yeah`。
+- 速度残留 P2：当前基线 `paraformer_bilingual_asr6_chunk60` 首个 partial `p50=660ms / p95=1860ms / avg=1020ms`；最快安全候选 `chunk80` 仅到 `avg=1008ms / p95=1840ms`，收益太小，本轮不改配置。下一轮要真正提“说话到 HUD”的速度，应优先研究模型/partial emission，而不是 CPU 线程或标点。
+- 已启动到 Windows 交互桌面：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.46\ainput-desktop.exe`，收口时已验证该路径进程在运行。
 
 2026-05-01 preview.45 流式尾字、孤立 `I` 与标点词组修复：
 
@@ -700,19 +715,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 下一轮交接 / Handoff
 
-- 当前进度：`1.0.0-preview.45` 是当前可实测版本，已启动到 Windows 交互桌面；流式提交仍以 HUD final ack 作为最终真相源，并新增 v12 尾字 / 孤立 `I` / 标点词组门禁。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.45\ainput-desktop.exe`；当前运行进程确认 PID `59416`。
-- 下一轮优先看：`specs\streaming-tail-artifact-punctuation-v12\RESULTS.md`、`specs\streaming-tail-artifact-punctuation-v12\SPEC.md`、`apps\ainput-desktop\src\worker.rs`、`crates\ainput-rewrite\src\lib.rs`、`scripts\package-release.ps1`。
+- 当前进度：`1.0.0-preview.46` 是当前可实测版本，已启动到 Windows 交互桌面；流式提交仍以 HUD final ack 作为最终真相源，并新增 v13 全量审计门禁。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.46\ainput-desktop.exe`；当前运行进程收口时已验证为该路径。
+- 下一轮优先看：`specs\streaming-full-bug-audit-v13\RESULTS.md`、`specs\streaming-full-bug-audit-v13\SPEC.md`、`apps\ainput-desktop\src\hotkey.rs`、`apps\ainput-desktop\src\worker.rs`、`scripts\run-streaming-full-audit.ps1`、`scripts\package-release.ps1`。
 - 未完成事项：真正的 AI 语义改写还没有接入；基础流式/HUD/上屏稳定后，下一轮再按新 spec 做 HUD 内完成改写、再上屏。
-- 已知风险：不要改坏非流式 `Alt+Z`；不要把流式 `Ctrl` 从“只监听不拦截”改回吞键；不要把 `preview.44` 当成可交付版本；不要让 `ainput-output` 在 HUD ack 后再改写文本。
-- 推荐下一步：先复跑 `scripts\run-startup-idle-acceptance.ps1`、`scripts\run-streaming-live-e2e.ps1 -Synthetic`、`scripts\run-streaming-live-e2e.ps1 -Wav`、`replay-streaming-manifest fixtures\streaming-user-regression-v12\manifest.json`，确认当前基线仍过，再开始 AI rewrite 或延迟优化。
-- 回滚点：上一稳定收口 commit `5b4976a` 对应 `preview.43`；本轮稳定包是 `dist\ainput-1.0.0-preview.45\`。
+- 已知风险：不要改坏非流式 `Alt+Z`；不要把流式 `Ctrl` 从“只监听不拦截 + 延迟判定 + 组合键取消”改回吞键或立即触发；不要把 `preview.44` 当成可交付版本；不要让 `ainput-output` 在 HUD ack 后再改写文本。
+- 推荐下一步：先复跑 `scripts\run-streaming-full-audit.ps1 -Version 1.0.0-preview.46 -LatencyRepeats 1 -LiveCaseLimit 3`，确认当前基线仍过；真正的下一轮优化应聚焦首个 partial 延迟的模型/输出 cadence，而不是继续改标点或 AI rewrite。
+- 回滚点：上一稳定收口 commit `d223f7f` 对应 `preview.45`；本轮稳定包是 `dist\ainput-1.0.0-preview.46\`。
 
 ## 当前边界
 
 - 当前默认还是 `CPU` 推理，不走 GPU
 - 默认热路径已经不依赖外网；若手动开启实验 AI rewrite，服务不可用时会降级回无 AI 改写
-- 当前 AI 改写只处理 committed prefix 之后的最新尾巴，不是对整段全文做大模型重写
+- AI 语义改写本轮仍未接入；当前只保留默认关闭的实验入口
 - `HUD 即最终结果` 已经做成同一 revision 状态机；短停顿 endpoint 默认关闭
 - `scripts\run-streaming-live-e2e.ps1 -InteractiveTask` 是当前无人值守前台 synthetic 验收入口
 - `scripts\live-streaming-acceptance.ps1` 仍然只用于人工真实麦克风热键验收
@@ -783,18 +798,18 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.0-preview.45\`
-- `dist\ainput-1.0.0-preview.45.zip`
+- `dist\ainput-1.0.0-preview.46\`
+- `dist\ainput-1.0.0-preview.46.zip`
 
 发包前门禁：
 
-- `.\scripts\streaming-regression.ps1 -Version 1.0.0-preview.45`
-- `.\scripts\run-streaming-selftest.ps1`
-- `.\scripts\run-startup-idle-acceptance.ps1 -Version 1.0.0-preview.45 -IdleSeconds 30 -Runs 1 -InteractiveTask`
-- `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.45 -Synthetic -InteractiveTask`
-- `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.45 -Wav -InteractiveTask`
-- `dist\ainput-1.0.0-preview.45\ainput-desktop.exe replay-streaming-manifest fixtures\streaming-user-regression-v12\manifest.json`
-- `.\scripts\run-streaming-raw-corpus.ps1 -ExePath .\dist\ainput-1.0.0-preview.45\ainput-desktop.exe -RawDir .\dist\ainput-1.0.0-preview.43\logs\streaming-raw-captures -ShortCount 1 -LongCount 1`
+- `.\scripts\run-streaming-full-audit.ps1 -Version 1.0.0-preview.46 -LatencyRepeats 1 -LiveCaseLimit 3`
+- `.\scripts\run-streaming-selftest.ps1 -Version 1.0.0-preview.46`
+- `.\scripts\run-startup-idle-acceptance.ps1 -Version 1.0.0-preview.46 -IdleSeconds 30 -Runs 1 -InteractiveTask`
+- `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.46 -Synthetic -InteractiveTask`
+- `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.46 -Wav -InteractiveTask`
+- `dist\ainput-1.0.0-preview.46\ainput-desktop.exe replay-streaming-manifest fixtures\streaming-user-regression-v12\manifest.json`
+- `.\scripts\run-streaming-raw-corpus.ps1 -ExePath .\dist\ainput-1.0.0-preview.46\ainput-desktop.exe -RawDir .\dist\ainput-1.0.0-preview.43\logs\streaming-raw-captures -ShortCount 1 -LongCount 1`
 - `python .\scripts\readme_closeout_guard.py .`
 
 ## 项目结构

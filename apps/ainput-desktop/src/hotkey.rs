@@ -469,11 +469,6 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     send_hotkey_state(HotkeyState::VoiceReleased);
                     return LRESULT(1);
                 }
-            } else if is_down
-                && config.voice.modifiers.matches_pressed()
-                && !VOICE_ACTIVE.swap(true, Ordering::Relaxed)
-            {
-                send_hotkey_state(HotkeyState::VoicePressed);
             }
 
             if VOICE_ACTIVE.load(Ordering::Relaxed)
@@ -1005,6 +1000,35 @@ mod tests {
             handle_modifier_only_voice_hotkey(VK_CONTROL, false, true, &config.voice).is_none()
         );
         assert!(!MODIFIER_ONLY_VOICE_PASSTHROUGH.load(Ordering::Relaxed));
+
+        reset_hotkey_state();
+    }
+
+    #[test]
+    fn modifier_only_ctrl_triggers_only_after_delay() {
+        let _guard = test_guard();
+        reset_hotkey_state();
+        install_test_config("Ctrl");
+        let config = current_config().expect("test config should be installed");
+
+        CTRL_DOWN.store(true, Ordering::Relaxed);
+        assert!(
+            handle_modifier_only_voice_hotkey(VK_CONTROL, true, false, &config.voice).is_none()
+        );
+        assert!(MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed));
+        assert!(!VOICE_ACTIVE.load(Ordering::Relaxed));
+
+        thread::sleep(Duration::from_millis(
+            MODIFIER_ONLY_VOICE_TRIGGER_DELAY_MS + 40,
+        ));
+        assert!(!MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed));
+        assert!(VOICE_ACTIVE.load(Ordering::Relaxed));
+
+        CTRL_DOWN.store(false, Ordering::Relaxed);
+        assert!(
+            handle_modifier_only_voice_hotkey(VK_CONTROL, false, true, &config.voice).is_none()
+        );
+        assert!(!VOICE_ACTIVE.load(Ordering::Relaxed));
 
         reset_hotkey_state();
     }
