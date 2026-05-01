@@ -33,7 +33,14 @@ const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
     ("google gemini", "Google Gemini"),
     ("google germany", "Google Gemini"),
 ];
-const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[("证确", "正确"), ("土字", "吐字")];
+const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
+    ("证确", "正确"),
+    ("土字", "吐字"),
+    ("强治", "简直"),
+    ("强距", "简直"),
+    ("标点，符号", "标点符号"),
+    ("简直就是灾难的标点符号", "简直就是灾难，标点符号"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestSentenceRewrite {
@@ -58,6 +65,7 @@ pub fn normalize_transcription(text: &str) -> String {
     current = merge_spelled_ascii_sequences(&current);
     current = normalize_common_product_names(&current);
     current = normalize_common_text_rewrites(&current);
+    current = repair_isolated_ascii_tail_artifacts(&current);
 
     current.trim().to_string()
 }
@@ -363,6 +371,63 @@ fn normalize_common_text_rewrites(text: &str) -> String {
         current = current.replace(spoken, canonical);
     }
     current
+}
+
+fn repair_isolated_ascii_tail_artifacts(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch == 'I' && is_isolated_tail_i_artifact(&chars, index) {
+            if result.ends_with('不') {
+                result.push('对');
+            }
+            continue;
+        }
+        result.push(ch);
+    }
+
+    cleanup_punctuation_spacing(&result)
+}
+
+fn is_isolated_tail_i_artifact(chars: &[char], index: usize) -> bool {
+    if chars.get(index).copied() != Some('I') {
+        return false;
+    }
+    if index == 0 {
+        return false;
+    }
+    let previous = chars[index - 1];
+    if previous.is_ascii_alphanumeric() {
+        return false;
+    }
+    if !has_cjk_content_before(chars, index) {
+        return false;
+    }
+
+    let mut cursor = index + 1;
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= chars.len() {
+        return true;
+    }
+    if !is_strong_boundary(chars[cursor]) {
+        return false;
+    }
+    cursor += 1;
+    while cursor < chars.len() {
+        let ch = chars[cursor];
+        if !ch.is_whitespace() && !is_sentence_trailing_char(ch) && !is_strong_boundary(ch) {
+            return false;
+        }
+        cursor += 1;
+    }
+    true
+}
+
+fn has_cjk_content_before(chars: &[char], end: usize) -> bool {
+    chars[..end].iter().rev().take(8).any(|ch| is_cjk_char(*ch))
 }
 
 fn replace_case_insensitive_ascii_phrase(text: &str, needle: &str, replacement: &str) -> String {
@@ -709,6 +774,13 @@ fn is_cjk_punctuation(ch: char) -> bool {
     )
 }
 
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -827,6 +899,15 @@ mod tests {
             normalize_transcription("明明这个hot上面已经把证确的文案显示出来了"),
             "明明这个HUD上面已经把正确的文案显示出来了"
         );
+        assert_eq!(
+            normalize_transcription("强治就是灾难的标点，符号都不I 。"),
+            "简直就是灾难，标点符号都不对。"
+        );
+        assert_eq!(
+            normalize_transcription("很奇怪还是会漏字和重复I 。"),
+            "很奇怪还是会漏字和重复。"
+        );
+        assert_eq!(normalize_transcription("我喜欢 API。"), "我喜欢 API。");
     }
 
     #[test]

@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "fixture_root": ".",
+  "cases": [
+    {
+      "id": "short_tail_da",
+      "wav_path": "short-tail-da.wav",
+      "expected_text": "我试了短句的话，问题好像不是很大。",
+      "min_partial_updates": 1,
+      "shortfall_tolerance_chars": 0
+    },
+    {
+      "id": "trailing_i_repeat",
+      "wav_path": "trailing-i-repeat.wav",
+      "expected_text": "很奇怪还是会漏字和重复。",
+      "min_partial_updates": 1,
+      "shortfall_tolerance_chars": 0
+    },
+    {
+      "id": "short_tail_full",
+      "wav_path": "short-tail-full.wav",
+      "expected_text": "我刚想说短句的话，问题不是很大结果又给我漏了最后那个字。",
+      "min_partial_updates": 1,
+      "shortfall_tolerance_chars": 0
+    },
+    {
+      "id": "punctuation_budui_i",
+      "wav_path": "punctuation-budui-i.wav",
+      "expected_text": "简直就是灾难，标点符号都不对。",
+      "min_partial_updates": 1,
+      "shortfall_tolerance_chars": 0
+    }
+  ]
+}

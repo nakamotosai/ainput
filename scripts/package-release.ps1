@@ -554,6 +554,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") |
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "scripts") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-hud-e2e") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-selftest") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-user-regression-v12") | Out-Null
 
 Copy-Item $releaseExe (Join-Path $packageDir "ainput-desktop.exe") -Force
 Copy-Item $mainConfigSource (Join-Path $packageDir "config\ainput.toml") -Force
@@ -638,6 +639,7 @@ Copy-Item (Join-Path $repoRoot "scripts\run-streaming-raw-corpus.ps1") (Join-Pat
 Copy-Item (Join-Path $repoRoot "scripts\run-startup-idle-acceptance.ps1") (Join-Path $packageDir "scripts\run-startup-idle-acceptance.ps1") -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-hud-e2e\manifest.json") (Join-Path $packageDir "fixtures\streaming-hud-e2e\manifest.json") -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-selftest\*") (Join-Path $packageDir "fixtures\streaming-selftest") -Recurse -Force
+Copy-Item (Join-Path $repoRoot "fixtures\streaming-user-regression-v12\*") (Join-Path $packageDir "fixtures\streaming-user-regression-v12") -Recurse -Force
 Copy-Item $modelSource $modelTarget -Recurse -Force
 if (!(Test-Path $streamingPunctuationModelSource)) {
     throw "missing streaming punctuation model directory: $streamingPunctuationModelSource"

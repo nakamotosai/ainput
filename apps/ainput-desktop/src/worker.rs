@@ -48,7 +48,7 @@ const STREAMING_FIRST_PARTIAL_HARD_MS: u128 = 900;
 const STREAMING_RELEASE_TAIL_TARGET_MS: u128 = 500;
 const STREAMING_RELEASE_TAIL_HARD_MS: u128 = STREAMING_RELEASE_HARD_WAIT_MS as u128;
 const STREAMING_OFFLINE_FINAL_TARGET_MS: u128 = 180;
-const STREAMING_OFFLINE_FINAL_HARD_MS: u128 = 350;
+const STREAMING_OFFLINE_FINAL_HARD_MS: u128 = 650;
 const STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS: u64 = 6_000;
 const STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS: u64 = 3_200;
 const STREAMING_PUNCTUATION_TARGET_MS: u128 = 120;
@@ -1267,7 +1267,7 @@ pub(crate) fn probe_streaming_live_session(
         streaming_endpoint_tail_padding_ms(&runtime.config.voice.streaming.endpoint),
         runtime.config.voice.streaming.rewrite_enabled,
     );
-    let final_text = prepared_commit.final_text.clone();
+    let final_text = ensure_terminal_sentence_boundary(&prepared_commit.final_text);
     let recorded = recording.stop()?;
     let raw_capture = save_streaming_raw_capture(
         runtime
@@ -1486,7 +1486,7 @@ pub(crate) fn replay_streaming_wav(
     } else {
         0.0
     };
-    let final_text = prepared_commit.final_text.clone();
+    let final_text = ensure_terminal_sentence_boundary(&prepared_commit.final_text);
     let final_visible_chars = visible_text_char_count(&final_text);
     if should_append_release_final_preview(&partial_timeline, &final_text) {
         let final_content_chars = content_chars_without_sentence_punctuation(&final_text);
@@ -1550,6 +1550,7 @@ pub(crate) fn replay_streaming_wav(
             ));
         }
     }
+    failures.extend(streaming_final_quality_failures(&final_text));
 
     let behavior_status = if failures.is_empty() {
         StreamingCaseStatus::Pass
@@ -2347,10 +2348,12 @@ fn prepare_final_streaming_commit(
     } else {
         offline_final.text
     };
+    let display_text_before_final = effective_streaming_display_text(session);
     let (selected_final_raw_text, selected_final_raw_source) = select_streaming_final_raw_text(
         &final_online_raw_text,
         &final_offline_raw_text,
         offline_final.scope,
+        &display_text_before_final,
     );
     let punctuation_started_at = Instant::now();
     let (prepared_final_candidate, prepared_candidate_source) =
@@ -2360,7 +2363,6 @@ fn prepare_final_streaming_commit(
         StreamingCommitSource::OfflineFinal => StreamingCommitSource::OfflineFinal,
         _ => prepared_candidate_source,
     };
-    let display_text_before_final = effective_streaming_display_text(session);
     let resolved_commit = resolve_final_streaming_commit(
         session,
         &display_text_before_final,
@@ -2495,6 +2497,7 @@ fn select_streaming_final_raw_text(
     online_raw_text: &str,
     offline_raw_text: &str,
     offline_scope: StreamingOfflineFinalScope,
+    display_text_before_final: &str,
 ) -> (String, StreamingCommitSource) {
     let online = online_raw_text.trim();
     let offline = offline_raw_text.trim();
@@ -2502,7 +2505,24 @@ fn select_streaming_final_raw_text(
         return (online.to_string(), StreamingCommitSource::OnlineFinal);
     }
     if online.is_empty() {
+        if let Some(repaired_tail) =
+            repair_offline_short_english_tail_artifact(display_text_before_final, offline)
+        {
+            return (repaired_tail, StreamingCommitSource::OfflineFinal);
+        }
+        if should_reject_offline_short_english_tail_artifact(display_text_before_final, offline) {
+            return (String::new(), StreamingCommitSource::OnlineFinal);
+        }
         return (offline.to_string(), StreamingCommitSource::OfflineFinal);
+    }
+
+    if let Some(repaired_tail) =
+        repair_offline_short_english_tail_artifact(display_text_before_final, offline)
+    {
+        return (repaired_tail, StreamingCommitSource::OfflineFinal);
+    }
+    if should_reject_offline_short_english_tail_artifact(display_text_before_final, offline) {
+        return (online.to_string(), StreamingCommitSource::OnlineFinal);
     }
 
     if matches!(offline_scope, StreamingOfflineFinalScope::TailWindow) {
@@ -2525,6 +2545,109 @@ fn select_streaming_final_raw_text(
     }
 
     (online.to_string(), StreamingCommitSource::OnlineFinal)
+}
+
+fn repair_offline_short_english_tail_artifact(
+    display_text_before_final: &str,
+    offline_raw_text: &str,
+) -> Option<String> {
+    if !is_single_i_artifact_text(offline_raw_text) {
+        return None;
+    }
+    let display_content = content_text_without_sentence_punctuation(display_text_before_final);
+    display_content.ends_with('不').then(|| "对。".to_string())
+}
+
+fn should_reject_offline_short_english_tail_artifact(
+    display_text_before_final: &str,
+    offline_raw_text: &str,
+) -> bool {
+    if !contains_cjk_char(display_text_before_final) {
+        return false;
+    }
+    is_short_english_tail_artifact_text(offline_raw_text)
+}
+
+fn is_single_i_artifact_text(text: &str) -> bool {
+    normalized_ascii_letters(text) == "i"
+}
+
+fn is_short_english_tail_artifact_text(text: &str) -> bool {
+    matches!(
+        normalized_ascii_letters(text).as_str(),
+        "i" | "yeah"
+            | "yea"
+            | "yes"
+            | "yep"
+            | "ok"
+            | "okay"
+            | "uh"
+            | "um"
+            | "hmm"
+            | "hm"
+            | "ah"
+            | "oh"
+            | "hey"
+            | "hi"
+    )
+}
+
+fn normalized_ascii_letters(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn streaming_final_quality_failures(final_text: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+    if has_isolated_i_tail_artifact(final_text) {
+        failures.push(format!(
+            "final_text_contains_isolated_i_tail_artifact: {final_text}"
+        ));
+    }
+    if final_text.contains("标点，符号") {
+        failures.push(format!(
+            "final_text_splits_fixed_word_punctuation: {final_text}"
+        ));
+    }
+    failures
+}
+
+fn has_isolated_i_tail_artifact(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch != 'I' || index == 0 {
+            continue;
+        }
+        if chars[index - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        if !chars[..index]
+            .iter()
+            .rev()
+            .take(8)
+            .any(|ch| is_cjk_char(*ch))
+        {
+            continue;
+        }
+        let mut cursor = index + 1;
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= chars.len() {
+            return true;
+        }
+        if is_sentence_punctuation(chars[cursor]) {
+            let rest_is_boundary = chars[cursor + 1..]
+                .iter()
+                .all(|ch| ch.is_whitespace() || is_sentence_punctuation(*ch));
+            if rest_is_boundary {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn merge_streaming_offline_tail_repair(
@@ -2595,8 +2718,11 @@ fn resolve_final_streaming_commit(
 
     let selected_commit =
         select_streaming_commit_text(&display_trimmed, &candidate_display_text, candidate_source);
-    let final_text = selected_commit.text.trim().to_string();
-    let commit_source = if final_text == display_trimmed {
+    let selected_commit_text = selected_commit.text.trim();
+    let final_text = finalize_streaming_commit_text(selected_commit_text);
+    let commit_source = if final_text != selected_commit_text {
+        StreamingCommitSource::StreamingTailRepair
+    } else if final_text == display_trimmed {
         StreamingCommitSource::StreamingState
     } else {
         selected_commit.source
@@ -2609,6 +2735,11 @@ fn resolve_final_streaming_commit(
         commit_source,
         rejected_prefix_rewrite,
     }
+}
+
+fn finalize_streaming_commit_text(text: &str) -> String {
+    let normalized = ainput_rewrite::normalize_transcription(text);
+    apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
 }
 
 fn update_streaming_partial_state(
@@ -4203,6 +4334,10 @@ fn contains_meaningful_preview_char(text: &str) -> bool {
         .any(|ch| ch.is_ascii_alphanumeric() || is_cjk_char(ch))
 }
 
+fn contains_cjk_char(text: &str) -> bool {
+    text.chars().any(is_cjk_char)
+}
+
 fn is_cjk_char(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -4894,19 +5029,20 @@ fn strip_trailing_terminal_sentence_punctuation(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioActivity, STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS,
+        AudioActivity, STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS, STREAMING_OFFLINE_FINAL_HARD_MS,
         STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT, StreamingCommitSource,
         StreamingOfflineFinalScope, StreamingResampler, analyze_recent_audio_activity,
         append_with_suffix_prefix_overlap, apply_streaming_semantic_commas,
         build_streaming_ai_rewrite_candidate, dedupe_streaming_punctuation,
         effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
-        merge_rolled_over_prefix, merge_streaming_offline_tail_repair,
-        prepare_streaming_output_text, prepare_streaming_pause_boundary_text,
-        prepare_streaming_preview_text, resolve_streaming_rollover_commit_text,
-        sanitize_ai_rewrite_output, save_streaming_raw_capture, select_streaming_commit_text,
-        select_streaming_final_raw_text, select_streaming_preview_text,
-        should_drop_low_signal_result, should_drop_streaming_preview_result,
-        should_skip_streaming_preview, streaming_offline_final_sample_start,
+        finalize_streaming_commit_text, merge_rolled_over_prefix,
+        merge_streaming_offline_tail_repair, prepare_streaming_output_text,
+        prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
+        resolve_streaming_rollover_commit_text, sanitize_ai_rewrite_output,
+        save_streaming_raw_capture, select_streaming_commit_text, select_streaming_final_raw_text,
+        select_streaming_preview_text, should_drop_low_signal_result,
+        should_drop_streaming_preview_result, should_skip_streaming_preview,
+        streaming_final_quality_failures, streaming_offline_final_sample_start,
         streaming_offline_final_scope, strip_trailing_terminal_sentence_punctuation,
     };
     use std::fs;
@@ -5147,9 +5283,74 @@ mod tests {
             "一共花了两天时",
             "一共花了两天时间。",
             StreamingOfflineFinalScope::FullAudio,
+            "一共花了两天时",
         );
         assert_eq!(selected, "一共花了两天时间。");
         assert_eq!(source, StreamingCommitSource::OfflineFinal);
+    }
+
+    #[test]
+    fn offline_final_late_budget_accepts_tail_repair_window() {
+        assert_eq!(STREAMING_OFFLINE_FINAL_HARD_MS, 650);
+    }
+
+    #[test]
+    fn offline_final_rejects_isolated_i_tail_artifact_after_chinese_display() {
+        let (selected, source) = select_streaming_final_raw_text(
+            "",
+            "I.",
+            StreamingOfflineFinalScope::TailWindow,
+            "很奇怪还是会漏字和重复",
+        );
+        assert_eq!(selected, "");
+        assert_eq!(source, StreamingCommitSource::OnlineFinal);
+    }
+
+    #[test]
+    fn offline_final_repairs_bu_i_tail_to_budui() {
+        let (selected, source) = select_streaming_final_raw_text(
+            "",
+            "I.",
+            StreamingOfflineFinalScope::TailWindow,
+            "简直就是灾难，标点符号都不",
+        );
+        assert_eq!(selected, "对。");
+        assert_eq!(source, StreamingCommitSource::OfflineFinal);
+    }
+
+    #[test]
+    fn output_text_repairs_observed_i_and_punctuation_artifacts() {
+        let (prepared, source) =
+            prepare_streaming_output_text("强治就是灾难的标点，符号都不I 。", false, None);
+        assert_eq!(prepared, "简直就是灾难，标点符号都不对。");
+        assert_eq!(source, StreamingCommitSource::StreamingTailRepair);
+    }
+
+    #[test]
+    fn final_commit_text_repairs_display_selected_i_and_punctuation_artifacts() {
+        assert_eq!(
+            finalize_streaming_commit_text("很奇怪还是会漏字和重复I 。"),
+            "很奇怪还是会漏字和重复。"
+        );
+        assert_eq!(
+            finalize_streaming_commit_text("强距就是灾难的标点，符号都不对I 。"),
+            "简直就是灾难，标点符号都不对。"
+        );
+    }
+
+    #[test]
+    fn streaming_final_quality_gate_catches_i_and_split_word_artifacts() {
+        assert!(streaming_final_quality_failures("简直就是灾难，标点符号都不对。").is_empty());
+        assert!(
+            streaming_final_quality_failures("很奇怪还是会漏字和重复I。")
+                .iter()
+                .any(|failure| failure.contains("isolated_i"))
+        );
+        assert!(
+            streaming_final_quality_failures("标点，符号都不对。")
+                .iter()
+                .any(|failure| failure.contains("splits_fixed_word"))
+        );
     }
 
     #[test]

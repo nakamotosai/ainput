@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.43`
+当前预览版本：`1.0.0-preview.45`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -11,13 +11,13 @@
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
 - `流式语音识别` 源码主线已切到 V3：在线 partial 进入 `committed / stable / volatile / rewrite candidate` 四层状态，HUD 和最终提交共享同一 revision。
-- `1.0.0-preview.43` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
+- `1.0.0-preview.45` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
 - 流式模式默认不再用应用层短停顿 endpointing 硬切段；真实前台里短停顿会把半句话冻结，导致 HUD 和上屏文本分叉。
 - 流式模式的 HUD 继续保持“只显示文字本身”的单行面板，但内部恢复 target/display 双缓冲逐字追目标，并保留原有位置、热加载参数和占位符保护。
 - 默认热路径已经收回“本地流式识别 + 本地轻整理 + HUD/最终提交同一状态机”，AI 尾巴改写只作为 revision-guarded candidate，不允许覆盖更新文本。
 - AI rewrite 保留为实验性尾巴改写能力，默认关闭，也不再在 `fast` 模式启动时预热。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.43\` 与 `dist\ainput-1.0.0-preview.43.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.45\` 与 `dist\ainput-1.0.0-preview.45.zip`。
 
 它不做系统级 IME。当前默认热路径全部走本地；AI rewrite 只是可选实验链路。当前重点是把四条前台主链路做稳：
 
@@ -445,16 +445,43 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.43\`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.45\`
 - 默认启动模式是 `极速语音识别`
 - 当前源码流式主链是：`Paraformer bilingual zh-en + HUD raw-normalized 实时显示 + committed/stable/volatile 状态机 + HUD 双缓冲 + revision-guarded 尾巴改写 candidate + 松手 final HUD ack + exact delivery 提交`
 - 默认热路径不依赖外网；实验 AI rewrite 默认 `enabled = false`
 - 默认实验 AI rewrite 占位端点是 `http://127.0.0.1:8080/v1/chat/completions`
 - 默认实验 AI rewrite 模型是 `Qwen3-0.6B`
-- `preview.43` 已用 HUD 最终真相源当前源码重新打包到 `dist\ainput-1.0.0-preview.43\` 与 `dist\ainput-1.0.0-preview.43.zip`
+- `preview.45` 已用 v12 尾字 / 孤立 `I` / 标点词组修复当前源码重新打包到 `dist\ainput-1.0.0-preview.45\` 与 `dist\ainput-1.0.0-preview.45.zip`
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
 ## 本轮收口验证
+
+2026-05-01 preview.45 流式尾字、孤立 `I` 与标点词组修复：
+
+- 本轮只改流式输出链路；非流式 `Alt+Z`、流式 `Ctrl` 按住说话、剪贴板 + `Ctrl+V` 主链路均未改。
+- final 选择先保留 `preview.43` 的 HUD 最终真相源，再在 `display/candidate` 二选一之后统一做最终清洗，避免 HUD/上屏尾部残留 `I`、`标点，符号`、`强治/强距`。
+- offline final hard budget 从 `350ms` 放宽到 `650ms`，避免可用尾字修复结果刚好晚到时被丢弃；固定样本 `short-tail-da.wav` 已覆盖“不是很大”的“大”。
+- tail-window offline final 如果只识别出短英文幻觉 `I/Yeah/Okay/...`，中文上下文下会拒绝拼接；若显示尾部是“...不”且离线尾巴是 `I`，本地修成“对”。
+- `crates\ainput-rewrite` 增加本轮已观察误识别清洗：`强治/强距 -> 简直`、`标点，符号 -> 标点符号`、中文尾部孤立 `I` 删除、`不I -> 不对`。
+- replay 报告的 `final_text` 已对齐真实最终 commit 文本，先补完终止句号再进入内容/质量门禁，避免报告和 HUD/上屏口径分叉。
+- 新增固定回归资产：`fixtures\streaming-user-regression-v12\`，覆盖短句尾字、重复 `I`、短句完整尾字、标点词组 + `不I`。
+- Windows 真机 `cargo fmt --check` 已通过。
+- Windows 真机 `cargo check -p ainput-desktop` 已通过。
+- Windows 真机 `cargo test -p ainput-rewrite -- --nocapture` 已通过，16/16 pass。
+- Windows 真机 `cargo test -p ainput-desktop final_commit -- --nocapture` 已通过，5/5 pass。
+- Windows 真机 `cargo test -p ainput-desktop streaming -- --nocapture` 已通过，32/32 pass。
+- Windows 真机 `cargo test -p ainput-desktop hotkey -- --nocapture` 已通过，6/6 pass，覆盖 `Ctrl+A/C/V` 不应被单独 `Ctrl` 热键吞掉。
+- 包内 `dist\ainput-1.0.0-preview.45\ainput-desktop.exe replay-streaming-manifest fixtures\streaming-user-regression-v12\manifest.json` 已通过，4/4 pass：
+  - `我试了短句的话，问题好像不是很大。`
+  - `很奇怪还是会漏字和重复。`
+  - `我刚想说短句的话，问题不是很大结果又给我漏了最后那个字。`
+  - `简直就是灾难，标点符号都不对。`
+- Windows 真机 `.\scripts\run-startup-idle-acceptance.ps1 -Version 1.0.0-preview.45 -IdleSeconds 30 -Runs 1 -InteractiveTask` 已通过，启动空闲不自触发录音。
+- Windows 真机 `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.45 -Synthetic -InteractiveTask` 已通过，3/3 pass，HUD flash/panel 全 0。
+- Windows 真机 `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.45 -Wav -InteractiveTask -CaseLimit 3` 已通过，3/3 pass，HUD flash/panel 全 0。
+- Windows 真机 `.\scripts\run-streaming-raw-corpus.ps1 -ExePath .\dist\ainput-1.0.0-preview.45\ainput-desktop.exe -RawDir .\dist\ainput-1.0.0-preview.43\logs\streaming-raw-captures -ShortCount 1 -LongCount 1` 已通过，2/2 pass，`final_missing_chars=0`。
+- `preview.44` 因打包脚本未先创建 `fixtures\streaming-user-regression-v12` 目录被废弃；`preview.45` 已修复打包目录并作为当前可测版本。
+- 已启动到 Windows 交互桌面：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.45\ainput-desktop.exe`，PID `59416`。
 
 2026-05-01 HUD 最终真相源收口：
 
@@ -673,13 +700,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 下一轮交接 / Handoff
 
-- 当前进度：`1.0.0-preview.43` 是当前可实测版本，已启动到 Windows 交互桌面；流式提交已改成 HUD final ack 作为最终真相源，HUD 显示、output commit、目标框读回必须一致。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.43\ainput-desktop.exe`；当前运行进程曾确认 PID `4412`。
-- 下一轮优先看：`specs\streaming-hud-truth-source-v11\RESULTS.md`、根 `TASKLIST.md` Round 26、`apps\ainput-desktop\src\worker.rs`、`apps\ainput-desktop\src\overlay.rs`、`crates\ainput-output\src\lib.rs`。
+- 当前进度：`1.0.0-preview.45` 是当前可实测版本，已启动到 Windows 交互桌面；流式提交仍以 HUD final ack 作为最终真相源，并新增 v12 尾字 / 孤立 `I` / 标点词组门禁。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.45\ainput-desktop.exe`；当前运行进程确认 PID `59416`。
+- 下一轮优先看：`specs\streaming-tail-artifact-punctuation-v12\RESULTS.md`、`specs\streaming-tail-artifact-punctuation-v12\SPEC.md`、`apps\ainput-desktop\src\worker.rs`、`crates\ainput-rewrite\src\lib.rs`、`scripts\package-release.ps1`。
 - 未完成事项：真正的 AI 语义改写还没有接入；基础流式/HUD/上屏稳定后，下一轮再按新 spec 做 HUD 内完成改写、再上屏。
-- 已知风险：不要改坏非流式 `Alt+Z`；不要把流式 `Ctrl` 从“只监听不拦截”改回吞键；不要把 `preview.42` 当成可交付版本；不要让 `ainput-output` 在 HUD ack 后再改写文本。
-- 推荐下一步：先复跑 `scripts\run-startup-idle-acceptance.ps1`、`scripts\run-streaming-live-e2e.ps1 -Synthetic`、`scripts\run-streaming-live-e2e.ps1 -Wav`，确认当前基线仍过，再开始 AI rewrite 或延迟优化。
-- 回滚点：当前收口 commit `5b4976a` 对应 `preview.43`；如果后续调试出问题，先退回 `dist\ainput-1.0.0-preview.43\` 验证基线。
+- 已知风险：不要改坏非流式 `Alt+Z`；不要把流式 `Ctrl` 从“只监听不拦截”改回吞键；不要把 `preview.44` 当成可交付版本；不要让 `ainput-output` 在 HUD ack 后再改写文本。
+- 推荐下一步：先复跑 `scripts\run-startup-idle-acceptance.ps1`、`scripts\run-streaming-live-e2e.ps1 -Synthetic`、`scripts\run-streaming-live-e2e.ps1 -Wav`、`replay-streaming-manifest fixtures\streaming-user-regression-v12\manifest.json`，确认当前基线仍过，再开始 AI rewrite 或延迟优化。
+- 回滚点：上一稳定收口 commit `5b4976a` 对应 `preview.43`；本轮稳定包是 `dist\ainput-1.0.0-preview.45\`。
 
 ## 当前边界
 
@@ -756,17 +783,18 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 
 当前发布目录结构使用：
 
-- `dist\ainput-1.0.0-preview.24\`
-- `dist\ainput-1.0.0-preview.24.zip`
+- `dist\ainput-1.0.0-preview.45\`
+- `dist\ainput-1.0.0-preview.45.zip`
 
 发包前门禁：
 
-- `.\scripts\streaming-regression.ps1 -Version 1.0.0-preview.24`
+- `.\scripts\streaming-regression.ps1 -Version 1.0.0-preview.45`
 - `.\scripts\run-streaming-selftest.ps1`
-- `.\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask`
-- `.\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask`
-- `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask`
-- `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask`
+- `.\scripts\run-startup-idle-acceptance.ps1 -Version 1.0.0-preview.45 -IdleSeconds 30 -Runs 1 -InteractiveTask`
+- `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.45 -Synthetic -InteractiveTask`
+- `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.45 -Wav -InteractiveTask`
+- `dist\ainput-1.0.0-preview.45\ainput-desktop.exe replay-streaming-manifest fixtures\streaming-user-regression-v12\manifest.json`
+- `.\scripts\run-streaming-raw-corpus.ps1 -ExePath .\dist\ainput-1.0.0-preview.45\ainput-desktop.exe -RawDir .\dist\ainput-1.0.0-preview.43\logs\streaming-raw-captures -ShortCount 1 -LongCount 1`
 - `python .\scripts\readme_closeout_guard.py .`
 
 ## 项目结构
