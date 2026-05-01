@@ -5,6 +5,30 @@
 
 ---
 
+## Round 28：流式 offline final 乱码尾巴修复
+
+- [x] 新增 Spec：`specs/streaming-offline-final-garbled-tail-v15/`
+- [x] 从用户复现和日志确认：HUD 文本正确，但 `offline_final_raw_text` 的 `We住慎重ong。` 被拼进 final commit envelope
+- [x] `select_streaming_final_raw_text` 增加 offline raw 乱码重复尾巴拒绝
+- [x] `select_streaming_commit_text` 增加 `HUD + garbled duplicate tail` 二次防守
+- [x] 单测覆盖 `还是得稳住慎重We住慎重ong。` 回退 HUD 文本
+- [x] 单测覆盖真实中英混合 `Windows 版本` 不被误杀
+- [x] 打包新 preview：`dist\ainput-1.0.0-preview.49`
+- [x] 最新版本启动到用户交互桌面：`preview.49` PID `20096`
+
+完成判定：
+
+- [x] `cargo fmt --check` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] `cargo test -p ainput-desktop garbled -- --nocapture` 通过
+- [x] `cargo test -p ainput-desktop streaming -- --nocapture` 通过
+- [x] `cargo test -p ainput-desktop hotkey -- --nocapture` 通过
+- [x] `cargo test -p ainput-rewrite -- --nocapture` 通过
+- [x] `scripts\run-streaming-full-audit.ps1 -Version 1.0.0-preview.49 -LatencyRepeats 1 -LiveCaseLimit 3` 通过，P0=0/P1=0/P2=0，报告：`tmp\streaming-full-audit\20260502-000910-084\full-audit-report.json`
+- [x] README / v15 RESULTS 已回写
+
+---
+
 ## Round 27：流式首字测速口径修正
 
 - [x] 新增 Spec：`specs/streaming-first-partial-latency-v14/`

@@ -2533,6 +2533,10 @@ fn select_streaming_final_raw_text(
         if should_reject_offline_short_english_tail_artifact(display_text_before_final, offline) {
             return (String::new(), StreamingCommitSource::OnlineFinal);
         }
+        if should_reject_offline_garbled_duplicate_tail_artifact(display_text_before_final, offline)
+        {
+            return (String::new(), StreamingCommitSource::OnlineFinal);
+        }
         return (offline.to_string(), StreamingCommitSource::OfflineFinal);
     }
 
@@ -2542,6 +2546,9 @@ fn select_streaming_final_raw_text(
         return (repaired_tail, StreamingCommitSource::OfflineFinal);
     }
     if should_reject_offline_short_english_tail_artifact(display_text_before_final, offline) {
+        return (online.to_string(), StreamingCommitSource::OnlineFinal);
+    }
+    if should_reject_offline_garbled_duplicate_tail_artifact(display_text_before_final, offline) {
         return (online.to_string(), StreamingCommitSource::OnlineFinal);
     }
 
@@ -2586,6 +2593,78 @@ fn should_reject_offline_short_english_tail_artifact(
         return false;
     }
     is_short_english_tail_artifact_text(offline_raw_text)
+}
+
+fn should_reject_offline_garbled_duplicate_tail_artifact(
+    display_text_before_final: &str,
+    offline_raw_text: &str,
+) -> bool {
+    should_reject_garbled_duplicate_tail_after_display(display_text_before_final, offline_raw_text)
+}
+
+fn should_reject_garbled_duplicate_tail_after_display(
+    display_text_before_final: &str,
+    appended_tail: &str,
+) -> bool {
+    if !contains_cjk_char(display_text_before_final)
+        || !contains_ascii_letter(appended_tail)
+        || !contains_cjk_char(appended_tail)
+    {
+        return false;
+    }
+    if !looks_like_embedded_ascii_noise_around_cjk(appended_tail) {
+        return false;
+    }
+
+    let display_content = content_text_without_sentence_punctuation(display_text_before_final);
+    let tail_cjk = cjk_text_only(appended_tail);
+    let tail_cjk_chars = tail_cjk.chars().count();
+    if tail_cjk_chars < 2 || display_content.chars().count() < tail_cjk_chars {
+        return false;
+    }
+
+    let display_tail = trailing_chars(&display_content, tail_cjk_chars.saturating_add(6).max(10));
+    display_tail.ends_with(&tail_cjk)
+        || longest_common_subsequence_chars(&display_tail, &tail_cjk) >= tail_cjk_chars
+}
+
+fn looks_like_embedded_ascii_noise_around_cjk(text: &str) -> bool {
+    let chars = text.chars().collect::<Vec<_>>();
+    let Some(first_cjk) = chars.iter().position(|ch| is_cjk_char(*ch)) else {
+        return false;
+    };
+    let Some(last_cjk) = chars.iter().rposition(|ch| is_cjk_char(*ch)) else {
+        return false;
+    };
+
+    let ascii_before = chars[..first_cjk]
+        .iter()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
+    let ascii_after = chars[last_cjk + 1..]
+        .iter()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
+    let before_touches_cjk = first_cjk > 0 && chars[first_cjk - 1].is_ascii_alphabetic();
+    let after_touches_cjk = last_cjk + 1 < chars.len() && chars[last_cjk + 1].is_ascii_alphabetic();
+
+    (before_touches_cjk && after_touches_cjk)
+        || (before_touches_cjk && ascii_before <= 3)
+        || (after_touches_cjk && ascii_after <= 3)
+}
+
+fn contains_ascii_letter(text: &str) -> bool {
+    text.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn cjk_text_only(text: &str) -> String {
+    text.chars().filter(|ch| is_cjk_char(*ch)).collect()
+}
+
+fn trailing_chars(text: &str, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let start = chars.len().saturating_sub(max_chars);
+    chars[start..].iter().collect()
 }
 
 fn is_single_i_artifact_text(text: &str) -> bool {
@@ -3829,6 +3908,24 @@ fn select_streaming_commit_text(
     }
 
     if selected_candidate.text.is_empty() {
+        return StreamingCommitChoice {
+            source: StreamingCommitSource::StreamingState,
+            text: display_trimmed.to_string(),
+        };
+    }
+
+    if matches!(
+        selected_candidate.source,
+        StreamingCommitSource::OfflineFinal
+    ) && let Some(appended_tail) = selected_candidate.text.strip_prefix(display_trimmed)
+        && should_reject_garbled_duplicate_tail_after_display(display_trimmed, appended_tail)
+    {
+        tracing::info!(
+            display_text = %short_log_text(display_trimmed, 120),
+            appended_tail = %short_log_text(appended_tail, 120),
+            final_candidate = %short_log_text(&selected_candidate.text, 120),
+            "streaming final commit rejected garbled offline duplicate tail"
+        );
         return StreamingCommitChoice {
             source: StreamingCommitSource::StreamingState,
             text: display_trimmed.to_string(),
@@ -5381,6 +5478,39 @@ mod tests {
         );
         assert_eq!(selected, "");
         assert_eq!(source, StreamingCommitSource::OnlineFinal);
+    }
+
+    #[test]
+    fn offline_final_rejects_garbled_duplicate_cjk_tail_with_ascii_noise() {
+        let (selected, source) = select_streaming_final_raw_text(
+            "",
+            "We住慎重ong。",
+            StreamingOfflineFinalScope::TailWindow,
+            "还是得稳住慎重",
+        );
+        assert_eq!(selected, "");
+        assert_eq!(source, StreamingCommitSource::OnlineFinal);
+
+        let final_text = ensure_terminal_sentence_boundary(&finalize_streaming_commit_text(
+            &select_streaming_commit_text(
+                "还是得稳住慎重",
+                "还是得稳住慎重We住慎重ong。",
+                StreamingCommitSource::OfflineFinal,
+            )
+            .text,
+        ));
+        assert_eq!(final_text, "还是得稳住慎重。");
+    }
+
+    #[test]
+    fn offline_final_garbled_tail_guard_keeps_true_bilingual_append() {
+        let selected = select_streaming_commit_text(
+            "这个功能支持",
+            "这个功能支持 Windows 版本。",
+            StreamingCommitSource::OfflineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::OfflineFinal);
+        assert_eq!(selected.text, "这个功能支持 Windows 版本。");
     }
 
     #[test]
