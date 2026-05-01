@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$OutputDir = "",
     [string]$VoiceName = "Microsoft Huihui Desktop"
 )
@@ -45,6 +45,7 @@ $cases = @(
         id = "sentence_01"
         text_b64 = "5ZaC5ZaC5ZaC77yM5L2g5aW95L2g5aW977yM5oCO5LmI5Zue5LqL5ZWK77yf"
         wav = "sentence-01.wav"
+        keywords_b64 = @("5L2g5aW9", "5oCO5LmI5Zue5LqL")
         min_partial_updates = 2
         shortfall_tolerance_chars = 3
     },
@@ -52,6 +53,7 @@ $cases = @(
         id = "sentence_02"
         text_b64 = "5oiR55qE5ZCN5a2X5Y+r6ICB6JSh77yM546w5Zyo6L+Z5Liq5ZCQ5a2X5LiN5aSf5Lid5ruR44CC"
         wav = "sentence-02.wav"
+        keywords_b64 = @("5oiR55qE5ZCN5a2X5Y+r6ICB6JSh", "5Lid5ruR")
         min_partial_updates = 2
         shortfall_tolerance_chars = 3
     },
@@ -59,6 +61,7 @@ $cases = @(
         id = "sentence_03"
         text_b64 = "54S25ZCO5LiN566h5oiR6K+05aSa5bCR5Liq5a2X77yM5a6D5rC46L+c5Y+q6IO95pi+56S65Ye65p2l5Lik5Liq5a2X44CC"
         wav = "sentence-03.wav"
+        keywords_b64 = @("5aSa5bCR5Liq5a2X", "5pi+56S65Ye65p2l5Lik5Liq")
         min_partial_updates = 3
         shortfall_tolerance_chars = 3
     },
@@ -66,6 +69,7 @@ $cases = @(
         id = "sentence_04"
         text_b64 = "5bqU6K+l5piv5oiR5LiN5pat5Zyw6K+06K+d5LmL5ZCO77yM5a6D6IO95LiN5pat5Zyw5Ye6546w5paH5a2X44CC"
         wav = "sentence-04.wav"
+        keywords_b64 = @("5LiN5pat", "6K+06K+d5LmL5ZCO", "5Ye6546w")
         min_partial_updates = 3
         shortfall_tolerance_chars = 3
     },
@@ -73,6 +77,7 @@ $cases = @(
         id = "sentence_05"
         text_b64 = "5piO5piO6L+Z5LiqSFVE5LiK6Z2i5bey57uP5oqK5q2j56Gu55qE5paH5qGI5pi+56S65Ye65p2l5LqG77yM5L2G5piv5a6D5pyJ5pe25YCZ5LiK5bGP6L+Y5piv5oWi44CC"
         wav = "sentence-05.wav"
+        keywords_b64 = @("5q2j56Gu55qE5paH5qGI", "5pi+56S65Ye65p2l", "5LiK5bGP")
         min_partial_updates = 4
         shortfall_tolerance_chars = 4
     },
@@ -80,6 +85,7 @@ $cases = @(
         id = "sentence_combo_long"
         text_b64 = "54S25ZCO5LiN566h5oiR6K+05aSa5bCR5Liq5a2X77yM5a6D5rC46L+c5Y+q6IO95pi+56S65Ye65p2l5Lik5Liq5a2X44CC5bqU6K+l5piv5oiR5LiN5pat5Zyw6K+06K+d5LmL5ZCO77yM5a6D6IO95LiN5pat5Zyw5Ye6546w5paH5a2X44CC5piO5piO6L+Z5LiqSFVE5LiK6Z2i5bey57uP5oqK5q2j56Gu55qE5paH5qGI5pi+56S65Ye65p2l5LqG77yM5L2G5piv5a6D5pyJ5pe25YCZ5LiK5bGP6L+Y5piv5oWi44CC"
         wav = "sentence-combo-long.wav"
+        keywords_b64 = @("5aSa5bCR5Liq5a2X", "5pi+56S65Ye65p2l5Lik5Liq", "6K+06K+d5LmL5ZCO", "5Ye6546w5paH5a2X", "5q2j56Gu55qE5paH5qGI", "5LiK5bGP")
         min_partial_updates = 5
         shortfall_tolerance_chars = 5
     }
@@ -89,6 +95,10 @@ $manifestCases = @()
 
 foreach ($case in $cases) {
     $text = Decode-Utf8Base64 $case.text_b64
+    $keywords = @()
+    foreach ($keywordB64 in $case.keywords_b64) {
+        $keywords += Decode-Utf8Base64 $keywordB64
+    }
     $rawPath = Join-Path $rawDir ($case.id + ".wav")
     $finalPath = Join-Path $OutputDir $case.wav
 
@@ -102,6 +112,7 @@ foreach ($case in $cases) {
         id = $case.id
         wav_path = $case.wav
         expected_text = $text
+        keywords = $keywords
         min_partial_updates = $case.min_partial_updates
         shortfall_tolerance_chars = $case.shortfall_tolerance_chars
     }
@@ -114,7 +125,10 @@ $manifest = [ordered]@{
 }
 
 $manifestPath = Join-Path $OutputDir "manifest.json"
-$manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestPath -Encoding UTF8
+$manifestJson = $manifest | ConvertTo-Json -Depth 6
+$manifestJson = ($manifestJson -split '\r?\n' | ForEach-Object { $_.TrimEnd() }) -join "`n"
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText($manifestPath, $manifestJson + "`n", $utf8NoBom)
 
 Write-Host "fixtures ready:"
 Write-Host $OutputDir

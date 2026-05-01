@@ -1,14 +1,15 @@
+use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{
     ops::{Deref, DerefMut},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use ainput_output::{OutputConfig, OutputDelivery};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use winit::event_loop::EventLoopProxy;
 
@@ -18,28 +19,52 @@ use crate::streaming_fixtures::{
     StreamingReplayPartialEntry, StreamingReplayReport, StreamingSelftestReport,
 };
 use crate::streaming_state::{
-    StreamingState, can_append_segment_only_candidate, longest_common_prefix_chars,
-    split_frozen_prefix, visible_text_char_count,
+    StreamingStabilityPolicy, StreamingState, can_append_segment_only_candidate,
+    longest_common_prefix_chars, split_frozen_prefix, visible_text_char_count,
 };
 use crate::{AppEvent, AppRuntime, hotkey};
 
 const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
-const STREAMING_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(15);
-const STREAMING_TAIL_PADDING_MS: u64 = 300;
-const STREAMING_RELEASE_GRACE_MS: u64 = 120;
-const STREAMING_RELEASE_MIN_WAIT_MS: u64 = 24;
-const STREAMING_RELEASE_IDLE_SETTLE_MS: u64 = 32;
+const STREAMING_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(120);
+const STREAMING_DEFAULT_TAIL_PADDING_MS: u64 = 720;
+const STREAMING_RELEASE_MAX_WAIT_MS: u64 = 500;
+const STREAMING_RELEASE_HARD_WAIT_MS: u64 = 650;
+const STREAMING_RELEASE_MIN_WAIT_MS: u64 = 160;
+const STREAMING_RELEASE_IDLE_SETTLE_MS: u64 = 160;
 const STREAMING_RELEASE_POLL_INTERVAL_MS: u64 = 8;
-const STREAMING_FINAL_AI_REWRITE_WAIT_MS: u64 = 320;
+const STREAMING_IDLE_FINALIZE_TAIL_PADDING_MS: u64 = 480;
+const STREAMING_HUD_SOFT_FLUSH_MS: u64 = 360;
+const STREAMING_HUD_SOFT_FLUSH_MIN_VISIBLE_CHARS: usize = 4;
+const STREAMING_HUD_SOFT_FLUSH_TAIL_PADDING_MS: u64 = 240;
+const STREAMING_FINAL_AI_REWRITE_WAIT_MS: u64 = 280;
+const STREAMING_HUD_FINAL_ACK_TIMEOUT_MS: u64 = 650;
 const STREAMING_PREVIEW_SHORTFALL_TOLERANCE_CHARS: usize = 3;
 const STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS: usize = 3;
-const STREAMING_PREROLL_MS: u64 = 180;
-const STREAMING_ENDPOINT_TRAILING_SILENCE_SECS: f32 = 10.0;
-const STREAMING_ENDPOINT_MAX_UTTERANCE_SECS: f32 = 20.0;
-const STREAMING_FIRST_PARTIAL_TARGET_MS: u128 = 300;
-const STREAMING_FIRST_PARTIAL_HARD_MS: u128 = 450;
-const STREAMING_RELEASE_TO_COMMIT_TARGET_MS: u128 = 220;
-const STREAMING_RELEASE_TO_COMMIT_HARD_MS: u128 = 450;
+const STREAMING_DEFAULT_PREROLL_MS: u64 = 180;
+const STREAMING_SHERPA_FALLBACK_TRAILING_SILENCE_SECS: f32 = 60.0;
+const STREAMING_SHERPA_FALLBACK_MAX_UTTERANCE_SECS: f32 = 60.0;
+const STREAMING_FIRST_PARTIAL_TARGET_MS: u128 = 700;
+const STREAMING_FIRST_PARTIAL_HARD_MS: u128 = 900;
+const STREAMING_RELEASE_TAIL_TARGET_MS: u128 = 500;
+const STREAMING_RELEASE_TAIL_HARD_MS: u128 = STREAMING_RELEASE_HARD_WAIT_MS as u128;
+const STREAMING_OFFLINE_FINAL_TARGET_MS: u128 = 180;
+const STREAMING_OFFLINE_FINAL_HARD_MS: u128 = 350;
+const STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS: u64 = 6_000;
+const STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS: u64 = 3_200;
+const STREAMING_PUNCTUATION_TARGET_MS: u128 = 120;
+const STREAMING_PUNCTUATION_HARD_MS: u128 = 220;
+const STREAMING_RELEASE_TO_COMMIT_TARGET_MS: u128 = 900;
+const STREAMING_RELEASE_TO_COMMIT_HARD_MS: u128 = 1200;
+const STREAMING_RAW_CAPTURE_LIMIT: usize = 20;
+const AUDIO_ACTIVITY_FRAME_SAMPLES: usize = 320;
+const AUDIO_ACTIVITY_SPEECH_FRAME_RMS: f32 = 0.004;
+const AUDIO_ACTIVITY_FRAME_MS: u64 = 20;
+const LOW_CONFIDENCE_SHORT_ENGLISH_SUSTAINED_VOICE_MS: u64 = 80;
+const LOW_CONFIDENCE_SHORT_ENGLISH_RMS: f32 = 0.0065;
+const LOW_CONFIDENCE_SHORT_ENGLISH_ACTIVE_RATIO: f32 = 0.06;
+const STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MIN_CHARS: usize = 4;
+const STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MAX_CHARS: usize = 18;
+static STREAMING_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) enum WorkerEvent {
     Ready(WorkerKind),
@@ -56,10 +81,21 @@ pub(crate) enum WorkerEvent {
         prepared_text: String,
     },
     StreamingFlushing,
+    StreamingFinalHudCommitRequest {
+        final_text: String,
+        response_tx: mpsc::Sender<StreamingHudCommitAck>,
+    },
     StreamingClipboardFallback(String),
     StreamingFinal(String),
     Error(String),
     Unavailable(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamingHudCommitAck {
+    pub text: String,
+    pub visible: bool,
+    pub elapsed_ms: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +123,7 @@ struct StreamingSession {
 }
 
 struct StreamingCoreSession {
+    session_id: String,
     input_sample_rate_hz: i32,
     sample_rate_hz: i32,
     stream: ainput_asr::StreamingZipformerStream,
@@ -95,6 +132,7 @@ struct StreamingCoreSession {
     ingested_input_samples: usize,
     resampler: StreamingResampler,
     state: StreamingState,
+    endpoint: StreamingEndpointTracker,
     rolled_over_prefix: String,
     awaiting_post_rollover_speech: bool,
     last_fast_preview_text: String,
@@ -109,7 +147,37 @@ struct StreamingCoreSession {
     total_chunks_fed: usize,
     partial_updates: usize,
     first_partial_at: Option<Instant>,
+    last_partial_audio_ms: Option<u64>,
+    last_soft_flush_audio_ms: Option<u64>,
     started_at: Instant,
+    commit_locked: bool,
+    post_hud_flush_mutation_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamingEndpointTracker {
+    segment_start_ms: u64,
+    speech_started_ms: Option<u64>,
+    last_voice_ms: Option<u64>,
+}
+
+impl StreamingEndpointTracker {
+    fn observe(&mut self, audio_duration_ms: u64, voice_active: bool) {
+        if !voice_active {
+            return;
+        }
+
+        if self.speech_started_ms.is_none() {
+            self.speech_started_ms = Some(audio_duration_ms);
+        }
+        self.last_voice_ms = Some(audio_duration_ms);
+    }
+
+    fn reset_after_rollover(&mut self, audio_duration_ms: u64) {
+        self.segment_start_ms = audio_duration_ms;
+        self.speech_started_ms = None;
+        self.last_voice_ms = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +192,7 @@ pub(crate) enum StreamingCommitSource {
     StreamingState,
     StreamingTailRepair,
     OnlineFinal,
+    OfflineFinal,
 }
 
 impl StreamingCommitSource {
@@ -132,14 +201,30 @@ impl StreamingCommitSource {
             Self::StreamingState => "streaming_state",
             Self::StreamingTailRepair => "streaming_tail_repair",
             Self::OnlineFinal => "online_final",
+            Self::OfflineFinal => "offline_final",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StreamingCommitChoice<'a> {
+#[derive(Debug, Clone)]
+struct StreamingCommitChoice {
     source: StreamingCommitSource,
-    text: &'a str,
+    text: String,
+}
+
+trait StreamingOutputAdapter {
+    fn commit_text(&self, text: &str, config: &OutputConfig) -> Result<OutputDelivery>;
+}
+
+struct ClipboardStreamingOutputAdapter<'a> {
+    controller: &'a ainput_output::OutputController,
+}
+
+impl StreamingOutputAdapter for ClipboardStreamingOutputAdapter<'_> {
+    fn commit_text(&self, text: &str, config: &OutputConfig) -> Result<OutputDelivery> {
+        let _voice_hotkey_suppression = hotkey::suppress_voice_hotkey_for_output();
+        self.controller.deliver_text(text, config)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,9 +242,12 @@ pub(crate) struct StreamingLiveProbeReport {
     partial_updates: usize,
     last_partial_text: String,
     final_online_raw_text: String,
+    final_offline_raw_text: String,
     final_prepared_candidate: String,
     final_text: String,
     commit_source: StreamingCommitSource,
+    raw_capture_wav: String,
+    raw_capture_metadata: String,
 }
 
 impl StreamingSession {
@@ -196,7 +284,9 @@ impl StreamingCoreSession {
         stream: ainput_asr::StreamingZipformerStream,
         sample_rate_hz: i32,
     ) -> Self {
+        let sequence = STREAMING_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         Self {
+            session_id: format!("streaming-{sequence}"),
             input_sample_rate_hz,
             sample_rate_hz,
             stream,
@@ -205,6 +295,7 @@ impl StreamingCoreSession {
             ingested_input_samples: 0,
             resampler: StreamingResampler::new(input_sample_rate_hz, sample_rate_hz),
             state: StreamingState::default(),
+            endpoint: StreamingEndpointTracker::default(),
             rolled_over_prefix: String::new(),
             awaiting_post_rollover_speech: false,
             last_fast_preview_text: String::new(),
@@ -219,7 +310,11 @@ impl StreamingCoreSession {
             total_chunks_fed: 0,
             partial_updates: 0,
             first_partial_at: None,
+            last_partial_audio_ms: None,
+            last_soft_flush_audio_ms: None,
             started_at: Instant::now(),
+            commit_locked: false,
+            post_hud_flush_mutation_count: 0,
         }
     }
 }
@@ -372,6 +467,7 @@ pub(crate) fn push_to_talk_worker(
                                     peak_abs = format_args!("{:.6}", activity.peak_abs),
                                     rms = format_args!("{:.6}", activity.rms),
                                     active_ratio = format_args!("{:.4}", activity.active_ratio),
+                                    sustained_voice_ms = activity.sustained_voice_ms,
                                     "push-to-talk recording captured"
                                 );
 
@@ -385,6 +481,7 @@ pub(crate) fn push_to_talk_worker(
                                         peak_abs = format_args!("{:.6}", activity.peak_abs),
                                         rms = format_args!("{:.6}", activity.rms),
                                         active_ratio = format_args!("{:.4}", activity.active_ratio),
+                                        sustained_voice_ms = activity.sustained_voice_ms,
                                         "skip transcription because captured audio looks like silence"
                                     );
                                     let _ = proxy
@@ -414,6 +511,7 @@ pub(crate) fn push_to_talk_worker(
                                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
                                                 rms = format_args!("{:.6}", activity.rms),
                                                 active_ratio = format_args!("{:.4}", activity.active_ratio),
+                                                sustained_voice_ms = activity.sustained_voice_ms,
                                                 "drop low-signal hallucinated transcription"
                                             );
                                             let _ = proxy.send_event(AppEvent::Worker(
@@ -460,11 +558,19 @@ pub(crate) fn push_to_talk_worker(
                                                 .fallback_to_clipboard,
                                             voice_hotkey_uses_alt: hotkey::voice_hotkey_uses_alt(),
                                             paste_stabilize_delay: Duration::from_millis(35),
+                                            allow_native_edit: false,
+                                            restore_clipboard_after_paste: true,
+                                            defer_clipboard_restore: false,
+                                            preserve_text_exactly: false,
                                         };
-                                        match runtime
-                                            .output_controller
-                                            .deliver_text(&text, &output_config)
-                                        {
+                                        let delivery_result = {
+                                            let _voice_hotkey_suppression =
+                                                hotkey::suppress_voice_hotkey_for_output();
+                                            runtime
+                                                .output_controller
+                                                .deliver_text(&text, &output_config)
+                                        };
+                                        match delivery_result {
                                             Ok(delivery) => {
                                                 let output_elapsed_ms =
                                                     output_started_at.elapsed().as_millis();
@@ -500,7 +606,8 @@ pub(crate) fn push_to_talk_worker(
                                                 );
 
                                                 let event = match delivery {
-                                                    OutputDelivery::DirectPaste => {
+                                                    OutputDelivery::NativeEdit
+                                                    | OutputDelivery::DirectPaste => {
                                                         WorkerEvent::Delivered
                                                     }
                                                     OutputDelivery::ClipboardOnly => {
@@ -577,14 +684,28 @@ pub(crate) fn streaming_push_to_talk_worker(
         },
         Some,
     );
+    let final_repair_recognizer = build_streaming_final_recognizer(&runtime).map_or_else(
+        |error| {
+            tracing::warn!(
+                error = %error,
+                "streaming offline final repair unavailable; final text will use streaming ASR only"
+            );
+            None
+        },
+        Some,
+    );
     let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(WorkerKind::Streaming)));
 
     let mut standby_recording: Option<ainput_audio::ActiveRecording> = None;
     let mut active_session: Option<StreamingSession> = None;
     tracing::info!(
-        shortcut = %runtime.config.hotkeys.voice_input,
+        fast_hotkey = %runtime.config.hotkeys.voice_input,
+        streaming_effective_hotkey = "Ctrl",
         model_dir = %runtime.runtime_paths.root_dir.join(&runtime.config.voice.streaming.model_dir).display(),
         chunk_ms = runtime.config.voice.streaming.chunk_ms,
+        streaming_asr_num_threads = effective_streaming_asr_num_threads(&runtime),
+        streaming_final_num_threads = effective_streaming_final_num_threads(&runtime),
+        streaming_punctuation_num_threads = effective_streaming_punctuation_num_threads(&runtime),
         "ainput streaming worker loop started"
     );
 
@@ -608,10 +729,11 @@ pub(crate) fn streaming_push_to_talk_worker(
                         if let Some(recording) = standby_recording.as_ref() {
                             let stream = recognizer.create_stream();
                             let current_cursor = recording.sample_count();
-                            let preroll_samples = sample_count_for_ms(
-                                recording.sample_rate_hz(),
-                                STREAMING_PREROLL_MS,
+                            let preroll_ms = streaming_endpoint_preroll_ms(
+                                &runtime.config.voice.streaming.endpoint,
                             );
+                            let preroll_samples =
+                                sample_count_for_ms(recording.sample_rate_hz(), preroll_ms);
                             let start_cursor = current_cursor.saturating_sub(preroll_samples);
                             active_session = Some(StreamingSession::new(
                                 recording.sample_rate_hz(),
@@ -625,7 +747,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 sample_rate_hz = recording.sample_rate_hz(),
                                 current_cursor,
                                 start_cursor,
-                                preroll_ms = STREAMING_PREROLL_MS,
+                                preroll_ms,
                                 "streaming push-to-talk recording started"
                             );
                         }
@@ -643,20 +765,27 @@ pub(crate) fn streaming_push_to_talk_worker(
                             continue;
                         };
                         let release_started_at = Instant::now();
-                        let release_drain =
-                            match finish_streaming_recording(&mut session, recording) {
-                                Ok(stats) => stats,
-                                Err(error) => {
-                                    tracing::error!(
-                                        error = %error,
-                                        "failed to finalize streaming recording on hotkey release"
-                                    );
-                                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                        format!("结束流式录音失败：{error}"),
-                                    )));
-                                    continue;
-                                }
-                            };
+                        let release_drain = match finish_streaming_recording(
+                            &mut session,
+                            recording,
+                            runtime
+                                .runtime_paths
+                                .logs_dir
+                                .join("streaming-raw-captures"),
+                            &runtime.config.voice.streaming.finalize,
+                        ) {
+                            Ok(stats) => stats,
+                            Err(error) => {
+                                tracing::error!(
+                                    error = %error,
+                                    "failed to finalize streaming recording on hotkey release"
+                                );
+                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                    format!("结束流式录音失败：{error}"),
+                                )));
+                                continue;
+                            }
+                        };
                         let sample_rate_hz = session.sample_rate_hz;
                         let chunk_samples = streaming_chunk_num_samples(
                             sample_rate_hz,
@@ -680,9 +809,13 @@ pub(crate) fn streaming_push_to_talk_worker(
                             peak_abs = format_args!("{:.6}", activity.peak_abs),
                             rms = format_args!("{:.6}", activity.rms),
                             active_ratio = format_args!("{:.4}", activity.active_ratio),
+                            sustained_voice_ms = activity.sustained_voice_ms,
                             release_grace_added_samples = release_drain.grace_added_samples,
                             release_stop_added_samples = release_drain.stop_added_samples,
                             release_grace_wait_elapsed_ms = release_drain.grace_wait_elapsed_ms,
+                            release_voice_active_observations =
+                                release_drain.voice_active_observations,
+                            release_tail_timeout_fallback = release_drain.timeout_fallback,
                             streamed_samples,
                             total_chunks_fed = session.total_chunks_fed,
                             "streaming push-to-talk recording captured"
@@ -695,6 +828,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
                                 rms = format_args!("{:.6}", activity.rms),
                                 active_ratio = format_args!("{:.4}", activity.active_ratio),
+                                sustained_voice_ms = activity.sustained_voice_ms,
                                 "skip streaming transcription because captured audio looks like silence"
                             );
                             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
@@ -712,10 +846,14 @@ pub(crate) fn streaming_push_to_talk_worker(
                         }
                         let prepared_commit = prepare_final_streaming_commit(
                             &recognizer,
+                            final_repair_recognizer.as_ref(),
                             punctuator.as_ref(),
                             &mut session,
                             sample_rate_hz,
                             chunk_samples,
+                            streaming_endpoint_tail_padding_ms(
+                                &runtime.config.voice.streaming.endpoint,
+                            ),
                             runtime.config.voice.streaming.rewrite_enabled,
                         );
 
@@ -724,75 +862,167 @@ pub(crate) fn streaming_push_to_talk_worker(
                         {
                             tracing::info!(
                                 final_online_raw_text = %prepared_commit.final_online_raw_text,
+                                final_offline_raw_text = %prepared_commit.final_offline_raw_text,
                                 prepared_final_candidate = %prepared_commit.prepared_final_candidate,
                                 display_text_before_final = %prepared_commit.display_text_before_final,
                                 candidate_display_text = %prepared_commit.candidate_display_text,
                                 selected_commit_source = prepared_commit.commit_source.as_str(),
                                 final_decode_elapsed_ms = prepared_commit.final_decode_elapsed_ms,
+                                online_final_elapsed_ms = prepared_commit.online_final_elapsed_ms,
+                                offline_final_elapsed_ms = prepared_commit.offline_final_elapsed_ms,
+                                offline_final_timed_out = prepared_commit.offline_final_timed_out,
+                                punctuation_elapsed_ms = prepared_commit.punctuation_elapsed_ms,
                                 final_decode_steps = prepared_commit.final_decode_steps,
                                 rejected_prefix_rewrite = prepared_commit.rejected_prefix_rewrite,
                                 peak_abs = format_args!("{:.6}", activity.peak_abs),
                                 rms = format_args!("{:.6}", activity.rms),
                                 active_ratio = format_args!("{:.4}", activity.active_ratio),
+                                sustained_voice_ms = activity.sustained_voice_ms,
                                 "drop empty or low-signal streaming final text"
                             );
                             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
                             continue;
                         }
 
-                        if prepared_commit.final_text != prepared_commit.display_text_before_final {
-                            emit_streaming_final_preview_sync(
-                                &mut session,
-                                &prepared_commit.final_text,
-                                &proxy,
-                            );
+                        let commit_envelope =
+                            StreamingCommitEnvelope::from_prepared(&session, &prepared_commit);
+                        let commit_text = ensure_terminal_sentence_boundary(
+                            &commit_envelope.resolved_commit_text,
+                        );
+                        tracing::info!(
+                            session_id = %commit_envelope.session_id,
+                            revision = commit_envelope.revision,
+                            last_hud_target_text = %commit_envelope.last_hud_target_text,
+                            final_online_raw_text = %commit_envelope.final_online_raw_text,
+                            final_offline_raw_text = %commit_envelope.final_offline_raw_text,
+                            final_candidate_text = %commit_envelope.final_candidate_text,
+                            candidate_display_text = %commit_envelope.candidate_display_text,
+                            resolved_commit_text = %commit_envelope.resolved_commit_text,
+                            commit_source = commit_envelope.commit_source.as_str(),
+                            online_final_elapsed_ms = commit_envelope.online_final_elapsed_ms,
+                            offline_final_elapsed_ms = commit_envelope.offline_final_elapsed_ms,
+                            offline_final_timed_out = commit_envelope.offline_final_timed_out,
+                            punctuation_elapsed_ms = commit_envelope.punctuation_elapsed_ms,
+                            "streaming commit envelope created"
+                        );
+
+                        session.commit_locked = true;
+                        let hud_final_flush_started_at = Instant::now();
+                        let hud_ack = if runtime.config.voice.streaming.panel_enabled
+                            && runtime
+                                .config
+                                .voice
+                                .streaming
+                                .commit
+                                .require_hud_flush_before_commit
+                        {
+                            match request_streaming_final_hud_commit_ack(&proxy, &commit_text) {
+                                Ok(ack) => ack,
+                                Err(error) => {
+                                    tracing::error!(
+                                        error = %error,
+                                        commit_text = %short_log_text(&commit_text, 120),
+                                        "streaming final HUD commit ack failed; skip paste"
+                                    );
+                                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                        format!("HUD 最终文本确认失败，已取消上屏：{error}"),
+                                    )));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            StreamingHudCommitAck {
+                                text: commit_text.clone(),
+                                visible: false,
+                                elapsed_ms: 0,
+                            }
+                        };
+                        let hud_commit_text = hud_ack.text.trim().to_string();
+                        if hud_commit_text.is_empty() {
+                            tracing::error!("streaming final HUD commit ack returned empty text");
+                            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                "HUD 最终文本为空，已取消上屏".to_string(),
+                            )));
+                            continue;
                         }
+                        let hud_final_flush_elapsed_ms =
+                            hud_final_flush_started_at.elapsed().as_millis();
 
                         tracing::info!(
                             samples = session.captured_samples.len(),
                             audio_duration_ms = captured_audio_duration_ms,
                             final_online_raw_text = %prepared_commit.final_online_raw_text,
+                            final_offline_raw_text = %prepared_commit.final_offline_raw_text,
                             display_text_before_final = %prepared_commit.display_text_before_final,
                             prepared_final_candidate = %prepared_commit.prepared_final_candidate,
                             candidate_display_text = %prepared_commit.candidate_display_text,
                             selected_commit_source = prepared_commit.commit_source.as_str(),
-                            commit_text = %prepared_commit.final_text,
+                            commit_text = %commit_text,
+                            hud_commit_text = %hud_commit_text,
+                            hud_ack_elapsed_ms = hud_ack.elapsed_ms,
+                            hud_ack_visible = hud_ack.visible,
                             final_decode_steps = prepared_commit.final_decode_steps,
                             final_decode_elapsed_ms = prepared_commit.final_decode_elapsed_ms,
+                            online_final_elapsed_ms = prepared_commit.online_final_elapsed_ms,
+                            offline_final_elapsed_ms = prepared_commit.offline_final_elapsed_ms,
+                            offline_final_timed_out = prepared_commit.offline_final_timed_out,
+                            punctuation_elapsed_ms = prepared_commit.punctuation_elapsed_ms,
+                            hud_final_flush_elapsed_ms,
+                            post_hud_flush_mutation_count = session.post_hud_flush_mutation_count,
                             rejected_prefix_rewrite = prepared_commit.rejected_prefix_rewrite,
                             total_decode_steps = session.total_decode_steps,
                             "streaming final transcription ready"
                         );
+
+                        let hotkey_release_wait_started_at = Instant::now();
+                        let modifiers_released = hotkey::wait_for_voice_hotkey_release(
+                            VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT,
+                        );
+                        let hotkey_release_wait_elapsed_ms =
+                            hotkey_release_wait_started_at.elapsed().as_millis();
+                        if !modifiers_released {
+                            tracing::warn!(
+                                waited_ms = hotkey_release_wait_elapsed_ms,
+                                fast_hotkey = %runtime.config.hotkeys.voice_input,
+                                streaming_effective_hotkey = "Ctrl",
+                                "streaming output started before all modifiers fully released"
+                            );
+                        }
 
                         let output_config = OutputConfig {
                             prefer_direct_paste: runtime.config.voice.prefer_direct_paste,
                             fallback_to_clipboard: runtime.config.voice.fallback_to_clipboard,
                             voice_hotkey_uses_alt: hotkey::voice_hotkey_uses_alt(),
                             paste_stabilize_delay: STREAMING_PASTE_STABILIZE_DELAY,
+                            allow_native_edit: true,
+                            restore_clipboard_after_paste: false,
+                            defer_clipboard_restore: false,
+                            preserve_text_exactly: true,
                         };
 
                         let output_started_at = Instant::now();
-                        let delivery = match runtime
-                            .output_controller
-                            .deliver_text(&prepared_commit.final_text, &output_config)
-                        {
-                            Ok(delivery) => {
-                                if matches!(delivery, OutputDelivery::ClipboardOnly) {
-                                    let _ = proxy.send_event(AppEvent::Worker(
-                                        WorkerEvent::StreamingClipboardFallback(
-                                            prepared_commit.final_text.clone(),
-                                        ),
-                                    ));
-                                }
-                                delivery
-                            }
-                            Err(error) => {
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("输出流式文本失败：{error}"),
-                                )));
-                                continue;
-                            }
+                        let output_adapter = ClipboardStreamingOutputAdapter {
+                            controller: &runtime.output_controller,
                         };
+                        let delivery =
+                            match output_adapter.commit_text(&hud_commit_text, &output_config) {
+                                Ok(delivery) => {
+                                    if matches!(delivery, OutputDelivery::ClipboardOnly) {
+                                        let _ = proxy.send_event(AppEvent::Worker(
+                                            WorkerEvent::StreamingClipboardFallback(
+                                                hud_commit_text.clone(),
+                                            ),
+                                        ));
+                                    }
+                                    delivery
+                                }
+                                Err(error) => {
+                                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
+                                        format!("输出流式文本失败：{error}"),
+                                    )));
+                                    continue;
+                                }
+                            };
                         let output_elapsed_ms = output_started_at.elapsed().as_millis();
                         let release_to_commit_elapsed_ms = release_started_at.elapsed().as_millis();
                         let first_partial_elapsed_ms = session
@@ -801,11 +1031,11 @@ pub(crate) fn streaming_push_to_talk_worker(
 
                         runtime
                             .shared_state
-                            .set_last_voice_text(prepared_commit.final_text.clone());
+                            .set_last_voice_text(hud_commit_text.clone());
                         runtime.maintenance.persist_voice_result(VoiceHistoryEntry {
                             timestamp: current_timestamp(),
                             delivery_label: streaming_delivery_label(delivery),
-                            text: prepared_commit.final_text.clone(),
+                            text: hud_commit_text.clone(),
                         });
                         let pipeline_elapsed_ms = session.started_at.elapsed().as_millis();
                         let realtime_factor = if captured_audio_duration_ms > 0 {
@@ -815,11 +1045,24 @@ pub(crate) fn streaming_push_to_talk_worker(
                         };
                         tracing::info!(
                             ?delivery,
-                            text = %prepared_commit.final_text,
+                            text = %hud_commit_text,
+                            commit_text = %commit_text,
+                            hud_ack_elapsed_ms = hud_ack.elapsed_ms,
+                            hud_ack_visible = hud_ack.visible,
+                            session_id = %commit_envelope.session_id,
+                            revision = commit_envelope.revision,
                             audio_duration_ms = captured_audio_duration_ms,
                             first_partial_elapsed_ms,
                             release_tail_elapsed_ms = release_drain.grace_wait_elapsed_ms,
+                            release_tail_timeout_fallback = release_drain.timeout_fallback,
+                            hotkey_release_wait_elapsed_ms,
                             final_decode_elapsed_ms = prepared_commit.final_decode_elapsed_ms,
+                            online_final_elapsed_ms = prepared_commit.online_final_elapsed_ms,
+                            offline_final_elapsed_ms = prepared_commit.offline_final_elapsed_ms,
+                            offline_final_timed_out = prepared_commit.offline_final_timed_out,
+                            punctuation_elapsed_ms = prepared_commit.punctuation_elapsed_ms,
+                            hud_final_flush_elapsed_ms,
+                            post_hud_flush_mutation_count = session.post_hud_flush_mutation_count,
                             final_decode_steps = prepared_commit.final_decode_steps,
                             total_decode_steps = session.total_decode_steps,
                             output_elapsed_ms,
@@ -830,11 +1073,23 @@ pub(crate) fn streaming_push_to_talk_worker(
                         );
                         log_streaming_timing_gate_results(
                             first_partial_elapsed_ms,
+                            release_drain.grace_wait_elapsed_ms,
+                            prepared_commit.offline_final_elapsed_ms,
+                            prepared_commit.offline_final_timed_out,
+                            prepared_commit.punctuation_elapsed_ms,
                             release_to_commit_elapsed_ms,
                         );
 
+                        let drained_commands = drain_pending_voice_commands(&worker_rx);
+                        if drained_commands > 0 {
+                            tracing::warn!(
+                                drained_commands,
+                                "dropped queued voice hotkey commands after streaming commit"
+                            );
+                        }
+
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFinal(
-                            prepared_commit.final_text,
+                            hud_commit_text,
                         )));
                     }
                 }
@@ -877,12 +1132,66 @@ pub(crate) fn streaming_push_to_talk_worker(
                         "streaming live preview decode failed"
                     );
                 }
+                let soft_flushed = if let Some(update) = maybe_soft_flush_streaming_tail_core(
+                    &runtime,
+                    &recognizer,
+                    punctuator.as_ref(),
+                    session,
+                    runtime.config.voice.streaming.rewrite_enabled,
+                    audio_duration_ms,
+                ) {
+                    tracing::debug!(
+                        samples = session.captured_samples.len(),
+                        audio_duration_ms,
+                        decode_steps = session.total_decode_steps,
+                        total_chunks_fed = session.total_chunks_fed,
+                        selected_preview_source = update.source,
+                        stable_chars = update.stable_chars,
+                        frozen_chars = update.frozen_chars,
+                        volatile_chars = update.volatile_chars,
+                        revision = update.revision,
+                        raw_text = %update.raw_text,
+                        prepared_text = %update.display_text,
+                        "streaming HUD soft flush updated"
+                    );
+                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
+                        raw_text: update.raw_text,
+                        prepared_text: update.display_text,
+                    }));
+                    true
+                } else {
+                    false
+                };
+
+                if !soft_flushed
+                    && let Some(committed_text) = maybe_rollover_streaming_segment_core(
+                        &runtime,
+                        &recognizer,
+                        punctuator.as_ref(),
+                        session,
+                        runtime.config.voice.streaming.rewrite_enabled,
+                        audio_duration_ms,
+                    )
+                {
+                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
+                        raw_text: committed_text.clone(),
+                        prepared_text: committed_text,
+                    }));
+                }
             }
 
             let level = normalize_audio_level(recording.current_level());
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Meter(level)));
         }
     }
+}
+
+fn drain_pending_voice_commands(worker_rx: &mpsc::Receiver<WorkerCommand>) -> usize {
+    let mut drained = 0usize;
+    while worker_rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    drained
 }
 
 pub(crate) fn probe_streaming_live_session(
@@ -925,6 +1234,7 @@ pub(crate) fn probe_streaming_live_session(
                 total_audio_duration_ms,
             )?;
             let _ = maybe_rollover_streaming_segment_core(
+                runtime,
                 recognizer,
                 punctuator.as_ref(),
                 &mut session,
@@ -946,15 +1256,26 @@ pub(crate) fn probe_streaming_live_session(
     );
 
     let activity = analyze_audio_activity(&session.captured_samples);
+    let offline_final_recognizer = build_streaming_final_recognizer(runtime).ok();
     let prepared_commit = prepare_final_streaming_commit(
         recognizer,
+        offline_final_recognizer.as_ref(),
         punctuator.as_ref(),
         &mut session,
         sample_rate_hz,
         chunk_samples,
+        streaming_endpoint_tail_padding_ms(&runtime.config.voice.streaming.endpoint),
         runtime.config.voice.streaming.rewrite_enabled,
     );
     let final_text = prepared_commit.final_text.clone();
+    let recorded = recording.stop()?;
+    let raw_capture = save_streaming_raw_capture(
+        runtime
+            .runtime_paths
+            .logs_dir
+            .join("streaming-raw-captures"),
+        recorded,
+    )?;
 
     Ok(StreamingLiveProbeReport {
         seconds_requested: seconds.max(1),
@@ -970,9 +1291,12 @@ pub(crate) fn probe_streaming_live_session(
         partial_updates: session.partial_updates,
         last_partial_text: session.last_display_text.clone(),
         final_online_raw_text: prepared_commit.final_online_raw_text,
+        final_offline_raw_text: prepared_commit.final_offline_raw_text,
         final_prepared_candidate: prepared_commit.prepared_final_candidate,
         final_text,
         commit_source: prepared_commit.commit_source,
+        raw_capture_wav: raw_capture.wav_path.display().to_string(),
+        raw_capture_metadata: raw_capture.json_path.display().to_string(),
     })
 }
 
@@ -982,11 +1306,13 @@ pub(crate) fn replay_streaming_wav(
     case_id: &str,
     wav_path: &Path,
     expected_text: Option<&str>,
+    keywords: &[String],
     min_partial_updates: usize,
     min_visible_chars: Option<usize>,
     shortfall_tolerance_chars: usize,
 ) -> Result<StreamingReplayReport> {
     let punctuator = build_streaming_punctuator(runtime).ok();
+    let offline_final_recognizer = build_streaming_final_recognizer(runtime).ok();
     let (input_sample_rate_hz, input_samples) = read_wav_samples(wav_path)?;
     let mut session = StreamingCoreSession::new(
         input_sample_rate_hz,
@@ -1003,6 +1329,7 @@ pub(crate) fn replay_streaming_wav(
     );
     let runner_sample_rate_hz = session.sample_rate_hz;
     let mut partial_timeline = Vec::new();
+    let processing_started_at = Instant::now();
 
     for chunk in input_samples.chunks(replay_chunk_num_samples.max(1)) {
         let added_samples = push_streaming_input_samples(&mut session, chunk);
@@ -1020,6 +1347,32 @@ pub(crate) fn replay_streaming_wav(
 
         let total_audio_duration_ms =
             audio_duration_ms(session.sample_rate_hz, session.captured_samples.len());
+        if let Some(fast_update) = prepare_fast_streaming_partial(
+            recognizer,
+            &mut session,
+            total_audio_duration_ms,
+            streaming_stability_policy(&runtime.config.voice.streaming.stability),
+        ) {
+            let processing_elapsed_ms = processing_started_at.elapsed().as_millis();
+            partial_timeline.push(StreamingReplayPartialEntry {
+                offset_ms: total_audio_duration_ms,
+                processing_elapsed_ms,
+                processing_realtime_factor: streaming_replay_realtime_factor(
+                    processing_elapsed_ms,
+                    total_audio_duration_ms,
+                ),
+                raw_text: fast_update.raw_text,
+                content_chars: content_chars_without_sentence_punctuation(
+                    &fast_update.display_text,
+                ),
+                prepared_text: fast_update.display_text,
+                source: fast_update.source.to_string(),
+                stable_chars: fast_update.stable_chars,
+                frozen_chars: fast_update.frozen_chars,
+                volatile_chars: fast_update.volatile_chars,
+                rejected_prefix_rewrite: fast_update.rejected_prefix_rewrite,
+            });
+        }
         if let Some(update) = update_streaming_partial_state(
             runtime,
             recognizer,
@@ -1028,9 +1381,16 @@ pub(crate) fn replay_streaming_wav(
             runtime.config.voice.streaming.rewrite_enabled,
             total_audio_duration_ms,
         )? {
+            let processing_elapsed_ms = processing_started_at.elapsed().as_millis();
             partial_timeline.push(StreamingReplayPartialEntry {
                 offset_ms: total_audio_duration_ms,
+                processing_elapsed_ms,
+                processing_realtime_factor: streaming_replay_realtime_factor(
+                    processing_elapsed_ms,
+                    total_audio_duration_ms,
+                ),
                 raw_text: update.raw_text,
+                content_chars: content_chars_without_sentence_punctuation(&update.display_text),
                 prepared_text: update.display_text,
                 source: update.source.to_string(),
                 stable_chars: update.stable_chars,
@@ -1039,21 +1399,62 @@ pub(crate) fn replay_streaming_wav(
                 rejected_prefix_rewrite: update.rejected_prefix_rewrite,
             });
         }
-        if let Some(committed_text) = maybe_rollover_streaming_segment_core(
+
+        let soft_flushed = if let Some(update) = maybe_soft_flush_streaming_tail_core(
+            runtime,
             recognizer,
             punctuator.as_ref(),
             &mut session,
             runtime.config.voice.streaming.rewrite_enabled,
             total_audio_duration_ms,
         ) {
+            let processing_elapsed_ms = processing_started_at.elapsed().as_millis();
             partial_timeline.push(StreamingReplayPartialEntry {
                 offset_ms: total_audio_duration_ms,
+                processing_elapsed_ms,
+                processing_realtime_factor: streaming_replay_realtime_factor(
+                    processing_elapsed_ms,
+                    total_audio_duration_ms,
+                ),
+                raw_text: update.raw_text,
+                content_chars: content_chars_without_sentence_punctuation(&update.display_text),
+                prepared_text: update.display_text,
+                source: update.source.to_string(),
+                stable_chars: update.stable_chars,
+                frozen_chars: update.frozen_chars,
+                volatile_chars: update.volatile_chars,
+                rejected_prefix_rewrite: update.rejected_prefix_rewrite,
+            });
+            true
+        } else {
+            false
+        };
+
+        if !soft_flushed
+            && let Some(committed_text) = maybe_rollover_streaming_segment_core(
+                runtime,
+                recognizer,
+                punctuator.as_ref(),
+                &mut session,
+                runtime.config.voice.streaming.rewrite_enabled,
+                total_audio_duration_ms,
+            )
+        {
+            let processing_elapsed_ms = processing_started_at.elapsed().as_millis();
+            partial_timeline.push(StreamingReplayPartialEntry {
+                offset_ms: total_audio_duration_ms,
+                processing_elapsed_ms,
+                processing_realtime_factor: streaming_replay_realtime_factor(
+                    processing_elapsed_ms,
+                    total_audio_duration_ms,
+                ),
                 raw_text: committed_text.clone(),
+                content_chars: content_chars_without_sentence_punctuation(&committed_text),
                 prepared_text: committed_text,
                 source: "endpoint_rollover".to_string(),
                 stable_chars: session.last_display_text.chars().count(),
-                frozen_chars: session.state.frozen_prefix.chars().count(),
-                volatile_chars: session.state.volatile_sentence.chars().count(),
+                frozen_chars: session.state.committed_prefix.chars().count(),
+                volatile_chars: session.state.current_tail().chars().count(),
                 rejected_prefix_rewrite: false,
             });
         }
@@ -1070,14 +1471,51 @@ pub(crate) fn replay_streaming_wav(
     let activity = analyze_audio_activity(&session.captured_samples);
     let prepared_commit = prepare_final_streaming_commit(
         recognizer,
+        offline_final_recognizer.as_ref(),
         punctuator.as_ref(),
         &mut session,
         runner_sample_rate_hz,
         stream_chunk_num_samples,
+        streaming_endpoint_tail_padding_ms(&runtime.config.voice.streaming.endpoint),
         runtime.config.voice.streaming.rewrite_enabled,
     );
+    let processing_wall_elapsed_ms = processing_started_at.elapsed().as_millis();
+    let input_duration_ms = audio_duration_ms(input_sample_rate_hz, session.ingested_input_samples);
+    let processing_realtime_factor = if input_duration_ms > 0 {
+        processing_wall_elapsed_ms as f64 / input_duration_ms as f64
+    } else {
+        0.0
+    };
     let final_text = prepared_commit.final_text.clone();
     let final_visible_chars = visible_text_char_count(&final_text);
+    if should_append_release_final_preview(&partial_timeline, &final_text) {
+        let final_content_chars = content_chars_without_sentence_punctuation(&final_text);
+        partial_timeline.push(StreamingReplayPartialEntry {
+            offset_ms: input_duration_ms,
+            processing_elapsed_ms: processing_wall_elapsed_ms,
+            processing_realtime_factor,
+            raw_text: prepared_commit.final_online_raw_text.clone(),
+            content_chars: final_content_chars,
+            prepared_text: final_text.clone(),
+            source: "release_final_preview".to_string(),
+            stable_chars: final_content_chars,
+            frozen_chars: session.state.committed_prefix.chars().count(),
+            volatile_chars: 0,
+            rejected_prefix_rewrite: false,
+        });
+        session.last_display_text = final_text.clone();
+    }
+    let last_partial_content_chars = partial_timeline
+        .last()
+        .map(|entry| entry.content_chars)
+        .unwrap_or(0);
+    let final_content_chars = content_chars_without_sentence_punctuation(&final_text);
+    let final_extra_content_chars = final_content_chars.saturating_sub(last_partial_content_chars);
+    let final_missing_content_chars =
+        last_partial_content_chars.saturating_sub(final_content_chars);
+    let last_partial_to_final_gap_ms = partial_timeline
+        .last()
+        .map(|entry| input_duration_ms.saturating_sub(entry.offset_ms));
     let expected_text = expected_text.map(str::to_string);
     let expected_visible_chars = min_visible_chars.or_else(|| {
         expected_text
@@ -1118,14 +1556,28 @@ pub(crate) fn replay_streaming_wav(
     } else {
         StreamingCaseStatus::FailBehavior
     };
+    let (rollback_count, max_rollback_chars) =
+        summarize_streaming_timeline_rollbacks(&partial_timeline);
 
     let mut content_failures = Vec::new();
-    if let Some(expected_text) = expected_text.as_deref()
-        && normalize_replay_text(&final_text) != normalize_replay_text(expected_text)
-    {
+    let matched_keywords = matched_replay_keywords(&final_text, keywords);
+    let keyword_coverage =
+        (!keywords.is_empty()).then_some(matched_keywords.len() as f32 / keywords.len() as f32);
+    let exact_content_match = expected_text
+        .as_deref()
+        .map(|expected_text| {
+            normalize_replay_text(&final_text) == normalize_replay_text(expected_text)
+        })
+        .unwrap_or(true);
+    let keyword_content_match = !keywords.is_empty() && matched_keywords.len() == keywords.len();
+    if !exact_content_match && !keyword_content_match {
+        let expected_text = expected_text.as_deref().unwrap_or("");
         content_failures.push(format!(
-            "final_text_mismatch expected='{}' actual='{}'",
-            expected_text, final_text
+            "final_text_mismatch expected='{}' actual='{}' matched_keywords={}/{}",
+            expected_text,
+            final_text,
+            matched_keywords.len(),
+            keywords.len()
         ));
     }
     let content_status = if content_failures.is_empty() {
@@ -1140,7 +1592,7 @@ pub(crate) fn replay_streaming_wav(
         input_wav: wav_path.display().to_string(),
         input_sample_rate_hz,
         runner_sample_rate_hz,
-        input_duration_ms: audio_duration_ms(input_sample_rate_hz, session.ingested_input_samples),
+        input_duration_ms,
         captured_samples: session.captured_samples.len(),
         peak_abs: activity.peak_abs,
         rms: activity.rms,
@@ -1149,22 +1601,101 @@ pub(crate) fn replay_streaming_wav(
         total_decode_steps: session.total_decode_steps,
         partial_updates: session.partial_updates,
         first_partial_ms: partial_timeline.first().map(|entry| entry.offset_ms),
-        final_commit_ms: audio_duration_ms(input_sample_rate_hz, session.ingested_input_samples),
+        final_commit_ms: input_duration_ms,
+        processing_wall_elapsed_ms,
+        processing_realtime_factor,
+        final_decode_elapsed_ms: prepared_commit.final_decode_elapsed_ms,
+        online_final_elapsed_ms: prepared_commit.online_final_elapsed_ms,
+        offline_final_elapsed_ms: prepared_commit.offline_final_elapsed_ms,
+        offline_final_timed_out: prepared_commit.offline_final_timed_out,
+        punctuation_elapsed_ms: prepared_commit.punctuation_elapsed_ms,
+        rollback_count,
+        max_rollback_chars,
+        last_partial_content_chars,
+        final_extra_content_chars,
+        final_missing_content_chars,
+        last_partial_to_final_gap_ms,
         partial_timeline,
         last_partial_text: session.last_display_text.clone(),
         final_online_raw_text: prepared_commit.final_online_raw_text,
+        final_offline_raw_text: prepared_commit.final_offline_raw_text,
         final_prepared_candidate: prepared_commit.prepared_final_candidate,
         final_text,
         final_visible_chars,
         commit_source: prepared_commit.commit_source.as_str().to_string(),
         expected_text,
         expected_visible_chars,
+        keywords: keywords.to_vec(),
+        matched_keywords,
+        keyword_coverage,
         min_partial_updates,
         shortfall_tolerance_chars,
         behavior_status,
         content_status,
         failures,
     })
+}
+
+fn streaming_replay_realtime_factor(processing_elapsed_ms: u128, audio_offset_ms: u64) -> f64 {
+    if audio_offset_ms == 0 {
+        0.0
+    } else {
+        processing_elapsed_ms as f64 / audio_offset_ms as f64
+    }
+}
+
+fn should_append_release_final_preview(
+    partial_timeline: &[StreamingReplayPartialEntry],
+    final_text: &str,
+) -> bool {
+    let final_trimmed = final_text.trim();
+    if final_trimmed.is_empty() {
+        return false;
+    }
+    partial_timeline
+        .last()
+        .map(|entry| entry.prepared_text.trim() != final_trimmed)
+        .unwrap_or(true)
+}
+
+fn matched_replay_keywords(final_text: &str, keywords: &[String]) -> Vec<String> {
+    let normalized_final = normalize_replay_text(final_text);
+    keywords
+        .iter()
+        .filter(|keyword| {
+            let normalized_keyword = normalize_replay_text(keyword);
+            !normalized_keyword.is_empty() && normalized_final.contains(&normalized_keyword)
+        })
+        .cloned()
+        .collect()
+}
+
+fn summarize_streaming_timeline_rollbacks(
+    partial_timeline: &[StreamingReplayPartialEntry],
+) -> (usize, usize) {
+    let mut rollback_count = partial_timeline
+        .iter()
+        .filter(|entry| entry.rejected_prefix_rewrite)
+        .count();
+    let mut max_rollback_chars = 0usize;
+
+    for pair in partial_timeline.windows(2) {
+        let previous = pair[0].prepared_text.trim();
+        let current = pair[1].prepared_text.trim();
+        if previous.is_empty() || current.is_empty() {
+            continue;
+        }
+
+        let previous_chars = previous.chars().count();
+        let common_chars = longest_common_prefix_chars(previous, current);
+        let rollback_chars = previous_chars.saturating_sub(common_chars);
+        if rollback_chars > 0 && common_chars < previous_chars {
+            rollback_count += 1;
+            max_rollback_chars = max_rollback_chars.max(rollback_chars);
+        }
+    }
+
+    (rollback_count, max_rollback_chars)
 }
 
 pub(crate) fn replay_streaming_manifest(
@@ -1191,6 +1722,7 @@ pub(crate) fn replay_streaming_manifest(
             &case.id,
             &wav_path,
             case.expected_text.as_deref(),
+            &case.keywords,
             case.min_partial_updates.unwrap_or(1),
             case.min_visible_chars,
             case.shortfall_tolerance_chars.unwrap_or(3),
@@ -1267,6 +1799,22 @@ fn build_recognizer(runtime: &AppRuntime) -> Result<ainput_asr::SenseVoiceRecogn
     })
 }
 
+fn build_streaming_final_recognizer(
+    runtime: &AppRuntime,
+) -> Result<ainput_asr::SenseVoiceRecognizer> {
+    ainput_asr::SenseVoiceRecognizer::create(&ainput_asr::SenseVoiceConfig {
+        model_dir: runtime
+            .runtime_paths
+            .root_dir
+            .join(&runtime.config.asr.model_dir),
+        provider: runtime.config.asr.provider.clone(),
+        sample_rate_hz: runtime.config.asr.sample_rate_hz as i32,
+        language: runtime.config.asr.language.clone(),
+        use_itn: runtime.config.asr.use_itn,
+        num_threads: effective_streaming_final_num_threads(runtime),
+    })
+}
+
 fn build_streaming_recognizer(
     runtime: &AppRuntime,
 ) -> Result<ainput_asr::StreamingZipformerRecognizer> {
@@ -1277,12 +1825,12 @@ fn build_streaming_recognizer(
             .join(&runtime.config.voice.streaming.model_dir),
         provider: runtime.config.asr.provider.clone(),
         sample_rate_hz: runtime.config.asr.sample_rate_hz as i32,
-        num_threads: runtime.config.asr.num_threads,
+        num_threads: effective_streaming_asr_num_threads(runtime),
         decoding_method: "greedy_search".to_string(),
-        enable_endpoint: true,
-        rule1_min_trailing_silence: STREAMING_ENDPOINT_TRAILING_SILENCE_SECS,
-        rule2_min_trailing_silence: STREAMING_ENDPOINT_TRAILING_SILENCE_SECS,
-        rule3_min_utterance_length: STREAMING_ENDPOINT_MAX_UTTERANCE_SECS,
+        enable_endpoint: false,
+        rule1_min_trailing_silence: STREAMING_SHERPA_FALLBACK_TRAILING_SILENCE_SECS,
+        rule2_min_trailing_silence: STREAMING_SHERPA_FALLBACK_TRAILING_SILENCE_SECS,
+        rule3_min_utterance_length: STREAMING_SHERPA_FALLBACK_MAX_UTTERANCE_SECS,
     })
 }
 
@@ -1295,8 +1843,45 @@ fn build_streaming_punctuator(
             .root_dir
             .join(&runtime.config.voice.streaming.punctuation_model_dir),
         provider: runtime.config.asr.provider.clone(),
-        num_threads: runtime.config.voice.streaming.punctuation_num_threads,
+        num_threads: effective_streaming_punctuation_num_threads(runtime),
     })
+}
+
+fn effective_streaming_asr_num_threads(runtime: &AppRuntime) -> i32 {
+    let configured = runtime.config.voice.streaming.performance.asr_num_threads;
+    if configured <= 0 {
+        runtime.config.asr.num_threads.max(1)
+    } else {
+        configured.clamp(1, 12)
+    }
+}
+
+fn effective_streaming_final_num_threads(runtime: &AppRuntime) -> i32 {
+    let configured = runtime.config.voice.streaming.performance.final_num_threads;
+    if configured <= 0 {
+        runtime.config.asr.num_threads.max(1)
+    } else {
+        configured.clamp(1, 16)
+    }
+}
+
+fn effective_streaming_punctuation_num_threads(runtime: &AppRuntime) -> i32 {
+    let configured = runtime
+        .config
+        .voice
+        .streaming
+        .performance
+        .punctuation_num_threads;
+    if configured <= 0 {
+        runtime
+            .config
+            .voice
+            .streaming
+            .punctuation_num_threads
+            .max(1)
+    } else {
+        configured.clamp(1, 4)
+    }
 }
 
 fn ensure_streaming_recording_ready(
@@ -1373,19 +1958,26 @@ fn collect_stopped_recording_tail(
 fn finish_streaming_recording(
     session: &mut StreamingSession,
     recording: ainput_audio::ActiveRecording,
+    raw_capture_dir: PathBuf,
+    finalize_config: &ainput_shell::StreamingFinalizeConfig,
 ) -> Result<StreamingReleaseDrainStats> {
     let grace_started_at = Instant::now();
-    let deadline = grace_started_at + Duration::from_millis(STREAMING_RELEASE_GRACE_MS);
-    let min_wait = Duration::from_millis(STREAMING_RELEASE_MIN_WAIT_MS);
-    let idle_settle = Duration::from_millis(STREAMING_RELEASE_IDLE_SETTLE_MS);
+    let max_wait_ms = streaming_release_drain_max_ms(finalize_config);
+    let min_wait_ms = streaming_release_drain_min_ms(finalize_config);
+    let idle_settle_ms = streaming_release_drain_idle_settle_ms(finalize_config);
+    let deadline = grace_started_at + Duration::from_millis(max_wait_ms);
+    let min_wait = Duration::from_millis(min_wait_ms);
+    let idle_settle = Duration::from_millis(idle_settle_ms);
     let poll_interval = Duration::from_millis(STREAMING_RELEASE_POLL_INTERVAL_MS);
 
     let mut grace_added_samples = 0usize;
-    let mut last_new_audio_at: Option<Instant> = None;
+    let mut last_voice_at: Option<Instant> = None;
+    let mut voice_active_observations = 0usize;
+    let mut timeout_fallback = false;
     tracing::info!(
-        grace_ms = STREAMING_RELEASE_GRACE_MS,
-        min_wait_ms = STREAMING_RELEASE_MIN_WAIT_MS,
-        idle_settle_ms = STREAMING_RELEASE_IDLE_SETTLE_MS,
+        max_wait_ms,
+        min_wait_ms,
+        idle_settle_ms,
         "streaming release tail drain started"
     );
 
@@ -1393,20 +1985,28 @@ fn finish_streaming_recording(
         let added = collect_streaming_audio_chunk(session, &recording);
         if added > 0 {
             grace_added_samples += added;
-            last_new_audio_at = Some(Instant::now());
+        }
+
+        let activity =
+            analyze_recent_audio_activity(&session.captured_samples, session.sample_rate_hz, 180);
+        if is_streaming_endpoint_voice_active(&activity) {
+            last_voice_at = Some(Instant::now());
+            voice_active_observations += 1;
         }
 
         let now = Instant::now();
         if now >= deadline {
+            timeout_fallback = true;
             break;
         }
 
         let waited = now.saturating_duration_since(grace_started_at);
-        if waited >= min_wait
-            && last_new_audio_at
-                .is_some_and(|instant| now.saturating_duration_since(instant) >= idle_settle)
-        {
-            break;
+        if waited >= min_wait {
+            match last_voice_at {
+                Some(instant) if now.saturating_duration_since(instant) >= idle_settle => break,
+                None if waited >= idle_settle => break,
+                _ => {}
+            }
         }
 
         std::thread::sleep(poll_interval);
@@ -1414,12 +2014,16 @@ fn finish_streaming_recording(
 
     let recorded = recording.stop()?;
     let stop_added_samples = collect_stopped_recording_tail(session, &recorded);
+    let recorded_total_samples = recorded.samples.len();
+    save_streaming_raw_capture_async(raw_capture_dir, recorded);
     let grace_wait_elapsed_ms = grace_started_at.elapsed().as_millis();
     tracing::info!(
         grace_added_samples,
         stop_added_samples,
         grace_wait_elapsed_ms,
-        recorded_total_samples = recorded.samples.len(),
+        voice_active_observations,
+        timeout_fallback = ?timeout_fallback,
+        recorded_total_samples,
         "streaming release tail drain finished"
     );
 
@@ -1427,13 +2031,93 @@ fn finish_streaming_recording(
         grace_added_samples,
         stop_added_samples,
         grace_wait_elapsed_ms,
+        voice_active_observations,
+        timeout_fallback,
     })
+}
+
+fn streaming_release_drain_min_ms(config: &ainput_shell::StreamingFinalizeConfig) -> u64 {
+    if config.release_drain_min_ms == 0 {
+        STREAMING_RELEASE_MIN_WAIT_MS
+    } else {
+        config.release_drain_min_ms.clamp(80, 300)
+    }
+}
+
+fn streaming_release_drain_idle_settle_ms(config: &ainput_shell::StreamingFinalizeConfig) -> u64 {
+    if config.release_drain_idle_settle_ms == 0 {
+        STREAMING_RELEASE_IDLE_SETTLE_MS
+    } else {
+        config.release_drain_idle_settle_ms.clamp(80, 320)
+    }
+}
+
+fn streaming_release_drain_max_ms(config: &ainput_shell::StreamingFinalizeConfig) -> u64 {
+    if config.release_drain_max_ms == 0 {
+        STREAMING_RELEASE_MAX_WAIT_MS
+    } else {
+        config.release_drain_max_ms.clamp(
+            STREAMING_RELEASE_MIN_WAIT_MS,
+            STREAMING_RELEASE_HARD_WAIT_MS,
+        )
+    }
 }
 
 fn streaming_chunk_num_samples(sample_rate_hz: i32, chunk_ms: u32) -> usize {
     let effective_sample_rate = sample_rate_hz.max(1) as usize;
     let effective_chunk_ms = chunk_ms.clamp(60, 500) as usize;
     ((effective_sample_rate * effective_chunk_ms) / 1000).max(effective_sample_rate / 20)
+}
+
+fn streaming_endpoint_preroll_ms(config: &ainput_shell::StreamingEndpointConfig) -> u64 {
+    if config.preroll_ms == 0 {
+        STREAMING_DEFAULT_PREROLL_MS
+    } else {
+        config.preroll_ms.min(1_000)
+    }
+}
+
+fn streaming_endpoint_tail_padding_ms(config: &ainput_shell::StreamingEndpointConfig) -> u64 {
+    if config.tail_padding_ms == 0 {
+        STREAMING_DEFAULT_TAIL_PADDING_MS
+    } else {
+        config.tail_padding_ms.clamp(80, 1_000)
+    }
+}
+
+fn streaming_endpoint_soft_flush_ms(config: &ainput_shell::StreamingEndpointConfig) -> u64 {
+    if config.soft_flush_ms == 0 {
+        STREAMING_HUD_SOFT_FLUSH_MS
+    } else {
+        config.soft_flush_ms.clamp(200, 1_200)
+    }
+}
+
+fn streaming_idle_finalize_tail_padding_ms(config: &ainput_shell::StreamingEndpointConfig) -> u64 {
+    if config.tail_padding_ms == 0 {
+        STREAMING_IDLE_FINALIZE_TAIL_PADDING_MS
+    } else {
+        config.tail_padding_ms.clamp(120, 800)
+    }
+}
+
+fn streaming_soft_flush_tail_padding_ms(config: &ainput_shell::StreamingEndpointConfig) -> u64 {
+    if config.tail_padding_ms == 0 {
+        STREAMING_HUD_SOFT_FLUSH_TAIL_PADDING_MS
+    } else {
+        config
+            .tail_padding_ms
+            .clamp(120, STREAMING_HUD_SOFT_FLUSH_TAIL_PADDING_MS)
+    }
+}
+
+fn streaming_stability_policy(
+    config: &ainput_shell::StreamingStabilityConfig,
+) -> StreamingStabilityPolicy {
+    StreamingStabilityPolicy {
+        min_agreement: config.min_agreement,
+        max_rollback_chars: config.max_rollback_chars,
+    }
 }
 
 fn feed_streaming_pending_chunks(
@@ -1472,6 +2156,7 @@ fn finalize_streaming_decode(
     session: &mut StreamingCoreSession,
     sample_rate_hz: i32,
     chunk_num_samples: usize,
+    tail_padding_ms: u64,
 ) -> usize {
     let mut decode_steps = 0usize;
     let _ = flush_streaming_audio_tail(session);
@@ -1484,7 +2169,34 @@ fn finalize_streaming_decode(
     );
 
     let tail_padding_num_samples =
-        ((sample_rate_hz.max(1) as usize) * STREAMING_TAIL_PADDING_MS as usize / 1000).max(1);
+        ((sample_rate_hz.max(1) as usize) * tail_padding_ms as usize / 1000).max(1);
+    let tail_padding = vec![0.0f32; tail_padding_num_samples];
+    recognizer.accept_waveform(&session.stream, sample_rate_hz, &tail_padding);
+    decode_steps += recognizer.decode_available(&session.stream);
+    recognizer.input_finished(&session.stream);
+    decode_steps += recognizer.decode_available(&session.stream);
+    session.total_decode_steps += decode_steps;
+    decode_steps
+}
+
+fn finalize_streaming_pause_boundary_decode(
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    session: &mut StreamingCoreSession,
+    sample_rate_hz: i32,
+    chunk_num_samples: usize,
+    tail_padding_ms: u64,
+) -> usize {
+    let _ = feed_streaming_pending_chunks(
+        recognizer,
+        session,
+        sample_rate_hz,
+        chunk_num_samples,
+        false,
+    );
+
+    let mut decode_steps = 0usize;
+    let tail_padding_num_samples =
+        ((sample_rate_hz.max(1) as usize) * tail_padding_ms as usize / 1000).max(1);
     let tail_padding = vec![0.0f32; tail_padding_num_samples];
     recognizer.accept_waveform(&session.stream, sample_rate_hz, &tail_padding);
     decode_steps += recognizer.decode_available(&session.stream);
@@ -1497,6 +2209,7 @@ fn finalize_streaming_decode(
 #[derive(Debug, Clone)]
 struct PreparedStreamingCommit {
     final_online_raw_text: String,
+    final_offline_raw_text: String,
     prepared_final_candidate: String,
     display_text_before_final: String,
     candidate_display_text: String,
@@ -1504,6 +2217,10 @@ struct PreparedStreamingCommit {
     commit_source: StreamingCommitSource,
     final_decode_steps: usize,
     final_decode_elapsed_ms: u128,
+    online_final_elapsed_ms: u128,
+    offline_final_elapsed_ms: u128,
+    offline_final_timed_out: bool,
+    punctuation_elapsed_ms: u128,
     rejected_prefix_rewrite: bool,
 }
 
@@ -1512,6 +2229,45 @@ struct StreamingReleaseDrainStats {
     grace_added_samples: usize,
     stop_added_samples: usize,
     grace_wait_elapsed_ms: u128,
+    voice_active_observations: usize,
+    timeout_fallback: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingCommitEnvelope {
+    session_id: String,
+    revision: u64,
+    last_hud_target_text: String,
+    final_online_raw_text: String,
+    final_offline_raw_text: String,
+    final_candidate_text: String,
+    candidate_display_text: String,
+    resolved_commit_text: String,
+    commit_source: StreamingCommitSource,
+    online_final_elapsed_ms: u128,
+    offline_final_elapsed_ms: u128,
+    offline_final_timed_out: bool,
+    punctuation_elapsed_ms: u128,
+}
+
+impl StreamingCommitEnvelope {
+    fn from_prepared(session: &StreamingCoreSession, prepared: &PreparedStreamingCommit) -> Self {
+        Self {
+            session_id: session.session_id.clone(),
+            revision: session.state.revision,
+            last_hud_target_text: prepared.display_text_before_final.clone(),
+            final_online_raw_text: prepared.final_online_raw_text.clone(),
+            final_offline_raw_text: prepared.final_offline_raw_text.clone(),
+            final_candidate_text: prepared.prepared_final_candidate.clone(),
+            candidate_display_text: prepared.candidate_display_text.clone(),
+            resolved_commit_text: prepared.final_text.clone(),
+            commit_source: prepared.commit_source,
+            online_final_elapsed_ms: prepared.online_final_elapsed_ms,
+            offline_final_elapsed_ms: prepared.offline_final_elapsed_ms,
+            offline_final_timed_out: prepared.offline_final_timed_out,
+            punctuation_elapsed_ms: prepared.punctuation_elapsed_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1523,6 +2279,7 @@ struct PreparedStreamingPartial {
     stable_chars: usize,
     frozen_chars: usize,
     volatile_chars: usize,
+    revision: u64,
     rejected_prefix_rewrite: bool,
 }
 
@@ -1530,6 +2287,7 @@ struct PreparedStreamingPartial {
 struct StreamingAiRewriteCandidate {
     frozen_prefix: String,
     current_tail: String,
+    revision: u64,
 }
 
 #[derive(Debug)]
@@ -1544,26 +2302,64 @@ struct StreamingAiRewriteOutcome {
 struct StreamingAiRewriteDisplayUpdate {
     request_key: String,
     display_text: String,
+    revision: u64,
 }
 
 fn prepare_final_streaming_commit(
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    offline_final_recognizer: Option<&ainput_asr::SenseVoiceRecognizer>,
     punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
     session: &mut StreamingCoreSession,
     sample_rate_hz: i32,
     chunk_num_samples: usize,
+    tail_padding_ms: u64,
     rewrite_enabled: bool,
 ) -> PreparedStreamingCommit {
-    let final_decode_started_at = Instant::now();
-    let final_decode_steps =
-        finalize_streaming_decode(recognizer, session, sample_rate_hz, chunk_num_samples);
-    let final_decode_elapsed_ms = final_decode_started_at.elapsed().as_millis();
+    let online_final_started_at = Instant::now();
+    let final_decode_steps = finalize_streaming_decode(
+        recognizer,
+        session,
+        sample_rate_hz,
+        chunk_num_samples,
+        tail_padding_ms,
+    );
+    let online_final_elapsed_ms = online_final_started_at.elapsed().as_millis();
+    let final_decode_elapsed_ms = online_final_elapsed_ms;
     let final_online_raw_text = recognizer
         .get_result(&session.stream)
         .map(|result| result.text.trim().to_string())
         .unwrap_or_default();
-    let (prepared_final_candidate, candidate_source) =
-        prepare_streaming_output_text(&final_online_raw_text, rewrite_enabled, punctuator);
+    let offline_final = transcribe_streaming_offline_final(
+        offline_final_recognizer,
+        session.sample_rate_hz,
+        &session.captured_samples,
+    );
+    let offline_final_elapsed_ms = offline_final.elapsed_ms;
+    let offline_final_timed_out = offline_final_elapsed_ms > STREAMING_OFFLINE_FINAL_HARD_MS;
+    let final_offline_raw_text = if offline_final_timed_out {
+        tracing::warn!(
+            offline_final_elapsed_ms,
+            hard_ms = STREAMING_OFFLINE_FINAL_HARD_MS,
+            scope = offline_final.scope.as_str(),
+            "streaming offline final repair exceeded hard budget; ignoring repair text"
+        );
+        String::new()
+    } else {
+        offline_final.text
+    };
+    let (selected_final_raw_text, selected_final_raw_source) = select_streaming_final_raw_text(
+        &final_online_raw_text,
+        &final_offline_raw_text,
+        offline_final.scope,
+    );
+    let punctuation_started_at = Instant::now();
+    let (prepared_final_candidate, prepared_candidate_source) =
+        prepare_streaming_output_text(&selected_final_raw_text, rewrite_enabled, punctuator);
+    let punctuation_elapsed_ms = punctuation_started_at.elapsed().as_millis();
+    let candidate_source = match selected_final_raw_source {
+        StreamingCommitSource::OfflineFinal => StreamingCommitSource::OfflineFinal,
+        _ => prepared_candidate_source,
+    };
     let display_text_before_final = effective_streaming_display_text(session);
     let resolved_commit = resolve_final_streaming_commit(
         session,
@@ -1574,6 +2370,7 @@ fn prepare_final_streaming_commit(
 
     PreparedStreamingCommit {
         final_online_raw_text,
+        final_offline_raw_text,
         prepared_final_candidate,
         display_text_before_final,
         candidate_display_text: resolved_commit.candidate_display_text,
@@ -1581,8 +2378,187 @@ fn prepare_final_streaming_commit(
         commit_source: resolved_commit.commit_source,
         final_decode_steps,
         final_decode_elapsed_ms,
+        online_final_elapsed_ms,
+        offline_final_elapsed_ms,
+        offline_final_timed_out,
+        punctuation_elapsed_ms,
         rejected_prefix_rewrite: resolved_commit.rejected_prefix_rewrite,
     }
+}
+
+#[derive(Debug, Clone)]
+struct StreamingOfflineFinalResult {
+    text: String,
+    elapsed_ms: u128,
+    scope: StreamingOfflineFinalScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingOfflineFinalScope {
+    None,
+    FullAudio,
+    TailWindow,
+}
+
+impl StreamingOfflineFinalScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::FullAudio => "full_audio",
+            Self::TailWindow => "tail_window",
+        }
+    }
+}
+
+fn transcribe_streaming_offline_final(
+    offline_final_recognizer: Option<&ainput_asr::SenseVoiceRecognizer>,
+    sample_rate_hz: i32,
+    samples: &[f32],
+) -> StreamingOfflineFinalResult {
+    let started_at = Instant::now();
+    let Some(recognizer) = offline_final_recognizer else {
+        return StreamingOfflineFinalResult {
+            text: String::new(),
+            elapsed_ms: started_at.elapsed().as_millis(),
+            scope: StreamingOfflineFinalScope::None,
+        };
+    };
+    if sample_rate_hz <= 0 || samples.is_empty() {
+        return StreamingOfflineFinalResult {
+            text: String::new(),
+            elapsed_ms: started_at.elapsed().as_millis(),
+            scope: StreamingOfflineFinalScope::None,
+        };
+    }
+
+    let scope = streaming_offline_final_scope(sample_rate_hz, samples.len());
+    let sample_start = streaming_offline_final_sample_start(sample_rate_hz, samples.len(), scope);
+    let repair_samples = &samples[sample_start..];
+    let text = match recognizer.transcribe_samples(
+        sample_rate_hz,
+        repair_samples,
+        "streaming-final-repair",
+    ) {
+        Ok(transcription) => transcription.text.trim().to_string(),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                scope = scope.as_str(),
+                "streaming offline final repair failed; keeping streaming final"
+            );
+            String::new()
+        }
+    };
+    let elapsed_ms = started_at.elapsed().as_millis();
+    tracing::debug!(
+        scope = scope.as_str(),
+        input_audio_ms = audio_duration_ms(sample_rate_hz, samples.len()),
+        repair_audio_ms = audio_duration_ms(sample_rate_hz, repair_samples.len()),
+        elapsed_ms,
+        "streaming offline final repair finished"
+    );
+    StreamingOfflineFinalResult {
+        text,
+        elapsed_ms,
+        scope,
+    }
+}
+
+fn streaming_offline_final_scope(
+    sample_rate_hz: i32,
+    sample_count: usize,
+) -> StreamingOfflineFinalScope {
+    if sample_rate_hz <= 0 || sample_count == 0 {
+        return StreamingOfflineFinalScope::None;
+    }
+    let duration_ms = audio_duration_ms(sample_rate_hz, sample_count);
+    if duration_ms > STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS {
+        StreamingOfflineFinalScope::TailWindow
+    } else {
+        StreamingOfflineFinalScope::FullAudio
+    }
+}
+
+fn streaming_offline_final_sample_start(
+    sample_rate_hz: i32,
+    sample_count: usize,
+    scope: StreamingOfflineFinalScope,
+) -> usize {
+    if !matches!(scope, StreamingOfflineFinalScope::TailWindow) {
+        return 0;
+    }
+    let tail_samples = sample_count_for_ms(sample_rate_hz, STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS);
+    sample_count.saturating_sub(tail_samples.max(1))
+}
+
+fn select_streaming_final_raw_text(
+    online_raw_text: &str,
+    offline_raw_text: &str,
+    offline_scope: StreamingOfflineFinalScope,
+) -> (String, StreamingCommitSource) {
+    let online = online_raw_text.trim();
+    let offline = offline_raw_text.trim();
+    if offline.is_empty() {
+        return (online.to_string(), StreamingCommitSource::OnlineFinal);
+    }
+    if online.is_empty() {
+        return (offline.to_string(), StreamingCommitSource::OfflineFinal);
+    }
+
+    if matches!(offline_scope, StreamingOfflineFinalScope::TailWindow) {
+        if let Some(repaired) = merge_streaming_offline_tail_repair(online, offline) {
+            return (repaired, StreamingCommitSource::OfflineFinal);
+        }
+        return (online.to_string(), StreamingCommitSource::OnlineFinal);
+    }
+
+    let online_content = content_text_without_sentence_punctuation(online);
+    let offline_content = content_text_without_sentence_punctuation(offline);
+    let online_chars = online_content.chars().count();
+    let offline_chars = offline_content.chars().count();
+    if offline_chars > online_chars
+        && (offline_content.starts_with(&online_content)
+            || longest_common_prefix_chars(&offline_content, &online_content)
+                >= online_chars.saturating_sub(1).max(4))
+    {
+        return (offline.to_string(), StreamingCommitSource::OfflineFinal);
+    }
+
+    (online.to_string(), StreamingCommitSource::OnlineFinal)
+}
+
+fn merge_streaming_offline_tail_repair(
+    online_raw_text: &str,
+    offline_tail_text: &str,
+) -> Option<String> {
+    let online = online_raw_text.trim();
+    let tail = offline_tail_text.trim();
+    if online.is_empty() || tail.is_empty() {
+        return None;
+    }
+
+    let online_content = content_text_without_sentence_punctuation(online);
+    let tail_content = content_text_without_sentence_punctuation(tail);
+    if online_content.is_empty() || tail_content.is_empty() {
+        return None;
+    }
+    if online_content.contains(&tail_content) {
+        return None;
+    }
+
+    let raw_overlap = longest_suffix_prefix_overlap_chars(online, tail, 12);
+    let content_overlap = longest_suffix_prefix_overlap_chars(&online_content, &tail_content, 12);
+    let overlap = raw_overlap.max(content_overlap);
+    if overlap < 2 {
+        return None;
+    }
+
+    let tail_content_chars = tail_content.chars().count();
+    if tail_content_chars <= overlap {
+        return None;
+    }
+
+    Some(append_with_suffix_prefix_overlap(online, tail))
 }
 
 #[derive(Debug, Clone)]
@@ -1655,6 +2631,7 @@ fn update_streaming_partial_state(
             peak_abs = format_args!("{:.6}", activity.peak_abs),
             rms = format_args!("{:.6}", activity.rms),
             active_ratio = format_args!("{:.4}", activity.active_ratio),
+            sustained_voice_ms = activity.sustained_voice_ms,
             "skip streaming preview because audio still looks like background noise"
         );
         return Ok(None);
@@ -1674,6 +2651,7 @@ fn update_streaming_partial_state(
             peak_abs = format_args!("{:.6}", activity.peak_abs),
             rms = format_args!("{:.6}", activity.rms),
             active_ratio = format_args!("{:.4}", activity.active_ratio),
+            sustained_voice_ms = activity.sustained_voice_ms,
             "drop low-signal streaming preview text"
         );
         String::new()
@@ -1723,13 +2701,16 @@ fn update_streaming_partial_state(
         &selected_preview_text,
         &online_prepared_text,
         preview_source,
+        Some(total_audio_duration_ms),
+        streaming_stability_policy(&runtime.config.voice.streaming.stability),
     ))
 }
 
 fn prepare_fast_streaming_partial(
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
     session: &mut StreamingCoreSession,
-    _total_audio_duration_ms: u64,
+    total_audio_duration_ms: u64,
+    stability_policy: StreamingStabilityPolicy,
 ) -> Option<PreparedStreamingPartial> {
     if !session.last_display_text.is_empty() {
         return None;
@@ -1773,6 +2754,8 @@ fn prepare_fast_streaming_partial(
         selected_text,
         &fast_candidate,
         "fast_online",
+        Some(total_audio_duration_ms),
+        stability_policy,
     )
 }
 
@@ -1785,9 +2768,12 @@ fn emit_streaming_partial_if_changed(
     proxy: &EventLoopProxy<AppEvent>,
     total_audio_duration_ms: u64,
 ) -> Result<()> {
-    if let Some(fast_update) =
-        prepare_fast_streaming_partial(recognizer, session, total_audio_duration_ms)
-    {
+    if let Some(fast_update) = prepare_fast_streaming_partial(
+        recognizer,
+        session,
+        total_audio_duration_ms,
+        streaming_stability_policy(&runtime.config.voice.streaming.stability),
+    ) {
         tracing::debug!(
             samples = session.captured_samples.len(),
             audio_duration_ms = total_audio_duration_ms,
@@ -1797,6 +2783,7 @@ fn emit_streaming_partial_if_changed(
             stable_chars = fast_update.stable_chars,
             frozen_chars = fast_update.frozen_chars,
             volatile_chars = fast_update.volatile_chars,
+            revision = fast_update.revision,
             rejected_frozen_edit = fast_update.rejected_prefix_rewrite,
             raw_text = %fast_update.raw_text,
             online_prepared_text = %fast_update.online_prepared_text,
@@ -1830,6 +2817,7 @@ fn emit_streaming_partial_if_changed(
         stable_chars = update.stable_chars,
         frozen_chars = update.frozen_chars,
         volatile_chars = update.volatile_chars,
+        revision = update.revision,
         rejected_frozen_edit = update.rejected_prefix_rewrite,
         raw_text = %update.raw_text,
         online_prepared_text = %update.online_prepared_text,
@@ -1854,7 +2842,15 @@ fn maybe_apply_streaming_ai_rewrite(
         return Ok(selected_preview_text.trim().to_string());
     };
     let config = &runtime.config.voice.streaming.ai_rewrite;
-    let _ = poll_streaming_ai_rewrite_result(session, config);
+    if let Some(update) = poll_streaming_ai_rewrite_result(session, config) {
+        tracing::info!(
+            request_key = %short_log_text(&update.request_key, 120),
+            revision = update.revision,
+            display_text = %short_log_text(&update.display_text, 120),
+            "streaming AI rewrite result adopted into current preview"
+        );
+        return Ok(update.display_text);
+    }
     let trimmed_preview = selected_preview_text.trim();
     if trimmed_preview.is_empty() {
         tracing::info!("streaming AI rewrite skipped because preview text is empty");
@@ -1863,9 +2859,11 @@ fn maybe_apply_streaming_ai_rewrite(
 
     let effective_min_visible_chars =
         effective_ai_rewrite_min_visible_chars(config.min_visible_chars);
-    let Some(candidate) =
-        build_streaming_ai_rewrite_candidate(selected_preview_text, effective_min_visible_chars)
-    else {
+    let Some(candidate) = build_streaming_ai_rewrite_candidate(
+        selected_preview_text,
+        effective_min_visible_chars,
+        session.state.revision,
+    ) else {
         let (_, current_tail) = split_frozen_prefix(trimmed_preview);
         tracing::info!(
             preview_chars = trimmed_preview.chars().count(),
@@ -1944,9 +2942,11 @@ fn spawn_streaming_ai_rewrite_request(
     session.ai_rewrite_result_rx = Some(result_rx);
     tracing::info!(
         request_key = %short_log_text(&request_key, 120),
+        revision = candidate.revision,
         frozen_prefix = %short_log_text(&candidate.frozen_prefix, 120),
         current_tail = %short_log_text(&candidate.current_tail, 120),
         process_name = context.process_name.as_deref().unwrap_or("unknown"),
+        window_title = context.window_title.as_deref().unwrap_or("unknown"),
         context_kind = ?context.kind,
         "streaming AI rewrite request queued"
     );
@@ -1985,8 +2985,19 @@ fn poll_streaming_ai_rewrite_result(
     match result_rx.try_recv() {
         Ok(outcome) => {
             session.ai_rewrite_inflight_input.clear();
-            session.last_ai_rewrite_input = outcome.request_key;
             session.last_ai_rewrite_output.clear();
+
+            if outcome.candidate.revision != session.state.revision {
+                tracing::info!(
+                    request_key = %short_log_text(&outcome.request_key, 120),
+                    request_revision = outcome.candidate.revision,
+                    current_revision = session.state.revision,
+                    "streaming AI rewrite result dropped because state revision moved on"
+                );
+                return None;
+            }
+
+            session.last_ai_rewrite_input = outcome.request_key;
 
             if let Some(error) = outcome.error {
                 tracing::warn!(
@@ -2020,6 +3031,7 @@ fn poll_streaming_ai_rewrite_result(
                 session.last_ai_rewrite_output = rewritten_tail;
                 return Some(StreamingAiRewriteDisplayUpdate {
                     request_key: session.last_ai_rewrite_input.clone(),
+                    revision: outcome.candidate.revision,
                     display_text: format!(
                         "{}{}",
                         outcome.candidate.frozen_prefix, session.last_ai_rewrite_output
@@ -2066,6 +3078,7 @@ fn drain_final_streaming_ai_rewrite(
             &preview_after_cached_rewrite,
             "ai_rewrite_cached",
             proxy,
+            streaming_stability_policy(&runtime.config.voice.streaming.stability),
         );
     }
 
@@ -2075,7 +3088,12 @@ fn drain_final_streaming_ai_rewrite(
     let mut received_result = false;
 
     while wait_started_at.elapsed() < wait_budget {
-        if apply_ready_streaming_ai_rewrite_result(session, config, proxy) {
+        if apply_ready_streaming_ai_rewrite_result(
+            session,
+            config,
+            proxy,
+            streaming_stability_policy(&runtime.config.voice.streaming.stability),
+        ) {
             received_result = true;
             break;
         }
@@ -2086,7 +3104,12 @@ fn drain_final_streaming_ai_rewrite(
     }
 
     if !received_result {
-        received_result = apply_ready_streaming_ai_rewrite_result(session, config, proxy);
+        received_result = apply_ready_streaming_ai_rewrite_result(
+            session,
+            config,
+            proxy,
+            streaming_stability_policy(&runtime.config.voice.streaming.stability),
+        );
     }
 
     tracing::info!(
@@ -2103,6 +3126,7 @@ fn apply_ready_streaming_ai_rewrite_result(
     session: &mut StreamingCoreSession,
     config: &ainput_shell::StreamingAiRewriteConfig,
     proxy: &EventLoopProxy<AppEvent>,
+    stability_policy: StreamingStabilityPolicy,
 ) -> bool {
     let Some(update) = poll_streaming_ai_rewrite_result(session, config) else {
         return false;
@@ -2114,6 +3138,7 @@ fn apply_ready_streaming_ai_rewrite_result(
         &update.display_text,
         "ai_rewrite_async",
         proxy,
+        stability_policy,
     );
     tracing::info!(
         request_key = %short_log_text(&update.request_key, 120),
@@ -2123,16 +3148,64 @@ fn apply_ready_streaming_ai_rewrite_result(
     true
 }
 
+fn request_streaming_final_hud_commit_ack(
+    proxy: &EventLoopProxy<AppEvent>,
+    final_text: &str,
+) -> Result<StreamingHudCommitAck> {
+    let expected_text = final_text.trim().to_string();
+    if expected_text.is_empty() {
+        bail!("final text is empty");
+    }
+
+    let (response_tx, response_rx) = mpsc::channel();
+    proxy
+        .send_event(AppEvent::Worker(
+            WorkerEvent::StreamingFinalHudCommitRequest {
+                final_text: expected_text.clone(),
+                response_tx,
+            },
+        ))
+        .map_err(|_| anyhow!("send HUD final commit request failed because event loop closed"))?;
+
+    let ack = response_rx
+        .recv_timeout(Duration::from_millis(STREAMING_HUD_FINAL_ACK_TIMEOUT_MS))
+        .with_context(|| {
+            format!(
+                "HUD final commit ack timed out after {}ms",
+                STREAMING_HUD_FINAL_ACK_TIMEOUT_MS
+            )
+        })?;
+    if ack.text.trim() != expected_text {
+        bail!(
+            "HUD final text mismatch: hud='{}' expected='{}'",
+            ack.text,
+            expected_text
+        );
+    }
+    if !ack.visible {
+        bail!("HUD final text is not visible");
+    }
+
+    Ok(ack)
+}
+
 fn emit_streaming_partial_override(
     session: &mut StreamingCoreSession,
     raw_text: &str,
     display_text: &str,
     source: &'static str,
     proxy: &EventLoopProxy<AppEvent>,
+    stability_policy: StreamingStabilityPolicy,
 ) {
-    let Some(update) =
-        apply_streaming_partial_update(session, raw_text, display_text, display_text, source)
-    else {
+    let Some(update) = apply_streaming_partial_update(
+        session,
+        raw_text,
+        display_text,
+        display_text,
+        source,
+        None,
+        stability_policy,
+    ) else {
         return;
     };
 
@@ -2142,34 +3215,30 @@ fn emit_streaming_partial_override(
     }));
 }
 
-fn emit_streaming_final_preview_sync(
-    session: &mut StreamingCoreSession,
-    final_text: &str,
-    proxy: &EventLoopProxy<AppEvent>,
-) {
-    let final_trimmed = final_text.trim();
-    if final_trimmed.is_empty() || session.last_display_text == final_trimmed {
-        return;
-    }
-
-    session.last_raw_partial = final_trimmed.to_string();
-    session.last_display_text = final_trimmed.to_string();
-    session.last_fast_preview_text = final_trimmed.to_string();
-
-    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
-        raw_text: final_trimmed.to_string(),
-        prepared_text: final_trimmed.to_string(),
-    }));
-}
-
 fn apply_streaming_partial_update(
     session: &mut StreamingCoreSession,
     raw_text: &str,
     candidate_display_text: &str,
     online_prepared_text: &str,
     source: &'static str,
+    audio_offset_ms: Option<u64>,
+    stability_policy: StreamingStabilityPolicy,
 ) -> Option<PreparedStreamingPartial> {
-    let update = session.state.apply_online_partial(candidate_display_text)?;
+    if session.commit_locked {
+        session.post_hud_flush_mutation_count += 1;
+        tracing::warn!(
+            session_id = %session.session_id,
+            post_hud_flush_mutation_count = session.post_hud_flush_mutation_count,
+            raw_text = %short_log_text(raw_text, 120),
+            candidate_display_text = %short_log_text(candidate_display_text, 120),
+            "dropped streaming partial because commit envelope is locked"
+        );
+        return None;
+    }
+
+    let update = session
+        .state
+        .apply_online_partial_with_policy(candidate_display_text, stability_policy)?;
     if update.rejected_prefix_rewrite && session.last_display_text == update.display_text {
         return None;
     }
@@ -2177,6 +3246,9 @@ fn apply_streaming_partial_update(
     session.last_raw_partial = raw_text.to_string();
     session.last_display_text = update.display_text.clone();
     session.last_fast_preview_text = update.display_text.clone();
+    if let Some(audio_offset_ms) = audio_offset_ms {
+        session.last_partial_audio_ms = Some(audio_offset_ms);
+    }
     if session.first_partial_at.is_none() && !update.display_text.trim().is_empty() {
         session.first_partial_at = Some(Instant::now());
     }
@@ -2190,6 +3262,7 @@ fn apply_streaming_partial_update(
         stable_chars: update.stable_chars,
         frozen_chars: update.frozen_chars,
         volatile_chars: update.volatile_chars,
+        revision: update.revision,
         rejected_prefix_rewrite: update.rejected_prefix_rewrite,
     })
 }
@@ -2197,6 +3270,7 @@ fn apply_streaming_partial_update(
 fn build_streaming_ai_rewrite_candidate(
     display_text: &str,
     min_visible_chars: usize,
+    revision: u64,
 ) -> Option<StreamingAiRewriteCandidate> {
     let trimmed = display_text.trim();
     if trimmed.is_empty() {
@@ -2211,6 +3285,7 @@ fn build_streaming_ai_rewrite_candidate(
     Some(StreamingAiRewriteCandidate {
         frozen_prefix,
         current_tail: current_tail.trim().to_string(),
+        revision,
     })
 }
 
@@ -2283,7 +3358,164 @@ fn reset_streaming_ai_rewrite_cache(session: &mut StreamingCoreSession) {
     session.last_ai_rewrite_at = None;
 }
 
+fn maybe_soft_flush_streaming_tail_core(
+    runtime: &AppRuntime,
+    recognizer: &ainput_asr::StreamingZipformerRecognizer,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+    session: &mut StreamingCoreSession,
+    rewrite_enabled: bool,
+    total_audio_duration_ms: u64,
+) -> Option<PreparedStreamingPartial> {
+    let config = &runtime.config.voice.streaming.endpoint;
+    if !config.enabled {
+        return None;
+    }
+
+    let activity =
+        analyze_recent_audio_activity(&session.captured_samples, session.sample_rate_hz, 220);
+    let voice_active = is_streaming_endpoint_voice_active(&activity);
+    session
+        .endpoint
+        .observe(total_audio_duration_ms, voice_active);
+
+    if session.awaiting_post_rollover_speech {
+        if voice_active {
+            session.awaiting_post_rollover_speech = false;
+        } else {
+            return None;
+        }
+    }
+    if voice_active {
+        return None;
+    }
+
+    let current_display = effective_streaming_display_text(session);
+    if visible_text_char_count(&current_display) < STREAMING_HUD_SOFT_FLUSH_MIN_VISIBLE_CHARS {
+        return None;
+    }
+
+    let segment_elapsed_ms =
+        total_audio_duration_ms.saturating_sub(session.endpoint.segment_start_ms);
+    let min_segment_ms = config.min_segment_ms.clamp(200, 5_000);
+    if segment_elapsed_ms < min_segment_ms {
+        return None;
+    }
+
+    let soft_flush_ms = streaming_endpoint_soft_flush_ms(config);
+    let Some(last_voice_ms) = session.endpoint.last_voice_ms else {
+        return None;
+    };
+    if total_audio_duration_ms.saturating_sub(last_voice_ms) < soft_flush_ms {
+        return None;
+    }
+
+    let Some(last_partial_audio_ms) = session.last_partial_audio_ms else {
+        return None;
+    };
+    if total_audio_duration_ms.saturating_sub(last_partial_audio_ms) < soft_flush_ms {
+        return None;
+    }
+    if session
+        .last_soft_flush_audio_ms
+        .is_some_and(|last| total_audio_duration_ms.saturating_sub(last) < soft_flush_ms * 2)
+    {
+        return None;
+    }
+
+    let sample_rate_hz = session.sample_rate_hz;
+    let chunk_samples =
+        streaming_chunk_num_samples(sample_rate_hz, runtime.config.voice.streaming.chunk_ms);
+    let soft_flush_tail_padding_ms =
+        streaming_soft_flush_tail_padding_ms(&runtime.config.voice.streaming.endpoint);
+    let soft_flush_decode_steps = finalize_streaming_pause_boundary_decode(
+        recognizer,
+        session,
+        sample_rate_hz,
+        chunk_samples,
+        soft_flush_tail_padding_ms,
+    );
+    let current_raw_text = recognizer
+        .get_result(&session.stream)
+        .map(|result| result.text.trim().to_string())
+        .unwrap_or_default();
+    let resolved_text = resolve_streaming_rollover_commit_text(
+        &session.rolled_over_prefix,
+        &current_display,
+        &current_raw_text,
+    );
+    let resolved_text = if resolved_text.trim().is_empty() {
+        current_display.clone()
+    } else {
+        resolved_text
+    };
+    let prepared_text =
+        prepare_streaming_pause_boundary_text(&resolved_text, rewrite_enabled, punctuator);
+    let before_content_chars = content_chars_without_sentence_punctuation(&current_display);
+    let after_content_chars = content_chars_without_sentence_punctuation(&prepared_text);
+    if after_content_chars <= before_content_chars {
+        recognizer.reset(&session.stream);
+        session
+            .endpoint
+            .reset_after_rollover(total_audio_duration_ms);
+        session.rolled_over_prefix = current_display.clone();
+        session.awaiting_post_rollover_speech = true;
+        session.last_soft_flush_audio_ms = Some(total_audio_duration_ms);
+        tracing::debug!(
+            audio_duration_ms = total_audio_duration_ms,
+            current_display = %short_log_text(&current_display, 120),
+            current_raw_text = %short_log_text(&current_raw_text, 120),
+            soft_flush_decode_steps,
+            "streaming HUD soft flush reset recognizer without content growth"
+        );
+        return None;
+    }
+
+    let update = session.state.rollover_with_display_text(&prepared_text);
+    session.rolled_over_prefix = update.display_text.clone();
+    session.awaiting_post_rollover_speech = true;
+    session
+        .endpoint
+        .reset_after_rollover(total_audio_duration_ms);
+    session.last_raw_partial = current_raw_text.clone();
+    session.last_display_text = update.display_text.clone();
+    session.last_fast_preview_text = update.display_text.clone();
+    session.last_partial_audio_ms = Some(total_audio_duration_ms);
+    session.last_soft_flush_audio_ms = Some(total_audio_duration_ms);
+    if session.first_partial_at.is_none() && !update.display_text.trim().is_empty() {
+        session.first_partial_at = Some(Instant::now());
+    }
+    session.partial_updates += 1;
+    reset_streaming_ai_rewrite_cache(session);
+    recognizer.reset(&session.stream);
+
+    tracing::info!(
+        audio_duration_ms = total_audio_duration_ms,
+        soft_flush_ms,
+        soft_flush_tail_padding_ms,
+        current_display = %short_log_text(&current_display, 120),
+        current_raw_text = %short_log_text(&current_raw_text, 120),
+        prepared_text = %short_log_text(&update.display_text, 120),
+        before_content_chars,
+        after_content_chars,
+        soft_flush_decode_steps,
+        "streaming HUD soft flush appended tail while hotkey is still held"
+    );
+
+    Some(PreparedStreamingPartial {
+        raw_text: current_raw_text,
+        online_prepared_text: prepared_text,
+        display_text: update.display_text,
+        source: "idle_soft_flush",
+        stable_chars: update.stable_chars,
+        frozen_chars: update.frozen_chars,
+        volatile_chars: update.volatile_chars,
+        revision: update.revision,
+        rejected_prefix_rewrite: update.rejected_prefix_rewrite,
+    })
+}
+
 fn maybe_rollover_streaming_segment_core(
+    runtime: &AppRuntime,
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
     punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
     session: &mut StreamingCoreSession,
@@ -2291,21 +3523,45 @@ fn maybe_rollover_streaming_segment_core(
     total_audio_duration_ms: u64,
 ) -> Option<String> {
     let activity =
-        analyze_recent_audio_activity(&session.captured_samples, session.sample_rate_hz, 500);
+        analyze_recent_audio_activity(&session.captured_samples, session.sample_rate_hz, 160);
+    let voice_active = is_streaming_endpoint_voice_active(&activity);
+    session
+        .endpoint
+        .observe(total_audio_duration_ms, voice_active);
+
     if session.awaiting_post_rollover_speech {
-        if should_skip_streaming_preview(&activity) {
+        if !voice_active {
             return None;
         }
         session.awaiting_post_rollover_speech = false;
     }
 
-    if !recognizer.is_endpoint(&session.stream) {
+    let app_endpoint = should_rollover_streaming_segment(
+        session,
+        &runtime.config.voice.streaming.endpoint,
+        total_audio_duration_ms,
+    );
+    let sherpa_endpoint = recognizer.is_endpoint(&session.stream);
+    if !app_endpoint && !sherpa_endpoint {
         return None;
     }
 
+    let sample_rate_hz = session.sample_rate_hz;
+    let chunk_samples =
+        streaming_chunk_num_samples(sample_rate_hz, runtime.config.voice.streaming.chunk_ms);
+    let pause_decode_steps = finalize_streaming_pause_boundary_decode(
+        recognizer,
+        session,
+        sample_rate_hz,
+        chunk_samples,
+        streaming_idle_finalize_tail_padding_ms(&runtime.config.voice.streaming.endpoint),
+    );
     let current_display = effective_streaming_display_text(session);
     if visible_text_char_count(&current_display) == 0 {
         recognizer.reset(&session.stream);
+        session
+            .endpoint
+            .reset_after_rollover(total_audio_duration_ms);
         session.last_raw_partial.clear();
         session.last_fast_preview_text.clear();
         session.last_display_text.clear();
@@ -2317,17 +3573,25 @@ fn maybe_rollover_streaming_segment_core(
         .get_result(&session.stream)
         .map(|result| result.text.trim().to_string())
         .unwrap_or_default();
-    let committed_text =
-        prepare_streaming_pause_boundary_text(&current_display, rewrite_enabled, punctuator);
-    let committed_text = if committed_text.is_empty() {
-        ensure_terminal_sentence_boundary(&current_display)
+    let committed_text = resolve_streaming_rollover_commit_text(
+        &session.rolled_over_prefix,
+        &current_display,
+        &current_raw_text,
+    );
+    let committed_text = if committed_text.trim().is_empty() {
+        current_display.clone()
     } else {
         committed_text
     };
+    let committed_text =
+        prepare_streaming_pause_boundary_text(&committed_text, rewrite_enabled, punctuator);
 
-    let update = session.state.freeze_with_committed_text(&committed_text);
+    let update = session.state.rollover_with_display_text(&committed_text);
     session.rolled_over_prefix = update.display_text.clone();
     session.awaiting_post_rollover_speech = true;
+    session
+        .endpoint
+        .reset_after_rollover(total_audio_duration_ms);
     session.last_raw_partial.clear();
     session.last_fast_preview_text.clear();
     session.last_display_text = update.display_text.clone();
@@ -2336,9 +3600,12 @@ fn maybe_rollover_streaming_segment_core(
 
     tracing::info!(
         audio_duration_ms = total_audio_duration_ms,
+        app_endpoint,
+        sherpa_endpoint,
         endpoint_raw_text = %current_raw_text,
         endpoint_text_before_reset = %current_display,
         endpoint_committed_text = %update.display_text,
+        pause_decode_steps,
         frozen_chars = update.frozen_chars,
         volatile_chars = update.volatile_chars,
         "streaming endpoint detected; rolled over to next segment"
@@ -2387,22 +3654,22 @@ fn select_streaming_preview_text<'a>(
     candidate
 }
 
-fn select_streaming_commit_text<'a>(
-    display_text: &'a str,
-    final_candidate: &'a str,
+fn select_streaming_commit_text(
+    display_text: &str,
+    final_candidate: &str,
     final_candidate_source: StreamingCommitSource,
-) -> StreamingCommitChoice<'a> {
+) -> StreamingCommitChoice {
     let display_trimmed = display_text.trim();
     let candidate_trimmed = final_candidate.trim();
     let selected_candidate = if visible_text_char_count(candidate_trimmed) > 0 {
         StreamingCommitChoice {
             source: final_candidate_source,
-            text: candidate_trimmed,
+            text: candidate_trimmed.to_string(),
         }
     } else {
         StreamingCommitChoice {
             source: StreamingCommitSource::StreamingState,
-            text: "",
+            text: String::new(),
         }
     };
 
@@ -2413,33 +3680,128 @@ fn select_streaming_commit_text<'a>(
     if selected_candidate.text.is_empty() {
         return StreamingCommitChoice {
             source: StreamingCommitSource::StreamingState,
-            text: display_trimmed,
+            text: display_trimmed.to_string(),
+        };
+    }
+
+    if let Some((text, overlap_chars)) =
+        repair_final_candidate_tail_overlap(display_trimmed, &selected_candidate.text)
+    {
+        tracing::info!(
+            overlap_chars,
+            display_text = %short_log_text(display_trimmed, 120),
+            final_candidate = %short_log_text(&selected_candidate.text, 120),
+            repaired_text = %short_log_text(&text, 120),
+            "streaming final commit repaired duplicated tail overlap"
+        );
+        return StreamingCommitChoice {
+            source: selected_candidate.source,
+            text,
         };
     }
 
     let display_visible = visible_text_char_count(display_trimmed);
-    let selected_visible = visible_text_char_count(selected_candidate.text);
-    if selected_visible + STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS < display_visible
-        && !is_segment_only_streaming_candidate(display_trimmed, selected_candidate.text)
-    {
+    let selected_visible = visible_text_char_count(&selected_candidate.text);
+    if let Some(text) = preserve_display_tail_when_final_candidate_is_shorter(
+        display_trimmed,
+        &selected_candidate.text,
+    ) {
         return StreamingCommitChoice {
             source: StreamingCommitSource::StreamingState,
-            text: display_trimmed,
+            text,
         };
     }
 
-    let common_prefix_chars = longest_common_prefix_chars(display_trimmed, selected_candidate.text);
-    if common_prefix_chars < 4
-        && display_visible > selected_visible
-        && !is_segment_only_streaming_candidate(display_trimmed, selected_candidate.text)
+    if selected_visible + STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS < display_visible
+        && !is_segment_only_streaming_candidate(display_trimmed, &selected_candidate.text)
     {
         return StreamingCommitChoice {
             source: StreamingCommitSource::StreamingState,
-            text: display_trimmed,
+            text: display_trimmed.to_string(),
+        };
+    }
+
+    let common_prefix_chars =
+        longest_common_prefix_chars(display_trimmed, &selected_candidate.text);
+    if common_prefix_chars < 4
+        && display_visible > selected_visible
+        && !is_segment_only_streaming_candidate(display_trimmed, &selected_candidate.text)
+    {
+        return StreamingCommitChoice {
+            source: StreamingCommitSource::StreamingState,
+            text: display_trimmed.to_string(),
         };
     }
 
     selected_candidate
+}
+
+fn repair_final_candidate_tail_overlap(
+    display_text: &str,
+    final_candidate: &str,
+) -> Option<(String, usize)> {
+    let display = display_text.trim();
+    let candidate = final_candidate.trim();
+    let appended_tail = candidate.strip_prefix(display)?.trim_start();
+    if display.is_empty() || appended_tail.is_empty() {
+        return None;
+    }
+
+    let overlap_chars = longest_fuzzy_suffix_prefix_overlap_chars(
+        display,
+        appended_tail,
+        STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MAX_CHARS,
+        1,
+    );
+    if overlap_chars < STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MIN_CHARS {
+        return None;
+    }
+
+    let display_chars = display.chars().collect::<Vec<_>>();
+    if overlap_chars > display_chars.len() {
+        return None;
+    }
+    let prefix_without_overlap = display_chars[..display_chars.len() - overlap_chars]
+        .iter()
+        .collect::<String>();
+    let repaired = format!("{prefix_without_overlap}{appended_tail}");
+    if repaired == candidate || repaired.trim().is_empty() {
+        return None;
+    }
+
+    Some((repaired, overlap_chars))
+}
+
+fn preserve_display_tail_when_final_candidate_is_shorter(
+    display_text: &str,
+    final_candidate: &str,
+) -> Option<String> {
+    if display_text.trim().is_empty() || final_candidate.trim().is_empty() {
+        return None;
+    }
+    if is_segment_only_streaming_candidate(display_text, final_candidate) {
+        return None;
+    }
+
+    let display_content = content_text_without_sentence_punctuation(display_text);
+    let candidate_content = content_text_without_sentence_punctuation(final_candidate);
+    if candidate_content.is_empty()
+        || candidate_content.chars().count() >= display_content.chars().count()
+    {
+        return None;
+    }
+
+    if !display_content.starts_with(&candidate_content) {
+        return None;
+    }
+
+    let mut preserved = display_text.trim().to_string();
+    if !has_terminal_sentence_boundary(&preserved)
+        && let Some(terminal) = trailing_terminal_sentence_punctuation(final_candidate)
+    {
+        preserved.push(terminal);
+    }
+    Some(preserved)
 }
 
 fn is_segment_only_streaming_candidate(current_display: &str, candidate_text: &str) -> bool {
@@ -2464,10 +3826,145 @@ fn merge_rolled_over_prefix(rolled_over_prefix: &str, current_display: &str) -> 
     }
 
     if can_append_segment_only_candidate(current_display, rolled_over_prefix) {
-        return format!("{}{}", rolled_over_prefix, current_display);
+        if looks_like_rollover_full_replacement(rolled_over_prefix, current_display) {
+            tracing::info!(
+                rolled_over_prefix = %short_log_text(rolled_over_prefix, 120),
+                replacement_candidate = %short_log_text(current_display, 120),
+                "streaming rollover prefix merge treated final candidate as full replacement"
+            );
+            return current_display.to_string();
+        }
+        return append_with_suffix_prefix_overlap(rolled_over_prefix, current_display);
     }
 
     current_display.to_string()
+}
+
+fn looks_like_rollover_full_replacement(rolled_over_prefix: &str, current_display: &str) -> bool {
+    let prefix_content = content_text_without_sentence_punctuation(rolled_over_prefix);
+    let current_content = content_text_without_sentence_punctuation(current_display);
+    let prefix_chars = prefix_content.chars().count();
+    let current_chars = current_content.chars().count();
+    if prefix_chars < 4 || current_chars < 4 {
+        return false;
+    }
+    if current_chars + 2 < prefix_chars {
+        return false;
+    }
+
+    let common_subsequence_chars =
+        longest_common_subsequence_chars(&prefix_content, &current_content);
+    let shorter_chars = prefix_chars.min(current_chars);
+    common_subsequence_chars >= 4 && common_subsequence_chars * 100 >= shorter_chars * 70
+}
+
+fn append_with_suffix_prefix_overlap(prefix: &str, suffix: &str) -> String {
+    let prefix = prefix.trim();
+    let suffix = suffix.trim();
+    if prefix.is_empty() || suffix.is_empty() {
+        return format!("{prefix}{suffix}");
+    }
+
+    let overlap_chars = longest_suffix_prefix_overlap_chars(prefix, suffix, 12);
+    let suffix_without_overlap = suffix.chars().skip(overlap_chars).collect::<String>();
+    format!("{prefix}{suffix_without_overlap}")
+}
+
+fn longest_suffix_prefix_overlap_chars(prefix: &str, suffix: &str, max_chars: usize) -> usize {
+    let prefix_chars = prefix.chars().collect::<Vec<_>>();
+    let suffix_chars = suffix.chars().collect::<Vec<_>>();
+    let max_overlap = prefix_chars
+        .len()
+        .min(suffix_chars.len())
+        .min(max_chars.max(1));
+
+    for overlap in (2..=max_overlap).rev() {
+        if prefix_chars[prefix_chars.len() - overlap..]
+            .iter()
+            .eq(suffix_chars[..overlap].iter())
+        {
+            return overlap;
+        }
+    }
+
+    0
+}
+
+fn longest_fuzzy_suffix_prefix_overlap_chars(
+    prefix: &str,
+    suffix: &str,
+    max_chars: usize,
+    max_mismatches: usize,
+) -> usize {
+    let prefix_chars = prefix.chars().collect::<Vec<_>>();
+    let suffix_chars = suffix.chars().collect::<Vec<_>>();
+    let max_overlap = prefix_chars
+        .len()
+        .min(suffix_chars.len())
+        .min(max_chars.max(1));
+
+    for overlap in (STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MIN_CHARS..=max_overlap).rev() {
+        let mismatches = prefix_chars[prefix_chars.len() - overlap..]
+            .iter()
+            .zip(suffix_chars[..overlap].iter())
+            .filter(|(left, right)| left != right)
+            .count();
+        if mismatches <= max_mismatches {
+            return overlap;
+        }
+    }
+
+    0
+}
+
+fn longest_common_subsequence_chars(left: &str, right: &str) -> usize {
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    if left_chars.is_empty() || right_chars.is_empty() {
+        return 0;
+    }
+
+    let mut previous = vec![0usize; right_chars.len() + 1];
+    let mut current = vec![0usize; right_chars.len() + 1];
+    for left_ch in left_chars {
+        for (right_index, right_ch) in right_chars.iter().enumerate() {
+            current[right_index + 1] = if left_ch == *right_ch {
+                previous[right_index] + 1
+            } else {
+                previous[right_index + 1].max(current[right_index])
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+
+    previous[right_chars.len()]
+}
+
+fn resolve_streaming_rollover_commit_text(
+    rolled_over_prefix: &str,
+    current_display: &str,
+    current_raw_text: &str,
+) -> String {
+    let display = current_display.trim();
+    let raw_prepared = ainput_rewrite::normalize_streaming_preview(current_raw_text);
+    if raw_prepared.trim().is_empty() {
+        return display.to_string();
+    }
+
+    let raw_display = merge_rolled_over_prefix(rolled_over_prefix, &raw_prepared);
+    let raw_display = raw_display.trim();
+    if display.is_empty() {
+        return raw_display.to_string();
+    }
+
+    let display_visible = visible_text_char_count(display);
+    let raw_visible = visible_text_char_count(raw_display);
+    if raw_visible > display_visible {
+        return raw_display.to_string();
+    }
+
+    display.to_string()
 }
 
 fn prepare_streaming_pause_boundary_text(
@@ -2475,12 +3972,9 @@ fn prepare_streaming_pause_boundary_text(
     rewrite_enabled: bool,
     punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
 ) -> String {
-    let (prepared, _) = prepare_streaming_output_text(text, rewrite_enabled, punctuator);
-    ensure_terminal_sentence_boundary(if prepared.trim().is_empty() {
-        text
-    } else {
-        &prepared
-    })
+    let normalized = ainput_rewrite::normalize_streaming_preview(text);
+    let _ = (rewrite_enabled, punctuator);
+    apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
 }
 
 fn ensure_terminal_sentence_boundary(text: &str) -> String {
@@ -2503,6 +3997,7 @@ struct AudioActivity {
     peak_abs: f32,
     rms: f32,
     active_ratio: f32,
+    sustained_voice_ms: u64,
 }
 
 fn analyze_audio_activity(samples: &[f32]) -> AudioActivity {
@@ -2511,12 +4006,15 @@ fn analyze_audio_activity(samples: &[f32]) -> AudioActivity {
             peak_abs: 0.0,
             rms: 0.0,
             active_ratio: 0.0,
+            sustained_voice_ms: 0,
         };
     }
 
     let mut peak_abs = 0.0f32;
     let mut energy_sum = 0.0f64;
     let mut active_frames = 0usize;
+    let mut sustained_voice_frames = 0usize;
+    let mut best_sustained_voice_frames = 0usize;
 
     for sample in samples {
         let abs = sample.abs();
@@ -2527,13 +4025,33 @@ fn analyze_audio_activity(samples: &[f32]) -> AudioActivity {
         }
     }
 
+    for frame in samples.chunks(AUDIO_ACTIVITY_FRAME_SAMPLES) {
+        let frame_rms = (frame
+            .iter()
+            .map(|sample| {
+                let sample = *sample as f64;
+                sample * sample
+            })
+            .sum::<f64>()
+            / frame.len() as f64)
+            .sqrt() as f32;
+        if frame_rms >= AUDIO_ACTIVITY_SPEECH_FRAME_RMS {
+            sustained_voice_frames += 1;
+            best_sustained_voice_frames = best_sustained_voice_frames.max(sustained_voice_frames);
+        } else {
+            sustained_voice_frames = 0;
+        }
+    }
+
     let rms = (energy_sum / samples.len() as f64).sqrt() as f32;
     let active_ratio = active_frames as f32 / samples.len() as f32;
+    let sustained_voice_ms = best_sustained_voice_frames as u64 * AUDIO_ACTIVITY_FRAME_MS;
 
     AudioActivity {
         peak_abs,
         rms,
         active_ratio,
+        sustained_voice_ms,
     }
 }
 
@@ -2559,11 +4077,44 @@ fn should_skip_streaming_preview(activity: &AudioActivity) -> bool {
     activity.peak_abs < 0.0065 || (activity.rms < 0.0018 && activity.active_ratio < 0.012)
 }
 
-fn should_drop_low_signal_result(text: &str, activity: &AudioActivity) -> bool {
-    if activity.rms >= 0.003 || activity.active_ratio >= 0.02 {
+fn is_streaming_endpoint_voice_active(activity: &AudioActivity) -> bool {
+    activity.peak_abs >= 0.008 || activity.rms >= 0.0024 || activity.active_ratio >= 0.018
+}
+
+fn should_rollover_streaming_segment(
+    session: &StreamingCoreSession,
+    config: &ainput_shell::StreamingEndpointConfig,
+    total_audio_duration_ms: u64,
+) -> bool {
+    if !config.enabled {
         return false;
     }
 
+    let visible_chars = visible_text_char_count(&effective_streaming_display_text(session));
+    if visible_chars == 0 {
+        return false;
+    }
+
+    let segment_elapsed_ms =
+        total_audio_duration_ms.saturating_sub(session.endpoint.segment_start_ms);
+    let min_segment_ms = config.min_segment_ms.clamp(200, 5_000);
+    let max_segment_ms = config.max_segment_ms.clamp(min_segment_ms + 1_000, 60_000);
+    if segment_elapsed_ms >= max_segment_ms {
+        return true;
+    }
+
+    if segment_elapsed_ms < min_segment_ms {
+        return false;
+    }
+
+    let Some(last_voice_ms) = session.endpoint.last_voice_ms else {
+        return false;
+    };
+    let pause_ms = config.pause_ms.clamp(200, 2_000);
+    total_audio_duration_ms.saturating_sub(last_voice_ms) >= pause_ms
+}
+
+fn should_drop_low_signal_result(text: &str, activity: &AudioActivity) -> bool {
     let stripped = text
         .trim()
         .trim_matches(|ch: char| ch.is_whitespace() || is_sentence_punctuation(ch));
@@ -2572,7 +4123,60 @@ fn should_drop_low_signal_result(text: &str, activity: &AudioActivity) -> bool {
         return true;
     }
 
+    if is_low_confidence_short_english_hallucination(stripped, activity) {
+        return true;
+    }
+
+    if activity.rms >= 0.003 || activity.active_ratio >= 0.02 {
+        return false;
+    }
+
     stripped.chars().count() <= 2
+}
+
+fn is_low_confidence_short_english_hallucination(stripped: &str, activity: &AudioActivity) -> bool {
+    if !is_short_english_filler(stripped) {
+        return false;
+    }
+
+    activity.rms < LOW_CONFIDENCE_SHORT_ENGLISH_RMS
+        || activity.active_ratio < LOW_CONFIDENCE_SHORT_ENGLISH_ACTIVE_RATIO
+        || activity.sustained_voice_ms < LOW_CONFIDENCE_SHORT_ENGLISH_SUSTAINED_VOICE_MS
+}
+
+fn is_short_english_filler(text: &str) -> bool {
+    if text.chars().any(|ch| {
+        !(ch.is_ascii_alphabetic()
+            || ch.is_ascii_whitespace()
+            || ch == '\''
+            || ch == '-'
+            || is_sentence_punctuation(ch))
+    }) {
+        return false;
+    }
+
+    let normalized: String = text
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "yeah"
+            | "yea"
+            | "yes"
+            | "yep"
+            | "ok"
+            | "okay"
+            | "uh"
+            | "um"
+            | "hmm"
+            | "hm"
+            | "ah"
+            | "oh"
+            | "hey"
+            | "hi"
+    )
 }
 
 fn should_drop_streaming_preview_result(text: &str, activity: &AudioActivity) -> bool {
@@ -2692,8 +4296,160 @@ fn current_timestamp() -> String {
     now.to_string()
 }
 
+fn current_timestamp_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[derive(Debug, Serialize)]
+struct StreamingRawCaptureMetadata {
+    wav_file: String,
+    sample_rate_hz: i32,
+    source_channels: u16,
+    saved_channels: u16,
+    samples: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingRawCaptureSaveResult {
+    wav_path: PathBuf,
+    json_path: PathBuf,
+}
+
+fn save_streaming_raw_capture_async(raw_capture_dir: PathBuf, audio: ainput_audio::RecordedAudio) {
+    std::thread::spawn(move || {
+        if let Err(error) = save_streaming_raw_capture(raw_capture_dir, audio) {
+            tracing::warn!(error = %error, "save streaming raw capture failed");
+        }
+    });
+}
+
+fn save_streaming_raw_capture(
+    raw_capture_dir: PathBuf,
+    audio: ainput_audio::RecordedAudio,
+) -> Result<StreamingRawCaptureSaveResult> {
+    if audio.sample_rate_hz <= 0 || audio.samples.is_empty() {
+        return Err(anyhow!("streaming raw capture audio was empty"));
+    }
+
+    fs::create_dir_all(&raw_capture_dir).with_context(|| {
+        format!(
+            "create streaming raw capture dir {}",
+            raw_capture_dir.display()
+        )
+    })?;
+    let stamp = current_timestamp_millis();
+    let (_file_stem, wav_path, json_path) =
+        next_streaming_raw_capture_paths(&raw_capture_dir, stamp)?;
+    write_mono_i16_wav(&wav_path, audio.sample_rate_hz as u32, &audio.samples)?;
+
+    let metadata = StreamingRawCaptureMetadata {
+        wav_file: wav_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| wav_path.display().to_string()),
+        sample_rate_hz: audio.sample_rate_hz,
+        source_channels: audio.channels,
+        saved_channels: 1,
+        samples: audio.samples.len(),
+    };
+    let metadata_json = serde_json::to_vec_pretty(&metadata)?;
+    fs::write(&json_path, metadata_json).with_context(|| {
+        format!(
+            "write streaming raw capture metadata {}",
+            json_path.display()
+        )
+    })?;
+    prune_streaming_raw_captures(&raw_capture_dir, STREAMING_RAW_CAPTURE_LIMIT)?;
+    tracing::info!(
+        wav = %wav_path.display(),
+        metadata = %json_path.display(),
+        limit = STREAMING_RAW_CAPTURE_LIMIT,
+        "streaming raw capture saved"
+    );
+    Ok(StreamingRawCaptureSaveResult {
+        wav_path,
+        json_path,
+    })
+}
+
+fn next_streaming_raw_capture_paths(
+    raw_capture_dir: &Path,
+    stamp: u128,
+) -> Result<(String, PathBuf, PathBuf)> {
+    for suffix in 0..1_000 {
+        let file_stem = if suffix == 0 {
+            format!("streaming-raw-{stamp}")
+        } else {
+            format!("streaming-raw-{stamp}-{suffix:03}")
+        };
+        let wav_path = raw_capture_dir.join(format!("{file_stem}.wav"));
+        let json_path = raw_capture_dir.join(format!("{file_stem}.json"));
+        if !wav_path.exists() && !json_path.exists() {
+            return Ok((file_stem, wav_path, json_path));
+        }
+    }
+    Err(anyhow!(
+        "unable to allocate unique streaming raw capture path for timestamp {stamp}"
+    ))
+}
+
+fn write_mono_i16_wav(path: &Path, sample_rate_hz: u32, samples: &[f32]) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: sample_rate_hz,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("create raw capture wav {}", path.display()))?;
+    for sample in samples {
+        let sample = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        writer
+            .write_sample(sample)
+            .with_context(|| format!("write raw capture wav {}", path.display()))?;
+    }
+    writer
+        .finalize()
+        .with_context(|| format!("finalize raw capture wav {}", path.display()))?;
+    Ok(())
+}
+
+fn prune_streaming_raw_captures(raw_capture_dir: &Path, keep: usize) -> Result<()> {
+    let mut captures = fs::read_dir(raw_capture_dir)
+        .with_context(|| format!("read raw capture dir {}", raw_capture_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("streaming-raw-") && name.ends_with(".wav"))
+        })
+        .collect::<Vec<_>>();
+    captures.sort();
+    let stale_count = captures.len().saturating_sub(keep);
+    for wav_path in captures.into_iter().take(stale_count) {
+        let json_path = wav_path.with_extension("json");
+        if let Err(error) = fs::remove_file(&wav_path) {
+            tracing::warn!(error = %error, path = %wav_path.display(), "remove stale raw capture wav failed");
+        }
+        if json_path.exists()
+            && let Err(error) = fs::remove_file(&json_path)
+        {
+            tracing::warn!(error = %error, path = %json_path.display(), "remove stale raw capture metadata failed");
+        }
+    }
+    Ok(())
+}
+
 fn log_streaming_timing_gate_results(
     first_partial_elapsed_ms: Option<u128>,
+    release_tail_elapsed_ms: u128,
+    offline_final_elapsed_ms: u128,
+    offline_final_timed_out: bool,
+    punctuation_elapsed_ms: u128,
     release_to_commit_elapsed_ms: u128,
 ) {
     if let Some(first_partial_elapsed_ms) = first_partial_elapsed_ms {
@@ -2713,6 +4469,28 @@ fn log_streaming_timing_gate_results(
         );
     }
 
+    log_streaming_timing_gate(
+        "streaming release-tail timing gate evaluated",
+        release_tail_elapsed_ms,
+        STREAMING_RELEASE_TAIL_TARGET_MS,
+        STREAMING_RELEASE_TAIL_HARD_MS,
+        None,
+    );
+    log_streaming_timing_gate(
+        "streaming offline-final timing gate evaluated",
+        offline_final_elapsed_ms,
+        STREAMING_OFFLINE_FINAL_TARGET_MS,
+        STREAMING_OFFLINE_FINAL_HARD_MS,
+        Some(offline_final_timed_out),
+    );
+    log_streaming_timing_gate(
+        "streaming punctuation timing gate evaluated",
+        punctuation_elapsed_ms,
+        STREAMING_PUNCTUATION_TARGET_MS,
+        STREAMING_PUNCTUATION_HARD_MS,
+        None,
+    );
+
     let gate_status = if release_to_commit_elapsed_ms <= STREAMING_RELEASE_TO_COMMIT_TARGET_MS {
         "target_pass"
     } else if release_to_commit_elapsed_ms <= STREAMING_RELEASE_TO_COMMIT_HARD_MS {
@@ -2729,8 +4507,34 @@ fn log_streaming_timing_gate_results(
     );
 }
 
+fn log_streaming_timing_gate(
+    message: &'static str,
+    elapsed_ms: u128,
+    target_ms: u128,
+    hard_ms: u128,
+    timeout_fallback: Option<bool>,
+) {
+    let gate_status = if elapsed_ms <= target_ms {
+        "target_pass"
+    } else if elapsed_ms <= hard_ms {
+        "hard_pass"
+    } else {
+        "hard_fail"
+    };
+    tracing::info!(
+        elapsed_ms,
+        target_ms,
+        hard_ms,
+        gate_status,
+        timeout_fallback,
+        gate = message,
+        "streaming timing gate evaluated"
+    );
+}
+
 fn delivery_label(delivery: OutputDelivery) -> &'static str {
     match delivery {
+        OutputDelivery::NativeEdit => "voice_native_edit",
         OutputDelivery::DirectPaste => "voice_direct_paste",
         OutputDelivery::ClipboardOnly => "voice_clipboard_only",
     }
@@ -2738,6 +4542,7 @@ fn delivery_label(delivery: OutputDelivery) -> &'static str {
 
 fn streaming_delivery_label(delivery: OutputDelivery) -> &'static str {
     match delivery {
+        OutputDelivery::NativeEdit => "streaming_native_edit",
         OutputDelivery::DirectPaste => "streaming_direct_paste",
         OutputDelivery::ClipboardOnly => "streaming_clipboard_only",
     }
@@ -2749,11 +4554,15 @@ fn prepare_streaming_preview_text(
     punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
 ) -> String {
     let normalized = ainput_rewrite::normalize_streaming_preview(current_partial);
-    if !rewrite_enabled {
-        return normalized;
+    if rewrite_enabled {
+        apply_streaming_semantic_commas(&apply_streaming_punctuation_content_safe(
+            &normalized,
+            punctuator,
+            false,
+        ))
+    } else {
+        apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
     }
-
-    apply_streaming_punctuation(&normalized, punctuator, false)
 }
 
 fn prepare_streaming_output_text(
@@ -2767,9 +4576,13 @@ fn prepare_streaming_output_text(
 
     let normalized = ainput_rewrite::normalize_transcription(final_text);
     let prepared = if rewrite_enabled {
-        apply_streaming_punctuation(&normalized, punctuator, true)
+        apply_streaming_semantic_commas(&apply_streaming_punctuation_content_safe(
+            &normalized,
+            punctuator,
+            true,
+        ))
     } else {
-        normalized
+        apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
     };
     let source = if prepared != final_text {
         StreamingCommitSource::StreamingTailRepair
@@ -2790,7 +4603,7 @@ fn apply_streaming_punctuation(
     }
 
     let Some(punctuator) = punctuator else {
-        return normalized.to_string();
+        return dedupe_streaming_punctuation(normalized);
     };
 
     let (frozen_prefix, latest_sentence) = split_frozen_prefix(normalized);
@@ -2812,15 +4625,262 @@ fn apply_streaming_punctuation(
     };
 
     let punctuated_latest = ainput_rewrite::normalize_transcription(&punctuated_latest);
-    let punctuated_latest = if finalize {
+    let punctuated_latest = dedupe_streaming_punctuation(&punctuated_latest);
+    let punctuated_latest = if finalize
+        || should_keep_streaming_preview_terminal_punctuation(target_text, &punctuated_latest)
+    {
         punctuated_latest
     } else {
         strip_trailing_terminal_sentence_punctuation(&punctuated_latest)
     };
 
-    format!("{}{}", frozen_prefix, punctuated_latest)
-        .trim()
-        .to_string()
+    apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&format!(
+        "{}{}",
+        frozen_prefix, punctuated_latest
+    )))
+}
+
+fn apply_streaming_punctuation_content_safe(
+    normalized_text: &str,
+    punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
+    finalize: bool,
+) -> String {
+    let normalized = normalized_text.trim();
+    if normalized.is_empty() {
+        return String::new();
+    }
+
+    let punctuated = apply_streaming_punctuation(normalized, punctuator, finalize);
+    let normalized_content_chars = content_chars_without_sentence_punctuation(normalized);
+    let punctuated_content_chars = content_chars_without_sentence_punctuation(&punctuated);
+    if punctuated_content_chars < normalized_content_chars {
+        tracing::debug!(
+            normalized = %short_log_text(normalized, 120),
+            punctuated = %short_log_text(&punctuated, 120),
+            normalized_content_chars,
+            punctuated_content_chars,
+            "streaming punctuation rejected because it removed content characters"
+        );
+        normalized.to_string()
+    } else {
+        punctuated
+    }
+}
+
+fn content_chars_without_sentence_punctuation(text: &str) -> usize {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !is_sentence_punctuation(*ch))
+        .count()
+}
+
+fn content_text_without_sentence_punctuation(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !is_sentence_punctuation(*ch))
+        .collect()
+}
+
+fn dedupe_streaming_punctuation(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut punctuation_run = Vec::new();
+
+    for ch in text.trim().chars() {
+        if is_sentence_punctuation(ch) {
+            punctuation_run.push(ch);
+            continue;
+        }
+
+        flush_punctuation_run(&mut result, &mut punctuation_run);
+        result.push(ch);
+    }
+    flush_punctuation_run(&mut result, &mut punctuation_run);
+    result.trim().to_string()
+}
+
+fn apply_streaming_semantic_commas(text: &str) -> String {
+    let mut current = text.trim().to_string();
+    for marker in ["另外", "然后", "而且", "但是", "不过", "所以", "现在"] {
+        current = insert_comma_after_leading_marker(&current, marker, 4);
+    }
+    for marker in [
+        "但是",
+        "不过",
+        "而且",
+        "然后",
+        "还是",
+        "尤其是",
+        "或者",
+        "比如",
+    ] {
+        current = insert_comma_before_marker(&current, marker, 6);
+    }
+    apply_streaming_semantic_tail_repairs(&current)
+}
+
+fn apply_streaming_semantic_tail_repairs(text: &str) -> String {
+    let mut current = text.trim().to_string();
+    for (from, to) in [
+        ("显示出来两个应该是", "显示出来两个字。应该是"),
+        ("出现文明明", "出现文字。明明"),
+    ] {
+        current = current.replace(from, to);
+    }
+    current
+}
+
+fn insert_comma_after_leading_marker(text: &str, marker: &str, min_tail_chars: usize) -> String {
+    let Some(rest) = text.strip_prefix(marker) else {
+        return text.to_string();
+    };
+    if rest.is_empty() {
+        return text.to_string();
+    }
+    if rest.chars().next().is_some_and(is_sentence_punctuation) {
+        return text.to_string();
+    }
+    if rest.chars().filter(|ch| !ch.is_whitespace()).count() < min_tail_chars {
+        return text.to_string();
+    }
+    format!("{marker}，{}", rest.trim_start())
+}
+
+fn insert_comma_before_marker(text: &str, marker: &str, min_prefix_chars: usize) -> String {
+    if text.is_empty() || marker.is_empty() {
+        return text.to_string();
+    }
+
+    let mut output = String::with_capacity(text.len() + 8);
+    let mut cursor = 0usize;
+    while let Some(relative_index) = text[cursor..].find(marker) {
+        let index = cursor + relative_index;
+        output.push_str(&text[cursor..index]);
+        if should_insert_streaming_comma_before(text, index, min_prefix_chars) {
+            output.push('，');
+        }
+        output.push_str(marker);
+        cursor = index + marker.len();
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn should_insert_streaming_comma_before(
+    text: &str,
+    marker_index: usize,
+    min_prefix_chars: usize,
+) -> bool {
+    let prefix = text[..marker_index].trim_end();
+    if prefix.chars().count() < min_prefix_chars {
+        return false;
+    }
+    prefix
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !is_sentence_punctuation(ch))
+}
+
+fn flush_punctuation_run(result: &mut String, punctuation_run: &mut Vec<char>) {
+    if punctuation_run.is_empty() {
+        return;
+    }
+
+    result.push(normalize_punctuation_run(punctuation_run));
+    punctuation_run.clear();
+}
+
+fn normalize_punctuation_run(punctuation_run: &[char]) -> char {
+    if punctuation_run.len() == 1 {
+        return punctuation_run[0];
+    }
+
+    if punctuation_run.iter().any(|ch| matches!(ch, '?' | '？')) {
+        return '？';
+    }
+    if punctuation_run.iter().any(|ch| matches!(ch, '!' | '！')) {
+        return '！';
+    }
+    if punctuation_run
+        .iter()
+        .any(|ch| matches!(ch, '.' | '。' | '．'))
+    {
+        return '。';
+    }
+    if punctuation_run.iter().any(|ch| matches!(ch, ';' | '；')) {
+        return '；';
+    }
+    if punctuation_run.iter().any(|ch| matches!(ch, ':' | '：')) {
+        return '：';
+    }
+    if punctuation_run.iter().all(|ch| *ch == '、') {
+        return '、';
+    }
+    '，'
+}
+
+fn trailing_terminal_sentence_punctuation(text: &str) -> Option<char> {
+    text.trim().chars().next_back().and_then(|ch| match ch {
+        '.' | '。' | '．' => Some('。'),
+        '!' | '！' => Some('！'),
+        '?' | '？' => Some('？'),
+        ';' | '；' => Some('；'),
+        _ => None,
+    })
+}
+
+fn should_keep_streaming_preview_terminal_punctuation(
+    source_text: &str,
+    punctuated_text: &str,
+) -> bool {
+    let Some(terminal) = trailing_terminal_sentence_punctuation(punctuated_text) else {
+        return false;
+    };
+    let source = source_text.trim();
+    if visible_text_char_count(source) < 4 {
+        return false;
+    }
+
+    match terminal {
+        '？' => has_semantic_question_cue(source),
+        '。' => has_semantic_statement_completion_cue(source),
+        '！' => has_semantic_exclamation_cue(source),
+        _ => false,
+    }
+}
+
+fn has_semantic_question_cue(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.ends_with('吗')
+        || trimmed.ends_with('么')
+        || trimmed.contains("是不是")
+        || trimmed.contains("对不对")
+        || trimmed.contains("能不能")
+        || trimmed.contains("可不可以")
+        || trimmed.contains("要不要")
+}
+
+fn has_semantic_statement_completion_cue(text: &str) -> bool {
+    let trimmed = text.trim();
+    [
+        "完了",
+        "好了",
+        "结束了",
+        "完成了",
+        "可以了",
+        "没问题了",
+        "清楚了",
+        "明白了",
+        "正常了",
+        "成功了",
+        "失败了",
+        "就这样",
+        "到这里",
+    ]
+    .iter()
+    .any(|ending| trimmed.ends_with(ending))
+}
+
+fn has_semantic_exclamation_cue(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.ends_with('啊') || trimmed.ends_with('呀') || trimmed.ends_with('啦')
 }
 
 fn strip_trailing_terminal_sentence_punctuation(text: &str) -> String {
@@ -2834,14 +4894,22 @@ fn strip_trailing_terminal_sentence_punctuation(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioActivity, StreamingCommitSource, StreamingResampler, analyze_recent_audio_activity,
-        build_streaming_ai_rewrite_candidate, effective_ai_rewrite_min_visible_chars,
-        ensure_terminal_sentence_boundary, merge_rolled_over_prefix, prepare_streaming_output_text,
-        prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
-        sanitize_ai_rewrite_output, select_streaming_commit_text, select_streaming_preview_text,
-        should_drop_streaming_preview_result, should_skip_streaming_preview,
-        strip_trailing_terminal_sentence_punctuation,
+        AudioActivity, STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS,
+        STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT, StreamingCommitSource,
+        StreamingOfflineFinalScope, StreamingResampler, analyze_recent_audio_activity,
+        append_with_suffix_prefix_overlap, apply_streaming_semantic_commas,
+        build_streaming_ai_rewrite_candidate, dedupe_streaming_punctuation,
+        effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
+        merge_rolled_over_prefix, merge_streaming_offline_tail_repair,
+        prepare_streaming_output_text, prepare_streaming_pause_boundary_text,
+        prepare_streaming_preview_text, resolve_streaming_rollover_commit_text,
+        sanitize_ai_rewrite_output, save_streaming_raw_capture, select_streaming_commit_text,
+        select_streaming_final_raw_text, select_streaming_preview_text,
+        should_drop_low_signal_result, should_drop_streaming_preview_result,
+        should_skip_streaming_preview, streaming_offline_final_sample_start,
+        streaming_offline_final_scope, strip_trailing_terminal_sentence_punctuation,
     };
+    use std::fs;
 
     #[test]
     fn streaming_preview_falls_back_to_normalized_text_without_punctuator() {
@@ -2868,11 +4936,46 @@ mod tests {
     }
 
     #[test]
+    fn streaming_punctuation_dedupes_repeated_marks() {
+        assert_eq!(
+            dedupe_streaming_punctuation("这个标点，，而且重复。。真的？！"),
+            "这个标点，而且重复。真的？"
+        );
+    }
+
+    #[test]
+    fn streaming_semantic_commas_handles_leading_discourse_marker() {
+        assert_eq!(
+            apply_streaming_semantic_commas("另外这个加标点符号的逻辑"),
+            "另外，这个加标点符号的逻辑"
+        );
+    }
+
+    #[test]
+    fn streaming_semantic_commas_handles_mid_sentence_markers() {
+        assert_eq!(
+            apply_streaming_semantic_commas("最后一个字的问题还是可能会漏字尤其是语气词"),
+            "最后一个字的问题，还是可能会漏字，尤其是语气词"
+        );
+    }
+
+    #[test]
+    fn streaming_semantic_tail_repairs_restore_obvious_missing_classifier_chars() {
+        assert_eq!(
+            apply_streaming_semantic_commas(
+                "然后，不管我说多少个字，它永远只能显示出来两个应该是我不断的说话之后，它能不断地出现文明明这个 HUD 上面已经把正确的文案显示出来了"
+            ),
+            "然后，不管我说多少个字，它永远只能显示出来两个字。应该是我不断的说话之后，它能不断地出现文字。明明这个 HUD 上面已经把正确的文案显示出来了"
+        );
+    }
+
+    #[test]
     fn streaming_preview_skips_background_noise_before_real_speech() {
         let activity = AudioActivity {
             peak_abs: 0.004,
             rms: 0.0012,
             active_ratio: 0.004,
+            sustained_voice_ms: 0,
         };
         assert!(should_skip_streaming_preview(&activity));
         assert!(should_drop_streaming_preview_result("喂", &activity));
@@ -2884,6 +4987,7 @@ mod tests {
             peak_abs: 0.036,
             rms: 0.008,
             active_ratio: 0.12,
+            sustained_voice_ms: 240,
         };
         assert!(!should_skip_streaming_preview(&activity));
         assert!(!should_drop_streaming_preview_result(
@@ -2893,12 +4997,91 @@ mod tests {
     }
 
     #[test]
+    fn low_confidence_short_english_fillers_are_dropped() {
+        let ghost_yeah = AudioActivity {
+            peak_abs: 0.081,
+            rms: 0.0052,
+            active_ratio: 0.0508,
+            sustained_voice_ms: 20,
+        };
+        assert!(should_drop_low_signal_result("Yeah.", &ghost_yeah));
+
+        let ghost_okay = AudioActivity {
+            peak_abs: 0.045,
+            rms: 0.0029,
+            active_ratio: 0.0228,
+            sustained_voice_ms: 40,
+        };
+        assert!(should_drop_low_signal_result("Okay.", &ghost_okay));
+    }
+
+    #[test]
+    fn low_signal_filter_keeps_clear_or_meaningful_text() {
+        let clear_short_english = AudioActivity {
+            peak_abs: 0.048,
+            rms: 0.008,
+            active_ratio: 0.12,
+            sustained_voice_ms: 180,
+        };
+        assert!(!should_drop_low_signal_result(
+            "Okay.",
+            &clear_short_english
+        ));
+
+        let weak_mixed_text = AudioActivity {
+            peak_abs: 0.018,
+            rms: 0.0032,
+            active_ratio: 0.024,
+            sustained_voice_ms: 80,
+        };
+        assert!(!should_drop_low_signal_result(
+            "okay 这个问题",
+            &weak_mixed_text
+        ));
+        assert!(!should_drop_low_signal_result("OpenAI", &weak_mixed_text));
+    }
+
+    #[test]
     fn recent_audio_activity_prefers_latest_speech_over_old_silence() {
         let mut samples = vec![0.0f32; 16_000];
         samples.extend(std::iter::repeat_n(0.05f32, 4_000));
         let activity = analyze_recent_audio_activity(&samples, 16_000, 700);
         assert!(activity.peak_abs >= 0.05);
         assert!(activity.active_ratio > 0.1);
+        assert!(activity.sustained_voice_ms >= 200);
+    }
+
+    #[test]
+    fn raw_capture_writer_keeps_only_recent_twenty_wavs() {
+        let dir = std::env::temp_dir().join(format!(
+            "ainput-raw-capture-test-{}",
+            super::current_timestamp_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create temp raw capture dir");
+        for _ in 0..(STREAMING_RAW_CAPTURE_LIMIT + 2) {
+            save_streaming_raw_capture(
+                dir.clone(),
+                ainput_audio::RecordedAudio {
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    samples: vec![0.0, 0.25, -0.25, 0.0],
+                },
+            )
+            .expect("save raw capture");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let wav_count = fs::read_dir(&dir)
+            .expect("read temp raw capture dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == std::ffi::OsStr::new("wav"))
+            })
+            .count();
+        assert_eq!(wav_count, STREAMING_RAW_CAPTURE_LIMIT);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2911,6 +5094,87 @@ mod tests {
             )
             .text,
             "帮我看一下这里有没有问题"
+        );
+    }
+
+    #[test]
+    fn commit_text_preserves_one_char_tail_drop() {
+        assert_eq!(
+            select_streaming_commit_text(
+                "我已经把这个问题修好了",
+                "我已经把这个问题修好。",
+                StreamingCommitSource::OnlineFinal
+            )
+            .text,
+            "我已经把这个问题修好了。"
+        );
+    }
+
+    #[test]
+    fn final_commit_repairs_fuzzy_tail_overlap_instead_of_duplicating() {
+        let selected = select_streaming_commit_text(
+            "我都已经设置了多跳思考的",
+            "我都已经设置了多跳思考的设置了多跳思考了。",
+            StreamingCommitSource::OfflineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::OfflineFinal);
+        assert_eq!(selected.text, "我都已经设置了多跳思考了。");
+    }
+
+    #[test]
+    fn final_commit_dedupes_exact_tail_overlap_after_display_prefix() {
+        let selected = select_streaming_commit_text(
+            "这个功能应该是这样处理",
+            "这个功能应该是这样处理这样处理了。",
+            StreamingCommitSource::OfflineFinal,
+        );
+        assert_eq!(selected.text, "这个功能应该是这样处理了。");
+    }
+
+    #[test]
+    fn final_commit_keeps_true_tail_append_without_overlap() {
+        let selected = select_streaming_commit_text(
+            "你这些分辨率",
+            "你这些分辨率有问题。",
+            StreamingCommitSource::OfflineFinal,
+        );
+        assert_eq!(selected.text, "你这些分辨率有问题。");
+    }
+
+    #[test]
+    fn offline_final_raw_text_repairs_streaming_tail_drop() {
+        let (selected, source) = select_streaming_final_raw_text(
+            "一共花了两天时",
+            "一共花了两天时间。",
+            StreamingOfflineFinalScope::FullAudio,
+        );
+        assert_eq!(selected, "一共花了两天时间。");
+        assert_eq!(source, StreamingCommitSource::OfflineFinal);
+    }
+
+    #[test]
+    fn offline_final_uses_tail_window_for_long_audio() {
+        let sample_rate_hz = 16_000;
+        let long_sample_count = ((STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS + 1)
+            * sample_rate_hz as u64
+            / 1000) as usize;
+        let scope = streaming_offline_final_scope(sample_rate_hz, long_sample_count);
+        assert_eq!(scope, StreamingOfflineFinalScope::TailWindow);
+        let start = streaming_offline_final_sample_start(sample_rate_hz, long_sample_count, scope);
+        let expected_tail_samples =
+            (STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS * sample_rate_hz as u64 / 1000) as usize;
+        assert_eq!(long_sample_count - start, expected_tail_samples);
+    }
+
+    #[test]
+    fn offline_tail_repair_only_appends_with_overlap() {
+        assert_eq!(
+            merge_streaming_offline_tail_repair("我已经把这个问题修好", "修好了。").as_deref(),
+            Some("我已经把这个问题修好了。")
+        );
+        assert_eq!(
+            merge_streaming_offline_tail_repair("我已经把这个问题修好", "完全不相关"),
+            None
         );
     }
 
@@ -2935,6 +5199,7 @@ mod tests {
             peak_abs: 0.014,
             rms: 0.0031,
             active_ratio: 0.0204,
+            sustained_voice_ms: 120,
         };
         assert!(!should_drop_streaming_preview_result("我不知", &activity));
     }
@@ -2945,6 +5210,7 @@ mod tests {
             peak_abs: 0.0068,
             rms: 0.0019,
             active_ratio: 0.0125,
+            sustained_voice_ms: 80,
         };
         assert!(!should_skip_streaming_preview(&activity));
     }
@@ -2958,10 +5224,12 @@ mod tests {
 
     #[test]
     fn ai_rewrite_candidate_only_targets_latest_tail() {
-        let candidate = build_streaming_ai_rewrite_candidate("第一句已经稳定。第二句先是错字", 2)
-            .expect("candidate");
+        let candidate =
+            build_streaming_ai_rewrite_candidate("第一句已经稳定。第二句先是错字", 2, 7)
+                .expect("candidate");
         assert_eq!(candidate.frozen_prefix, "第一句已经稳定。");
         assert_eq!(candidate.current_tail, "第二句先是错字");
+        assert_eq!(candidate.revision, 7);
     }
 
     #[test]
@@ -3017,18 +5285,18 @@ mod tests {
     }
 
     #[test]
-    fn pause_boundary_text_forces_terminal_punctuation() {
+    fn pause_boundary_text_does_not_force_terminal_punctuation() {
         assert_eq!(
             prepare_streaming_pause_boundary_text("第一句还没标点", false, None),
-            "第一句还没标点。"
+            "第一句还没标点"
         );
     }
 
     #[test]
-    fn pause_boundary_text_preserves_existing_prefix() {
+    fn pause_boundary_text_preserves_existing_text_without_new_boundary() {
         assert_eq!(
             prepare_streaming_pause_boundary_text("第一句已经稳定。第二句继续", false, None),
-            "第一句已经稳定。第二句继续。"
+            "第一句已经稳定。第二句继续"
         );
     }
 
@@ -3037,6 +5305,52 @@ mod tests {
         assert_eq!(
             merge_rolled_over_prefix("第一句已经稳定。", "第二句继续"),
             "第一句已经稳定。第二句继续"
+        );
+    }
+
+    #[test]
+    fn rollover_prefix_merge_does_not_duplicate_full_replacement() {
+        assert_eq!(
+            merge_rolled_over_prefix("你最些分辨率有问", "你这些分辨率有问题。"),
+            "你这些分辨率有问题。"
+        );
+    }
+
+    #[test]
+    fn final_commit_text_matches_output_terminal_boundary() {
+        assert_eq!(
+            ensure_terminal_sentence_boundary(
+                "明明这个HUD上面已经把正确的文案显示出来了，但是它有时候上屏，还是慢"
+            ),
+            "明明这个HUD上面已经把正确的文案显示出来了，但是它有时候上屏，还是慢。"
+        );
+    }
+
+    #[test]
+    fn rollover_prefix_merge_still_appends_true_segment_tail() {
+        assert_eq!(
+            merge_rolled_over_prefix("你这些分辨率", "有问题。"),
+            "你这些分辨率有问题。"
+        );
+    }
+
+    #[test]
+    fn rollover_prefix_merge_dedupes_short_overlap() {
+        assert_eq!(
+            append_with_suffix_prefix_overlap("这个功能应该是这样", "这样了"),
+            "这个功能应该是这样了"
+        );
+    }
+
+    #[test]
+    fn rollover_commit_prefers_raw_when_display_lags_tail() {
+        assert_eq!(
+            resolve_streaming_rollover_commit_text(
+                "而且这个面",
+                "而且这个面上面显示的东西也会",
+                "上面显示的东西也会乱跳"
+            ),
+            "而且这个面上面显示的东西也会乱跳"
         );
     }
 

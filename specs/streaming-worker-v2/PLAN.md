@@ -1,5 +1,7 @@
 # Streaming Worker V2 PLAN
 
+> 状态：已被 `../streaming-realtime-rewrite-v3/` 取代。本文只保留历史背景；继续开发和验收以 V3 `SPEC.md` / `PLAN.md` / `TASKLIST.md` 为准。
+
 ## 第 1 步：接通真正在线流式解码
 
 - 在 `apps/ainput-desktop/src/worker.rs` 为流式模式改用 `StreamingZipformerRecognizer`。

@@ -10,7 +10,7 @@ use enigo::{
     Direction::{Click, Press, Release},
     Enigo, Key, Keyboard, Settings,
 };
-use windows::Win32::Foundation::{CloseHandle, HWND, MAX_PATH};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, MAX_PATH, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize,
@@ -20,9 +20,17 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationTextPattern2,
-    IUIAutomationTextRange, TextPatternRangeEndpoint_End, UIA_TextPattern2Id, UIA_TextPatternId,
+    IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+    UIA_TextPattern2Id, UIA_TextPatternId,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::Controls::EM_REPLACESEL;
+use windows::Win32::UI::Input::Ime::{
+    CPS_CANCEL, ImmGetContext, ImmNotifyIME, ImmReleaseContext, NI_COMPOSITIONSTR,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GUITHREADINFO, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, SendMessageW,
+};
 use windows::core::PWSTR;
 
 const SENTENCE_FINAL_EMOJI_RULES: &[(&str, &str)] = &[
@@ -37,10 +45,15 @@ const SENTENCE_FINAL_EMOJI_RULES: &[(&str, &str)] = &[
 ];
 const DEFAULT_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(35);
 const CHROME_ALT_MENU_DISMISS_DELAY: Duration = Duration::from_millis(30);
+const IME_COMPOSITION_CANCEL_DELAY: Duration = Duration::from_millis(15);
 const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(120);
+const CLIPBOARD_WRITE_VERIFY_RETRIES: usize = 4;
+const CLIPBOARD_WRITE_VERIFY_DELAY: Duration = Duration::from_millis(12);
+const MAX_CONTEXT_TEXT_CHARS: i32 = 160;
 
 #[derive(Debug, Clone, Copy)]
 pub enum OutputDelivery {
+    NativeEdit,
     DirectPaste,
     ClipboardOnly,
 }
@@ -60,12 +73,20 @@ pub struct OutputConfig {
     pub fallback_to_clipboard: bool,
     pub voice_hotkey_uses_alt: bool,
     pub paste_stabilize_delay: Duration,
+    pub allow_native_edit: bool,
+    pub restore_clipboard_after_paste: bool,
+    pub defer_clipboard_restore: bool,
+    pub preserve_text_exactly: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputContextSnapshot {
     pub process_name: Option<String>,
+    pub window_title: Option<String>,
     pub kind: OutputContextKind,
+    pub selected_text: Option<String>,
+    pub text_before_cursor: Option<String>,
+    pub text_after_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +94,27 @@ pub enum OutputContextKind {
     EditableWithContentOnRight,
     EditableAtEnd,
     Unknown,
+}
+
+impl OutputContextSnapshot {
+    pub fn unknown() -> Self {
+        Self {
+            process_name: None,
+            window_title: None,
+            kind: OutputContextKind::Unknown,
+            selected_text: None,
+            text_before_cursor: None,
+            text_after_cursor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FocusedTextContext {
+    has_content_on_right: Option<bool>,
+    selected_text: Option<String>,
+    text_before_cursor: Option<String>,
+    text_after_cursor: Option<String>,
 }
 
 enum ClipboardBackup {
@@ -135,11 +177,25 @@ impl OutputController {
     pub fn deliver_text(&self, text: &str, config: &OutputConfig) -> Result<OutputDelivery> {
         let started_at = Instant::now();
         let correction_started_at = Instant::now();
-        let corrected_text = self.apply_term_corrections(text)?;
+        let corrected_text = if config.preserve_text_exactly {
+            text.to_string()
+        } else {
+            self.apply_term_corrections(text)?
+        };
         let correction_elapsed_ms = correction_started_at.elapsed().as_millis();
 
         let prepare_started_at = Instant::now();
-        let (prepared_text, context) = prepare_text_for_delivery(&corrected_text);
+        let (prepared_text, context) = if config.preserve_text_exactly {
+            (
+                corrected_text.clone(),
+                inspect_output_context().unwrap_or_else(|error| {
+                    tracing::warn!(error = %error, "failed to inspect caret context");
+                    OutputContextSnapshot::unknown()
+                }),
+            )
+        } else {
+            prepare_text_for_delivery(&corrected_text)
+        };
         let prepare_elapsed_ms = prepare_started_at.elapsed().as_millis();
 
         if prepared_text != text {
@@ -153,6 +209,29 @@ impl OutputController {
         }
 
         if config.prefer_direct_paste {
+            let native_edit_started_at = Instant::now();
+            if config.allow_native_edit {
+                cancel_ime_composition_before_insert();
+                match insert_via_native_focused_edit(&prepared_text) {
+                    Ok(true) => {
+                        tracing::info!(
+                            correction_elapsed_ms,
+                            prepare_elapsed_ms,
+                            native_edit_elapsed_ms = native_edit_started_at.elapsed().as_millis(),
+                            deliver_text_elapsed_ms = started_at.elapsed().as_millis(),
+                            context = ?context.kind,
+                            process_name = context.process_name.as_deref().unwrap_or("unknown"),
+                            "output delivery timing"
+                        );
+                        return Ok(OutputDelivery::NativeEdit);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::debug!(error = %error, "native edit insert unavailable");
+                    }
+                }
+            }
+
             let direct_paste_started_at = Instant::now();
             match paste_via_clipboard(&prepared_text, &context, config) {
                 Ok(()) => {
@@ -228,10 +307,7 @@ impl OutputController {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to inspect caret context for AI rewrite");
-                OutputContextSnapshot {
-                    process_name: None,
-                    kind: OutputContextKind::Unknown,
-                }
+                OutputContextSnapshot::unknown()
             }
         }
     }
@@ -250,7 +326,72 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
     clipboard
         .set_text(text.to_string())
         .context("write text into clipboard")?;
-    Ok(())
+    for _ in 0..CLIPBOARD_WRITE_VERIFY_RETRIES {
+        if clipboard.get_text().ok().as_deref() == Some(text) {
+            return Ok(());
+        }
+        thread::sleep(CLIPBOARD_WRITE_VERIFY_DELAY);
+    }
+    if clipboard.get_text().ok().as_deref() == Some(text) {
+        return Ok(());
+    }
+    Err(anyhow!("clipboard write verification failed"))
+}
+
+fn insert_via_native_focused_edit(text: &str) -> Result<bool> {
+    let Some(hwnd) = focused_native_edit_hwnd()? else {
+        return Ok(false);
+    };
+    let mut wide = text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        let _ = SendMessageW(
+            hwnd,
+            EM_REPLACESEL,
+            Some(WPARAM(1)),
+            Some(LPARAM(wide.as_mut_ptr() as isize)),
+        );
+    }
+    Ok(true)
+}
+
+fn focused_native_edit_hwnd() -> Result<Option<HWND>> {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() {
+            return Ok(None);
+        }
+
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        if foreground_thread == 0 {
+            return Ok(None);
+        }
+
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        GetGUIThreadInfo(foreground_thread, &mut info).context("get foreground GUI thread info")?;
+        let focused = info.hwndFocus;
+        if focused.0.is_null() {
+            return Ok(None);
+        }
+
+        let mut class_name = [0u16; 128];
+        let copied = GetClassNameW(focused, &mut class_name);
+        if copied <= 0 {
+            return Ok(None);
+        }
+        let class_name =
+            String::from_utf16_lossy(&class_name[..copied as usize]).to_ascii_lowercase();
+        if class_name == "edit" || class_name.starts_with("richedit") {
+            return Ok(Some(focused));
+        }
+
+        Ok(None)
+    }
 }
 
 fn paste_via_clipboard(
@@ -258,7 +399,9 @@ fn paste_via_clipboard(
     context: &OutputContextSnapshot,
     config: &OutputConfig,
 ) -> Result<()> {
-    let backup = ClipboardBackup::capture();
+    let backup = config
+        .restore_clipboard_after_paste
+        .then(ClipboardBackup::capture);
     let clipboard_started_at = Instant::now();
     copy_to_clipboard(text)?;
     let clipboard_elapsed_ms = clipboard_started_at.elapsed().as_millis();
@@ -277,25 +420,73 @@ fn paste_via_clipboard(
         thread::sleep(CHROME_ALT_MENU_DISMISS_DELAY);
     }
     let clear_menu_focus_elapsed_ms = clear_menu_focus_started_at.elapsed().as_millis();
+    let ime_cancel_started_at = Instant::now();
+    cancel_foreground_ime_composition();
+    thread::sleep(IME_COMPOSITION_CANCEL_DELAY);
+    let ime_cancel_elapsed_ms = ime_cancel_started_at.elapsed().as_millis();
     let key_send_started_at = Instant::now();
     enigo.key(Key::Control, Press).context("press ctrl")?;
     enigo.key(Key::V, Click).context("send v key")?;
     enigo.key(Key::Control, Release).context("release ctrl")?;
     let key_send_elapsed_ms = key_send_started_at.elapsed().as_millis();
-    thread::sleep(CLIPBOARD_RESTORE_DELAY);
-    if let Err(error) = backup.restore() {
-        tracing::warn!(error = %error, "restore clipboard after direct paste failed");
+    if let Some(backup) = backup {
+        if config.defer_clipboard_restore {
+            thread::spawn(move || {
+                thread::sleep(CLIPBOARD_RESTORE_DELAY);
+                if let Err(error) = backup.restore() {
+                    tracing::warn!(error = %error, "restore clipboard after direct paste failed");
+                }
+            });
+        } else {
+            thread::sleep(CLIPBOARD_RESTORE_DELAY);
+            if let Err(error) = backup.restore() {
+                tracing::warn!(error = %error, "restore clipboard after direct paste failed");
+            }
+        }
     }
     tracing::info!(
         clipboard_elapsed_ms,
         controller_elapsed_ms,
         clear_menu_focus_elapsed_ms,
+        ime_cancel_elapsed_ms,
         key_send_elapsed_ms,
         paste_via_clipboard_elapsed_ms = clipboard_started_at.elapsed().as_millis(),
         "paste timing"
     );
 
     Ok(())
+}
+
+fn cancel_ime_composition_before_insert() {
+    cancel_foreground_ime_composition();
+    thread::sleep(IME_COMPOSITION_CANCEL_DELAY);
+}
+
+fn cancel_foreground_ime_composition() {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() {
+            return;
+        }
+        let mut target = foreground;
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        if foreground_thread != 0 {
+            let mut info = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            if GetGUIThreadInfo(foreground_thread, &mut info).is_ok() && !info.hwndFocus.0.is_null()
+            {
+                target = info.hwndFocus;
+            }
+        }
+        let context = ImmGetContext(target);
+        if context.0.is_null() {
+            return;
+        }
+        let _ = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+        let _ = ImmReleaseContext(target, context);
+    }
 }
 
 impl ClipboardBackup {
@@ -366,6 +557,10 @@ impl Default for OutputConfig {
             fallback_to_clipboard: true,
             voice_hotkey_uses_alt: false,
             paste_stabilize_delay: DEFAULT_PASTE_STABILIZE_DELAY,
+            allow_native_edit: false,
+            restore_clipboard_after_paste: true,
+            defer_clipboard_restore: false,
+            preserve_text_exactly: false,
         }
     }
 }
@@ -380,13 +575,7 @@ fn should_clear_alt_menu_focus(context: &OutputContextSnapshot, config: &OutputC
 
 fn prepare_text_for_delivery(text: &str) -> (String, OutputContextSnapshot) {
     if text.is_empty() {
-        return (
-            String::new(),
-            OutputContextSnapshot {
-                process_name: None,
-                kind: OutputContextKind::Unknown,
-            },
-        );
+        return (String::new(), OutputContextSnapshot::unknown());
     }
 
     match inspect_output_context() {
@@ -396,13 +585,7 @@ fn prepare_text_for_delivery(text: &str) -> (String, OutputContextSnapshot) {
         ),
         Err(error) => {
             tracing::warn!(error = %error, "failed to inspect caret context");
-            (
-                text.to_string(),
-                OutputContextSnapshot {
-                    process_name: None,
-                    kind: OutputContextKind::Unknown,
-                },
-            )
+            (text.to_string(), OutputContextSnapshot::unknown())
         }
     }
 }
@@ -476,19 +659,31 @@ fn is_emoji_token(text: &str) -> bool {
 
 fn inspect_output_context() -> Result<OutputContextSnapshot> {
     let process_name = foreground_process_name()?;
+    let window_title = foreground_window_title()?;
 
-    match focused_has_content_on_right() {
-        Ok(Some(true)) => Ok(OutputContextSnapshot {
-            process_name,
-            kind: OutputContextKind::EditableWithContentOnRight,
-        }),
-        Ok(Some(false)) => Ok(OutputContextSnapshot {
-            process_name,
-            kind: OutputContextKind::EditableAtEnd,
-        }),
+    match focused_text_context() {
+        Ok(Some(text_context)) => {
+            let kind = match text_context.has_content_on_right {
+                Some(true) => OutputContextKind::EditableWithContentOnRight,
+                Some(false) => OutputContextKind::EditableAtEnd,
+                None => OutputContextKind::Unknown,
+            };
+            Ok(OutputContextSnapshot {
+                process_name,
+                window_title,
+                kind,
+                selected_text: text_context.selected_text,
+                text_before_cursor: text_context.text_before_cursor,
+                text_after_cursor: text_context.text_after_cursor,
+            })
+        }
         Ok(None) => Ok(OutputContextSnapshot {
             process_name,
+            window_title,
             kind: OutputContextKind::Unknown,
+            selected_text: None,
+            text_before_cursor: None,
+            text_after_cursor: None,
         }),
         Err(error) => Err(error),
     }
@@ -528,7 +723,29 @@ fn foreground_process_name() -> Result<Option<String>> {
     }
 }
 
-fn focused_has_content_on_right() -> Result<Option<bool>> {
+fn foreground_window_title() -> Result<Option<String>> {
+    unsafe {
+        let hwnd: HWND = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return Ok(None);
+        }
+
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return Ok(None);
+        }
+
+        let mut buffer = vec![0u16; len as usize + 1];
+        let copied = GetWindowTextW(hwnd, &mut buffer);
+        if copied <= 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(String::from_utf16_lossy(&buffer[..copied as usize])))
+    }
+}
+
+fn focused_text_context() -> Result<Option<FocusedTextContext>> {
     let _com = ComApartment::initialize()?;
 
     unsafe {
@@ -554,7 +771,16 @@ fn focused_has_content_on_right() -> Result<Option<bool>> {
             let document_range = text_pattern2
                 .DocumentRange()
                 .context("get text document range")?;
-            return compare_range_end_with_document_end(&caret_range, &document_range).map(Some);
+            let has_content_on_right =
+                compare_range_end_with_document_end(&caret_range, &document_range)?;
+            let (text_before_cursor, text_after_cursor) =
+                surrounding_text_from_ranges(&caret_range, &document_range)?;
+            return Ok(Some(FocusedTextContext {
+                has_content_on_right: Some(has_content_on_right),
+                selected_text: range_text(&caret_range)?,
+                text_before_cursor,
+                text_after_cursor,
+            }));
         }
 
         if let Ok(text_pattern) =
@@ -573,12 +799,66 @@ fn focused_has_content_on_right() -> Result<Option<bool>> {
             let document_range = text_pattern
                 .DocumentRange()
                 .context("get text document range")?;
-            return compare_range_end_with_document_end(&selection_range, &document_range)
-                .map(Some);
+            let has_content_on_right =
+                compare_range_end_with_document_end(&selection_range, &document_range)?;
+            let (text_before_cursor, text_after_cursor) =
+                surrounding_text_from_ranges(&selection_range, &document_range)?;
+            return Ok(Some(FocusedTextContext {
+                has_content_on_right: Some(has_content_on_right),
+                selected_text: range_text(&selection_range)?,
+                text_before_cursor,
+                text_after_cursor,
+            }));
         }
     }
 
     Ok(None)
+}
+
+fn surrounding_text_from_ranges(
+    current_range: &IUIAutomationTextRange,
+    document_range: &IUIAutomationTextRange,
+) -> Result<(Option<String>, Option<String>)> {
+    unsafe {
+        let before_range = document_range
+            .Clone()
+            .context("clone text document range")?;
+        before_range
+            .MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                current_range,
+                TextPatternRangeEndpoint_Start,
+            )
+            .context("move before-range endpoint to caret start")?;
+
+        let after_range = document_range
+            .Clone()
+            .context("clone text document range")?;
+        after_range
+            .MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                current_range,
+                TextPatternRangeEndpoint_End,
+            )
+            .context("move after-range endpoint to caret end")?;
+
+        Ok((range_text(&before_range)?, range_text(&after_range)?))
+    }
+}
+
+fn range_text(range: &IUIAutomationTextRange) -> Result<Option<String>> {
+    let raw = unsafe {
+        range
+            .GetText(MAX_CONTEXT_TEXT_CHARS)
+            .context("get text range content")?
+    };
+    let text = raw.to_string();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
 }
 
 fn compare_range_end_with_document_end(
@@ -751,23 +1031,39 @@ mod tests {
     fn clears_alt_menu_focus_only_for_chrome_with_alt_voice_hotkey() {
         let chrome_context = OutputContextSnapshot {
             process_name: Some("chrome.exe".to_string()),
+            window_title: Some("Chrome".to_string()),
             kind: OutputContextKind::EditableAtEnd,
+            selected_text: None,
+            text_before_cursor: None,
+            text_after_cursor: None,
         };
         let edge_context = OutputContextSnapshot {
             process_name: Some("msedge.exe".to_string()),
+            window_title: Some("Edge".to_string()),
             kind: OutputContextKind::EditableAtEnd,
+            selected_text: None,
+            text_before_cursor: None,
+            text_after_cursor: None,
         };
         let alt_config = OutputConfig {
             prefer_direct_paste: true,
             fallback_to_clipboard: true,
             voice_hotkey_uses_alt: true,
             paste_stabilize_delay: DEFAULT_PASTE_STABILIZE_DELAY,
+            allow_native_edit: false,
+            restore_clipboard_after_paste: true,
+            defer_clipboard_restore: false,
+            preserve_text_exactly: false,
         };
         let ctrl_config = OutputConfig {
             prefer_direct_paste: true,
             fallback_to_clipboard: true,
             voice_hotkey_uses_alt: false,
             paste_stabilize_delay: DEFAULT_PASTE_STABILIZE_DELAY,
+            allow_native_edit: false,
+            restore_clipboard_after_paste: true,
+            defer_clipboard_restore: false,
+            preserve_text_exactly: false,
         };
 
         assert!(should_clear_alt_menu_focus(&chrome_context, &alt_config));

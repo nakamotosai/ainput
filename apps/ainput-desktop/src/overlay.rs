@@ -4,22 +4,23 @@ use std::time::{Duration, Instant};
 use ainput_automation::{AutomationActivity, AutomationClickSnapshot, AutomationOverlayHint};
 use ainput_shell::{HudAnchor, HudOverlayConfig, HudTextAlign};
 use anyhow::{Result, anyhow};
+use serde::Serialize;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DEFAULT_QUALITY, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_WORDBREAK,
+    DEFAULT_PITCH, DEFAULT_QUALITY, DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
     DeleteObject, DrawTextW, FF_DONTCARE, GetDC, HBRUSH, HDC, HFONT, OUT_OUTLINE_PRECIS, ReleaseDC,
     SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics,
-    HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW, SET_WINDOW_POS_FLAGS,
-    SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_CTLCOLORSTATIC, WM_NCHITTEST, WM_SETFONT,
-    WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    GetWindowRect, HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, RegisterClassW,
+    SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos,
+    SetWindowTextW, ShowWindow, SystemParametersInfoW, WINDOW_STYLE, WM_CTLCOLORSTATIC,
+    WM_NCHITTEST, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -81,6 +82,24 @@ pub struct RecordingOverlay {
     started_at: Instant,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HudAcceptanceSnapshot {
+    pub hwnd: usize,
+    pub text_hwnd: usize,
+    pub target_text: String,
+    pub display_text: String,
+    pub message: String,
+    pub char_streaming: bool,
+    pub visible: bool,
+    pub alpha: u8,
+    pub rect: [i32; 4],
+    pub background_color: String,
+    pub text_color: String,
+    pub font_height_px: i32,
+    pub padding_x_px: i32,
+    pub padding_y_px: i32,
+}
+
 struct ShapeWindow {
     hwnd: HWND,
     brush: HBRUSH,
@@ -102,7 +121,6 @@ struct HudMicrostreamState {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-#[cfg(test)]
 struct HudRetargetStats {
     committed_chars: usize,
     diff_prefix_chars: usize,
@@ -146,9 +164,9 @@ impl HudStyle {
             offset_x_px: config.offset_x_px,
             offset_y_px: config.offset_y_px,
             width_px: config.width_px.max(220),
-            min_width_px: config.min_width_px.max(120),
-            min_height_px: config.min_height_px.max(56),
-            min_text_width_px: config.min_text_width_px.max(64),
+            min_width_px: config.min_width_px.max(36),
+            min_height_px: config.min_height_px.max(36),
+            min_text_width_px: config.min_text_width_px.max(1),
             padding_x_px: config.padding_x_px.max(8),
             padding_y_px: config.padding_y_px.max(6),
             font_height_px: config.font_height_px.clamp(16, 96),
@@ -159,8 +177,8 @@ impl HudStyle {
                 config.font_family.trim().to_string()
             },
             text_align: config.text_align,
-            text_color: parse_color_ref(&config.text_color, "#111111"),
-            background_color: parse_color_ref(&config.background_color, "#F3F3F3"),
+            text_color: parse_color_ref(&config.text_color, "#FFFFFF"),
+            background_color: parse_color_ref(&config.background_color, "#0B0B0B"),
             background_alpha: config.background_alpha,
             corner_radius_px: config.corner_radius_px.clamp(0, 120),
             display_min: Duration::from_millis(config.display_hold_ms.clamp(100, 10_000)),
@@ -370,25 +388,38 @@ impl RecordingOverlay {
             if self.hud_placeholder_active {
                 self.hud_stream.clear();
                 self.hud_message = message.to_string();
-                self.hud_window.set_text(message);
+                self.hud_window.set_status_text(message, persistent);
             } else if self.hud_stream.display_message() != message || self.hud_message != message {
                 self.hud_stream.set_immediate(message);
                 self.hud_message = message.to_string();
-                self.hud_window.set_text(message);
+                self.hud_window.set_status_text(message, true);
             }
             self.hud_char_streaming = false;
             self.hud_last_char_tick_at = now;
         } else {
             self.hud_placeholder_active = false;
-            if self.hud_stream.display_message() != message || self.hud_message != message {
-                self.hud_stream.set_immediate(message);
+            if self.hud_stream.target_message() != message || self.hud_message != message {
+                let stats = self.hud_stream.retarget(message);
+                if self.hud_stream.display_message().trim().is_empty()
+                    && self.hud_stream.has_pending_chars()
+                {
+                    self.hud_stream.advance_one_char();
+                }
+                let display_message = self.hud_stream.display_message();
                 self.hud_message = message.to_string();
-                self.hud_window.set_text_streaming(message);
+                self.hud_window.set_status_text(&display_message, true);
+                self.hud_char_streaming = self.hud_stream.has_pending_chars();
+                tracing::trace!(
+                    committed_chars = stats.committed_chars,
+                    diff_prefix_chars = stats.diff_prefix_chars,
+                    target_chars = stats.target_chars,
+                    display_chars = stats.display_chars,
+                    target_changed = stats.target_changed,
+                    "hud_microstream_retargeted"
+                );
+            } else {
+                self.hud_char_streaming = self.hud_stream.has_pending_chars();
             }
-            // Streaming partials now snap to the latest text immediately.
-            // This removes the extra UI-side lag that made the HUD look slower
-            // than the recognizer itself.
-            self.hud_char_streaming = false;
             self.hud_last_char_tick_at = now;
         }
 
@@ -397,10 +428,23 @@ impl RecordingOverlay {
     }
 
     pub fn clear_status_hud(&mut self) {
+        self.hud_stream.clear();
+        self.hud_message.clear();
         self.hud_persistent = false;
         self.hud_hold_until = Some(Instant::now());
         self.hud_placeholder_active = false;
         self.hud_char_streaming = false;
+        self.hud_window.set_text("");
+    }
+
+    pub fn reset_status_hud_for_acceptance(&mut self) {
+        self.hud_stream.clear();
+        self.hud_message.clear();
+        self.hud_placeholder_active = false;
+        self.hud_char_streaming = false;
+        self.hud_persistent = false;
+        self.hud_hold_until = Some(Instant::now());
+        self.hud_window.set_text("");
     }
 
     pub fn update_automation_feedback(
@@ -427,7 +471,7 @@ impl RecordingOverlay {
             self.hud_message = message.to_string();
             self.hud_stream.set_immediate(message);
             self.hud_char_streaming = false;
-            self.hud_window.set_text(message);
+            self.hud_window.set_status_text(message, persistent);
         }
 
         self.hud_persistent = persistent;
@@ -453,6 +497,27 @@ impl RecordingOverlay {
         self.tick_voice_bar();
         self.tick_hud();
         self.tick_click_effect();
+    }
+
+    pub fn acceptance_snapshot(&self) -> HudAcceptanceSnapshot {
+        let rect = self.hud_window.rect();
+        HudAcceptanceSnapshot {
+            hwnd: self.hud_window.hwnd.0 as usize,
+            text_hwnd: self.hud_window.text_hwnd.0 as usize,
+            target_text: self.hud_stream.target_message(),
+            display_text: self.hud_stream.display_message(),
+            message: self.hud_message.clone(),
+            char_streaming: self.hud_char_streaming,
+            visible: self.hud_shown,
+            alpha: (self.hud_window.style.background_alpha as f32 * self.hud_visibility).round()
+                as u8,
+            rect: [rect.left, rect.top, rect.right, rect.bottom],
+            background_color: format_color_ref_hex(self.hud_window.style.background_color),
+            text_color: format_color_ref_hex(self.hud_window.style.text_color),
+            font_height_px: self.hud_window.style.font_height_px,
+            padding_x_px: self.hud_window.style.padding_x_px,
+            padding_y_px: self.hud_window.style.padding_y_px,
+        }
     }
 
     fn suppress_voice_bar_immediately(&mut self) {
@@ -587,7 +652,7 @@ impl RecordingOverlay {
 
         self.hud_stream.advance_one_char();
         let next_display = self.hud_stream.display_message();
-        self.hud_window.set_text(&next_display);
+        self.hud_window.set_status_text(&next_display, true);
         self.hud_last_char_tick_at = now;
 
         tracing::trace!(
@@ -987,12 +1052,20 @@ impl HudWindow {
         }
     }
 
-    fn set_text_streaming(&self, text: &str) {
-        self.resize_to_fit_streaming(text);
+    fn set_status_text(&self, text: &str, _stable: bool) {
+        self.resize_to_fit(text);
         let text = HSTRING::from(text);
         unsafe {
             let _ = SetWindowTextW(self.text_hwnd, &text);
         }
+    }
+
+    fn rect(&self) -> RECT {
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        rect
     }
 
     fn resize_to_fit(&self, text: &str) {
@@ -1001,77 +1074,11 @@ impl HudWindow {
             .max(self.style.min_width_px);
         let available_height = (work_area.bottom - work_area.top - HUD_SCREEN_MARGIN_PX * 2)
             .max(self.style.min_height_px);
-        let preferred_width = self
-            .style
-            .width_px
-            .clamp(self.style.min_width_px, available_width);
-        let max_text_width = (preferred_width - self.style.padding_x_px * 2).max(1);
+        let max_text_width = (available_width - self.style.padding_x_px * 2).max(1);
         let (text_width, text_height) =
             measure_hud_text(self.text_hwnd, self.font, text, max_text_width, &self.style);
         let hud_width = (text_width + self.style.padding_x_px * 2)
             .clamp(self.style.min_width_px, available_width);
-        let hud_height = (text_height + self.style.padding_y_px * 2)
-            .clamp(self.style.min_height_px, available_height);
-
-        let base_x = match self.style.anchor {
-            HudAnchor::BottomLeft => work_area.left + HUD_SCREEN_MARGIN_PX,
-            HudAnchor::BottomCenter => {
-                work_area.left + ((work_area.right - work_area.left - hud_width) / 2)
-            }
-        };
-        let base_y = work_area.bottom - hud_height - HUD_SCREEN_MARGIN_PX;
-        let hud_x = clamp_i32(
-            base_x + self.style.offset_x_px,
-            work_area.left + HUD_SCREEN_MARGIN_PX,
-            (work_area.right - hud_width - HUD_SCREEN_MARGIN_PX).max(work_area.left),
-        );
-        let hud_y = clamp_i32(
-            base_y + self.style.offset_y_px,
-            work_area.top + HUD_SCREEN_MARGIN_PX,
-            (work_area.bottom - hud_height - HUD_SCREEN_MARGIN_PX).max(work_area.top),
-        );
-
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOPMOST),
-                hud_x,
-                hud_y,
-                hud_width,
-                hud_height,
-                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0),
-            );
-            let _ = apply_rounded_region(
-                self.hwnd,
-                hud_width,
-                hud_height,
-                self.style.corner_radius_px,
-            );
-            let _ = SetWindowPos(
-                self.text_hwnd,
-                None,
-                self.style.padding_x_px,
-                self.style.padding_y_px,
-                (hud_width - self.style.padding_x_px * 2).max(1),
-                (hud_height - self.style.padding_y_px * 2).max(1),
-                SET_WINDOW_POS_FLAGS(SWP_NOACTIVATE.0 | SWP_NOZORDER.0),
-            );
-        }
-    }
-
-    fn resize_to_fit_streaming(&self, text: &str) {
-        let work_area = work_area_rect();
-        let available_width = (work_area.right - work_area.left - HUD_SCREEN_MARGIN_PX * 2)
-            .max(self.style.min_width_px);
-        let available_height = (work_area.bottom - work_area.top - HUD_SCREEN_MARGIN_PX * 2)
-            .max(self.style.min_height_px);
-        let hud_width = self
-            .style
-            .width_px
-            .clamp(self.style.min_width_px, available_width);
-        let max_text_width = (hud_width - self.style.padding_x_px * 2).max(1);
-        let (_, text_height) =
-            measure_hud_text(self.text_hwnd, self.font, text, max_text_width, &self.style);
         let hud_height = (text_height + self.style.padding_y_px * 2)
             .clamp(self.style.min_height_px, available_height);
 
@@ -1143,7 +1150,7 @@ fn measure_hud_text(
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: max_text_width,
+            right: 0,
             bottom: 0,
         };
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
@@ -1155,7 +1162,7 @@ fn measure_hud_text(
             hdc,
             utf16.as_mut_slice(),
             &mut rect,
-            DT_CALCRECT | align | DT_WORDBREAK | DT_NOPREFIX,
+            DT_CALCRECT | align | DT_SINGLELINE | DT_NOPREFIX,
         );
         let _ = SelectObject(hdc, old_font);
         let _ = ReleaseDC(Some(text_hwnd), hdc);
@@ -1195,7 +1202,6 @@ fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
     value.clamp(min, max)
 }
 
-#[cfg(test)]
 fn longest_common_prefix_chars(left: &str, right: &str) -> usize {
     left.chars()
         .zip(right.chars())
@@ -1229,12 +1235,10 @@ fn resolve_hud_preview_text(
     hud_message.to_string()
 }
 
-#[cfg(test)]
 fn drop_prefix_chars(text: &str, char_count: usize) -> String {
     text.chars().skip(char_count).collect()
 }
 
-#[cfg(test)]
 fn split_committed_prefix(text: &str) -> (String, String) {
     let mut committed_end = 0usize;
     let mut boundary_seen = false;
@@ -1255,12 +1259,10 @@ fn split_committed_prefix(text: &str) -> (String, String) {
     (committed.to_string(), live.to_string())
 }
 
-#[cfg(test)]
 fn is_sentence_commit_char(ch: char) -> bool {
     matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';')
 }
 
-#[cfg(test)]
 fn is_sentence_trailing_char(ch: char) -> bool {
     matches!(
         ch,
@@ -1308,7 +1310,6 @@ impl HudMicrostreamState {
         self.display_suffix != self.target_suffix
     }
 
-    #[cfg(test)]
     fn retarget(&mut self, message: &str) -> HudRetargetStats {
         let previous_target_message = self.target_message();
         let previous_target_suffix = self.target_suffix.clone();
@@ -1379,6 +1380,13 @@ impl HudMicrostreamState {
 fn parse_color_ref(value: &str, fallback: &str) -> COLORREF {
     parse_color_ref_hex(value)
         .unwrap_or_else(|| parse_color_ref_hex(fallback).unwrap_or(COLORREF(0x00111111)))
+}
+
+fn format_color_ref_hex(color: COLORREF) -> String {
+    let r = color.0 & 0xFF;
+    let g = (color.0 >> 8) & 0xFF;
+    let b = (color.0 >> 16) & 0xFF;
+    format!("#{r:02X}{g:02X}{b:02X}")
 }
 
 fn parse_color_ref_hex(value: &str) -> Option<COLORREF> {

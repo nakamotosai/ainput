@@ -1,5 +1,7 @@
 # 流式 HUD AI 改写 PLAN
 
+> 状态：已被 `../streaming-realtime-rewrite-v3/` 取代。本文只保留历史背景；继续开发和验收以 V3 `SPEC.md` / `PLAN.md` / `TASKLIST.md` 为准。
+
 ## 阶段 1：补齐配置与运行时入口
 
 - 确认 `StreamingAiRewriteConfig`、`render_config_file()`、`AppRuntime.ai_rewriter` 已接好。

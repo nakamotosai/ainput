@@ -15,6 +15,25 @@ const COMMON_CN_COMMA_BEFORE_MARKERS: &[(&str, usize)] = &[
     ("然后", 6),
     ("现在", 4),
 ];
+const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
+    ("hud", "HUD"),
+    ("hot", "HUD"),
+    ("ht", "HUD"),
+    ("hut", "HUD"),
+    ("gpt4o", "GPT-4o"),
+    ("gpt 4o", "GPT-4o"),
+    ("codex cli", "Codex CLI"),
+    ("condex cli", "Codex CLI"),
+    ("codex ci", "Codex CI"),
+    ("condex ci", "Codex CI"),
+    ("claude ops", "Claude Opus"),
+    ("cloud ops", "Claude Opus"),
+    ("claude opus", "Claude Opus"),
+    ("cloud opus", "Claude Opus"),
+    ("google gemini", "Google Gemini"),
+    ("google germany", "Google Gemini"),
+];
+const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[("证确", "正确"), ("土字", "吐字")];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestSentenceRewrite {
@@ -35,6 +54,10 @@ pub fn normalize_transcription(text: &str) -> String {
     let mut current = collapse_whitespace(text);
     current = collapse_known_duplicates(&current);
     current = cleanup_punctuation_spacing(&current);
+    current = normalize_chinese_number_sequences(&current);
+    current = merge_spelled_ascii_sequences(&current);
+    current = normalize_common_product_names(&current);
+    current = normalize_common_text_rewrites(&current);
 
     current.trim().to_string()
 }
@@ -124,6 +147,285 @@ fn cleanup_punctuation_spacing(text: &str) -> String {
     }
 
     result
+}
+
+fn merge_spelled_ascii_sequences(text: &str) -> String {
+    let tokens: Vec<&str> = text.split(' ').collect();
+    if tokens.len() <= 1 {
+        return text.to_string();
+    }
+
+    let mut merged: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        let token = tokens[index];
+        if !is_single_spelling_token(token) {
+            merged.push(token.to_string());
+            index += 1;
+            continue;
+        }
+
+        let mut end = index + 1;
+        while end < tokens.len() && is_single_spelling_token(tokens[end]) {
+            end += 1;
+        }
+
+        if end - index >= 2 {
+            let mut combined = String::new();
+            for part in &tokens[index..end] {
+                combined.push_str(&normalize_spelling_token(part));
+            }
+            merged.push(combined);
+            index = end;
+            continue;
+        }
+
+        merged.push(token.to_string());
+        index += 1;
+    }
+
+    merged.join(" ")
+}
+
+fn normalize_chinese_number_sequences(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if !is_chinese_number_char(chars[index]) {
+            result.push(chars[index]);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < chars.len() && is_chinese_number_char(chars[index]) {
+            index += 1;
+        }
+
+        let segment: String = chars[start..index].iter().collect();
+        let previous = start.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(index).copied();
+        if should_normalize_chinese_number_segment(&segment, previous, next) {
+            if let Some(normalized) = normalize_chinese_number_segment(&segment) {
+                result.push_str(&normalized);
+                continue;
+            }
+        }
+
+        result.push_str(&segment);
+    }
+
+    result
+}
+
+fn should_normalize_chinese_number_segment(
+    segment: &str,
+    previous: Option<char>,
+    next: Option<char>,
+) -> bool {
+    if previous == Some('第') {
+        return false;
+    }
+
+    let char_count = segment.chars().count();
+    if segment.chars().any(is_chinese_unit_char) {
+        return char_count >= 2;
+    }
+
+    if char_count >= 2 {
+        return true;
+    }
+
+    previous.is_some_and(is_ascii_term_char) && next.is_some_and(is_ascii_term_char)
+}
+
+fn normalize_chinese_number_segment(segment: &str) -> Option<String> {
+    if segment.is_empty() {
+        return None;
+    }
+
+    if segment.chars().all(is_chinese_digit_char) {
+        let mut mapped = String::with_capacity(segment.len());
+        for ch in segment.chars() {
+            mapped.push(char::from(b'0' + chinese_digit_value(ch)? as u8));
+        }
+        return Some(mapped);
+    }
+
+    if !segment.chars().all(is_chinese_number_char) || !segment.chars().any(is_chinese_unit_char) {
+        return None;
+    }
+
+    parse_chinese_number_with_units(segment).map(|value| value.to_string())
+}
+
+fn parse_chinese_number_with_units(segment: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut section = 0u64;
+    let mut number = 0u64;
+    let mut saw_number = false;
+
+    for ch in segment.chars() {
+        if let Some(digit) = chinese_digit_value(ch) {
+            number = digit as u64;
+            saw_number = true;
+            continue;
+        }
+
+        match ch {
+            '十' => {
+                let value = if saw_number { number } else { 1 };
+                section += value * 10;
+                number = 0;
+                saw_number = false;
+            }
+            '百' => {
+                let value = if saw_number { number } else { 1 };
+                section += value * 100;
+                number = 0;
+                saw_number = false;
+            }
+            '千' => {
+                let value = if saw_number { number } else { 1 };
+                section += value * 1000;
+                number = 0;
+                saw_number = false;
+            }
+            '万' => {
+                section += number;
+                if section == 0 {
+                    section = 1;
+                }
+                total += section * 10_000;
+                section = 0;
+                number = 0;
+                saw_number = false;
+            }
+            '亿' => {
+                section += number;
+                if section == 0 {
+                    section = 1;
+                }
+                total += section * 100_000_000;
+                section = 0;
+                number = 0;
+                saw_number = false;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(total + section + number)
+}
+
+fn chinese_digit_value(ch: char) -> Option<u32> {
+    match ch {
+        '零' | '〇' | '○' | '洞' => Some(0),
+        '一' | '幺' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    }
+}
+
+fn is_chinese_digit_char(ch: char) -> bool {
+    chinese_digit_value(ch).is_some()
+}
+
+fn is_chinese_unit_char(ch: char) -> bool {
+    matches!(ch, '十' | '百' | '千' | '万' | '亿')
+}
+
+fn is_chinese_number_char(ch: char) -> bool {
+    is_chinese_digit_char(ch) || is_chinese_unit_char(ch)
+}
+
+fn normalize_common_product_names(text: &str) -> String {
+    let mut current = text.to_string();
+    for (spoken, canonical) in COMMON_PRODUCT_ALIASES {
+        current = replace_case_insensitive_ascii_phrase(&current, spoken, canonical);
+    }
+    current
+}
+
+fn normalize_common_text_rewrites(text: &str) -> String {
+    let mut current = text.to_string();
+    for (spoken, canonical) in COMMON_TEXT_REWRITES {
+        current = current.replace(spoken, canonical);
+    }
+    current
+}
+
+fn replace_case_insensitive_ascii_phrase(text: &str, needle: &str, replacement: &str) -> String {
+    let lower_text = text.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut byte_index = 0usize;
+
+    while byte_index < text.len() {
+        let remaining = &lower_text[byte_index..];
+        if remaining.starts_with(&lower_needle)
+            && ascii_phrase_boundary_ok(&chars, text, byte_index, needle.len())
+        {
+            result.push_str(replacement);
+            byte_index += needle.len();
+            continue;
+        }
+
+        let next_char = text[byte_index..]
+            .chars()
+            .next()
+            .expect("current byte index should be on char boundary");
+        result.push(next_char);
+        byte_index += next_char.len_utf8();
+    }
+
+    result
+}
+
+fn ascii_phrase_boundary_ok(chars: &[char], text: &str, start: usize, len: usize) -> bool {
+    let start_char_index = text[..start].chars().count();
+    let end_char_index = text[..start + len].chars().count();
+    let before = start_char_index
+        .checked_sub(1)
+        .and_then(|index| chars.get(index))
+        .copied();
+    let after = chars.get(end_char_index).copied();
+
+    before.map(|ch| !is_ascii_term_char(ch)).unwrap_or(true)
+        && after.map(|ch| !is_ascii_term_char(ch)).unwrap_or(true)
+}
+
+fn is_ascii_term_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+')
+}
+
+fn is_single_spelling_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => ch.is_ascii_alphanumeric() || is_chinese_digit_char(ch),
+        _ => false,
+    }
+}
+
+fn normalize_spelling_token(token: &str) -> String {
+    let mut chars = token.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) if is_chinese_digit_char(ch) => chinese_digit_value(ch)
+            .map(|digit| char::from(b'0' + digit as u8).to_string())
+            .unwrap_or_else(|| token.to_string()),
+        _ => token.to_string(),
+    }
 }
 
 fn trim_streaming_fillers(text: &str) -> String {
@@ -453,6 +755,35 @@ mod tests {
     }
 
     #[test]
+    fn normalize_transcription_merges_spelled_ascii_sequences() {
+        assert_eq!(normalize_transcription("h u d 上面"), "HUD 上面");
+        assert_eq!(normalize_transcription("P R review"), "PR review");
+        assert_eq!(normalize_transcription("g p t 4 o 模式"), "GPT-4o 模式");
+        assert_eq!(normalize_transcription("open ai"), "open ai");
+    }
+
+    #[test]
+    fn normalize_transcription_converts_chinese_numbers_to_arabic_digits() {
+        assert_eq!(
+            normalize_transcription("验证码一二三四五六"),
+            "验证码123456"
+        );
+        assert_eq!(normalize_transcription("今年是二零二六年"), "今年是2026年");
+        assert_eq!(normalize_transcription("一百二十三个"), "123个");
+        assert_eq!(normalize_transcription("g p t 四 o 模式"), "GPT-4o 模式");
+    }
+
+    #[test]
+    fn normalize_transcription_fixes_common_product_name_mishears() {
+        assert_eq!(normalize_transcription("condex cli"), "Codex CLI");
+        assert_eq!(normalize_transcription("cloud ops"), "Claude Opus");
+        assert_eq!(normalize_transcription("google germany"), "Google Gemini");
+        assert_eq!(normalize_transcription("codex ci"), "Codex CI");
+        assert_eq!(normalize_transcription("hot 上面"), "HUD 上面");
+        assert_eq!(normalize_transcription("hut 上面"), "HUD 上面");
+    }
+
+    #[test]
     fn streaming_rewrite_splits_and_punctuates() {
         assert_eq!(
             rewrite_streaming_text("嗯 帮我看一下这个pr 然后告诉我有没有风险"),
@@ -491,12 +822,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_transcription_does_not_apply_project_specific_word_rewrites() {
+    fn normalize_transcription_fixes_common_streaming_mishears() {
         assert_eq!(
-            normalize_transcription(
-                "明明这个哈上面已经把正确的文案显示出来了但是他有时候上评还是慢"
-            ),
-            "明明这个哈上面已经把正确的文案显示出来了但是他有时候上评还是慢"
+            normalize_transcription("明明这个hot上面已经把证确的文案显示出来了"),
+            "明明这个HUD上面已经把正确的文案显示出来了"
         );
     }
 
@@ -525,7 +854,7 @@ mod tests {
         let rewritten = rewrite_latest_sentence("我的名字叫老蔡现在这个土字不够丝滑");
         assert_eq!(
             rewritten.combined_text(),
-            "我的名字叫老蔡，现在这个土字不够丝滑。"
+            "我的名字叫老蔡，现在这个吐字不够丝滑。"
         );
     }
 }

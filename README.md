@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.24`
+当前预览版本：`1.0.0-preview.43`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -10,13 +10,14 @@
 
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
-- `流式语音识别` 现在固定走“在线 partial + 最近一句局部修正 + HUD 即最终结果”的单链路，不再把整段离线 rescore 伪装成流式最终提交。
-- `1.0.0-preview.24` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
+- `流式语音识别` 源码主线已切到 V3：在线 partial 进入 `committed / stable / volatile / rewrite candidate` 四层状态，HUD 和最终提交共享同一 revision。
+- `1.0.0-preview.43` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
-- 流式模式的 HUD 继续保持“只显示文字本身”的单行面板，并保留原有位置、热加载参数和占位符保护。
-- 默认热路径已经收回“本地流式识别 + 本地轻整理 + HUD/最终提交同一状态机”，不再要求外网 AI 改写才能用核心模式。
+- 流式模式默认不再用应用层短停顿 endpointing 硬切段；真实前台里短停顿会把半句话冻结，导致 HUD 和上屏文本分叉。
+- 流式模式的 HUD 继续保持“只显示文字本身”的单行面板，但内部恢复 target/display 双缓冲逐字追目标，并保留原有位置、热加载参数和占位符保护。
+- 默认热路径已经收回“本地流式识别 + 本地轻整理 + HUD/最终提交同一状态机”，AI 尾巴改写只作为 revision-guarded candidate，不允许覆盖更新文本。
 - AI rewrite 保留为实验性尾巴改写能力，默认关闭，也不再在 `fast` 模式启动时预热。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.24\` 与 `dist\ainput-1.0.0-preview.24.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.43\` 与 `dist\ainput-1.0.0-preview.43.zip`。
 
 它不做系统级 IME。当前默认热路径全部走本地；AI rewrite 只是可选实验链路。当前重点是把四条前台主链路做稳：
 
@@ -57,14 +58,16 @@
   - `流式语音识别` 使用本地 `sherpa-onnx-streaming-paraformer-bilingual-zh-en` 作为在线流式识别主模型
   - 流式模式按住热键时显示 HUD 面板
   - 流式模式按住时持续显示流式文字，默认只走本地识别 + 本地轻整理
-  - 流式模式会持续喂入在线音频块，并以“冻结前缀 + 最新一句”共享状态驱动 HUD 和最终提交
+  - 流式模式会持续喂入在线音频块，并以 `committed_prefix / stable_tail / volatile_tail / rewrite_candidate` 共享状态驱动 HUD 和最终提交
+  - 应用层短停顿 endpointing 仍保留为配置项，但默认关闭；流式默认在一次按住说话内保持同一条滚动状态
   - 默认流式块时长已压到 `60ms`，用于缩短 HUD 首字和增量刷新延迟
   - 流式模式的标点主链来自官方 `ct-transformer` 标点模型；模型缺失时只降级为无标点，不再让整个流式功能启动失败
-  - 可选实验 AI rewrite 只允许改“最新尾巴”；服务不可用时只降级回当前轻整理链路
+  - 可选实验 AI rewrite 只允许改“最新尾巴”；请求和响应都带 revision，过期响应会被丢弃，服务不可用时只降级回当前轻整理链路
   - HUD 默认停靠在屏幕正下方、任务栏上方
   - 可从托盘右键菜单直接打开 `HUD 参数文档`
   - `config\hud-overlay.toml` 保存后会自动热加载
-  - 松开热键后会继续收完最后尾音，再直接提交最终 HUD 文字；最终阶段只做冻结，不再二次重写
+  - 松开热键后会继续收完最后尾音，再做最终解码和最终 HUD flush，随后才提交上屏；HUD 不会在松手瞬间立刻消失
+  - 流式模式会异步保存每次按住说话的原始录音到 `logs\streaming-raw-captures\`，自动只保留最近 `20` 组 wav + json
   - 语音热键可配置
   - 自动直贴失败时，可按配置降级到剪贴板
   - 普通输入框与终端输入区使用不同句号策略
@@ -206,8 +209,20 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 
 - 这条脚本会直接调用 `target\release\ainput-desktop.exe`
 - 默认会生成一条拼接长句样本，并跑固定 wav 阈值检查
-- 每条样本都会检查“可见字符数是否明显大于老 bug 的 2 到 3 个字”
+- 这条旧回归主要检查“可见字符数是否明显大于老 bug 的 2 到 3 个字”
 - 结果会同时写入 `tmp\streaming-regression-latest.txt`
+
+V3 实时改写自测：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-selftest.ps1
+```
+
+说明：
+
+- 这条脚本会重新生成 `fixtures\streaming-selftest\manifest.json`
+- 每条样本同时检查首字延迟、最终延迟、rollback 次数、最大 rollback 字数和 keywords 命中
+- `expected` 不完全一致时，必须满足 keywords gate；不再允许“乱码但字符数够”的假通过
 
 ## 日常使用
 
@@ -226,9 +241,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 
 - 在托盘一级菜单切到 `流式语音识别`
 - 按住 `Ctrl`
-- 说话时屏幕正下方 HUD 只显示当前识别文字
+- 说话时屏幕正下方 HUD 只显示当前识别文字，最新尾巴允许被实时修正
 - 如果你正在编辑 `config\hud-overlay.toml`，保存后 HUD 会立刻刷新
-- 松开后程序会快速收尾，并把 HUD 当前文本直接提交到输入框
+- 松开后程序会快速收尾，并把 HUD 当前 revision 对应的最终文本提交到输入框
 - 如果直贴失败，会按配置退回到剪贴板
 - 如果想调字号、颜色、宽度或位置，直接在托盘右键点 `打开 HUD 参数文档`
 
@@ -341,6 +356,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 - `logs\ainput.log`
 - `logs\last_result.txt`
 - `logs\voice-history.log`
+- `logs\streaming-raw-captures\streaming-raw-*.wav`
+- `logs\streaming-raw-captures\streaming-raw-*.json`
 
 日志里会记录：
 
@@ -351,6 +368,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 - 输出耗时
 - 总流水线耗时
 - 上下文与输出策略
+- 流式原始录音留样路径和自动裁剪结果
 
 ### 常用调试命令
 
@@ -427,16 +445,221 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.24\`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.43\`
 - 默认启动模式是 `极速语音识别`
-- 当前流式主链是：`Paraformer bilingual zh-en + 官方标点 + HUD 实时显示 + 尾巴局部修正 + HUD 所见即最终提交`
+- 当前源码流式主链是：`Paraformer bilingual zh-en + HUD raw-normalized 实时显示 + committed/stable/volatile 状态机 + HUD 双缓冲 + revision-guarded 尾巴改写 candidate + 松手 final HUD ack + exact delivery 提交`
 - 默认热路径不依赖外网；实验 AI rewrite 默认 `enabled = false`
 - 默认实验 AI rewrite 占位端点是 `http://127.0.0.1:8080/v1/chat/completions`
 - 默认实验 AI rewrite 模型是 `Qwen3-0.6B`
-- `preview.24` 是当前已完成真机打包和固定 wav 回归的新便携版
+- `preview.43` 已用 HUD 最终真相源当前源码重新打包到 `dist\ainput-1.0.0-preview.43\` 与 `dist\ainput-1.0.0-preview.43.zip`
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
-## 本轮收口验证（2026-04-21）
+## 本轮收口验证
+
+2026-05-01 HUD 最终真相源收口：
+
+- 流式松开 `Ctrl` 后，worker 不再直接用内部 `commit_text` 上屏；最终文本必须先发给 UI，HUD 完整显示并返回 ack 后，才允许提交。
+- UI 收到 final 文本后立即完整刷新 HUD，不走逐字动画；worker 只用 HUD ack text 上屏。
+- 流式 HUD ack 后进入 exact delivery，`ainput-output` 不再二次补标点、删标点或做术语修正，避免 HUD 与实际上屏分叉。
+- Windows 真机 `cargo fmt --check` 已通过。
+- Windows 真机 `cargo check -p ainput-desktop` 已通过。
+- Windows 真机 `cargo test -p ainput-desktop final_commit -- --nocapture` 已通过，4/4 pass。
+- Windows 真机 `cargo test -p ainput-desktop streaming -- --nocapture` 已通过，31/31 pass。
+- Windows 真机 `cargo test -p ainput-desktop -- --nocapture` 已通过，86/86 pass。
+- Windows 真机 `cargo test -p ainput-output -- --nocapture` 已通过，9/9 pass。
+- Windows 真机 `cargo test -p ainput-shell -- --nocapture` 已通过，6/6 pass。
+- Windows 真机 `cargo test -p ainput-rewrite -- --nocapture` 已通过，16/16 pass。
+- Windows 真机 `.\scripts\run-startup-idle-acceptance.ps1 -Version 1.0.0-preview.43 -IdleSeconds 30 -Runs 1 -InteractiveTask` 已通过。
+- Windows 真机 `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.43 -Synthetic -InteractiveTask` 已通过，3/3 pass。
+- Windows 真机 `.\scripts\run-streaming-live-e2e.ps1 -Version 1.0.0-preview.43 -Wav -InteractiveTask -CaseLimit 3` 已通过，3/3 pass。
+- Windows 真机 `.\scripts\run-streaming-raw-corpus.ps1 -ExePath .\dist\ainput-1.0.0-preview.43\ainput-desktop.exe -RawDir .\dist\ainput-1.0.0-preview.37\logs\streaming-raw-captures -ShortCount 1 -LongCount 1` 已通过，2/2 pass。
+- wav E2E `sentence_03` 已确认 `hud_final_ack == output_commit_request == target_readback`：`然后，不管我说多少个字，它永远只能显示出来两个字。`
+- 已打包 `dist\ainput-1.0.0-preview.43\` 与 `dist\ainput-1.0.0-preview.43.zip`。
+- 已启动到 Windows 交互桌面：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.43\ainput-desktop.exe`。
+
+2026-04-29 V3 源码收口：
+
+- Windows 真机 `cargo fmt --check -- apps/ainput-desktop/src/streaming_state.rs apps/ainput-desktop/src/worker.rs apps/ainput-desktop/src/overlay.rs apps/ainput-desktop/src/main.rs apps/ainput-desktop/src/ai_rewrite.rs apps/ainput-desktop/src/streaming_fixtures.rs crates/ainput-shell/src/lib.rs crates/ainput-output/src/lib.rs` 已通过
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过
+- Windows 真机 `cargo test -p ainput-output` 已通过
+- Windows 真机 `cargo test -p ainput-rewrite` 已通过
+- Windows 真机 `cargo test -p ainput-shell` 已通过
+- Windows 真机 `cargo test -p ainput-desktop ai_rewrite` 已通过
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass，keywords gate 100%
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-release.ps1` 已通过，产出 `dist\ainput-1.0.0-preview.24\` 与 `dist\ainput-1.0.0-preview.24.zip`
+- Windows 真机 `dist\ainput-1.0.0-preview.24\ainput-desktop.exe bootstrap` 已通过
+- Windows 真机包内 release exe 跑 `replay-streaming-manifest fixtures\streaming-selftest\manifest.json` 已通过，进程退出码 `0`
+- 未覆盖：`scripts\live-streaming-acceptance.ps1` 是人工按住热键说话验收，不能在 SSH 无人值守环境中伪造通过
+
+2026-04-30 V3 前台失败修复：
+
+- 根据真实前台日志修复 HUD 与最终上屏分叉：录音中的 HUD 不再经过离线标点模型，避免最新尾巴被标点模型裁短
+- 默认关闭 `[voice.streaming.endpoint].enabled`，避免 `480ms` 级短停顿把半句话冻结成已提交前缀
+- 松手尾音收集从 `120ms` 加到 `260ms`，最终解码静音 padding 从 `240ms` 加到 `360ms`，降低最后一个字被截掉的概率
+- 增加常见流式误识别归一化：`hot/hud -> HUD`、`证确 -> 正确`、`土字 -> 吐字`
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过
+- Windows 真机 `cargo test -p ainput-desktop worker::tests` 已通过
+- Windows 真机 `cargo test -p ainput-rewrite` 已通过
+- Windows 真机 `cargo test -p ainput-shell` 已通过
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass，keywords gate 100%
+
+2026-04-30 streaming live E2E 自测闭环：
+
+- 新增 `scripts\run-streaming-live-e2e.ps1`，支持 `-InteractiveTask` 把测试进程投到当前 Windows console session，避免 SSH 非交互会话里键盘事件无法进入桌面的假失败
+- 新增 `run-streaming-live-e2e-synthetic` 命令、`fixtures\streaming-hud-e2e\manifest.json` 和专用 Win32 测试输入框
+- live E2E 报告会写入 `tmp\streaming-live-e2e\<timestamp>\report.json` 与 `timeline.jsonl`
+- 每个 case 会校验 `HUD final display == output commit text == target readback`
+- 每个 case 还会校验 HUD 稳定性：流式期间位置/尺寸变化超过 `3px` 直接失败，alpha 下降或不可见采样直接失败
+- 流式提交在原生 `EDIT/RichEdit` 输入框优先走 Windows `EM_REPLACESEL`，非流式模式保持原来的剪贴板恢复路径
+- acceptance 目标框在清空后会再次聚焦，并记录 `focused_hwnd` / `edit_is_focused`，避免焦点丢失造成假通过或假失败
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop acceptance` 已通过
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过
+- Windows 真机 `cargo test -p ainput-output` 已通过
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-release.ps1` 已通过，产出 `dist\ainput-1.0.0-preview.24\` 与 `dist\ainput-1.0.0-preview.24.zip`
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，报告：`tmp\streaming-live-e2e\20260430-101731-345`
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，报告：`tmp\streaming-live-e2e\20260430-101743-605`
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-102339-342`
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-102352-551`
+
+2026-04-30 HUD 单行黑色胶囊动态面板：
+
+- 流式 HUD 默认改为黑色半透明胶囊背景、白色文字、居中显示，替代原来的白色大面板
+- HUD 按当前显示文字的实际宽度动态调整：短文本是一小块底板，文字增加时从任务栏上方中心向两边延长
+- 流式和 final 都走同一套单行尺寸计算，不再使用固定宽度、多行高度的 streaming 大面板
+- 文本测量改为单行 `DT_SINGLELINE`，不自动换行；超长文本只受屏幕安全宽度限制
+- `config\hud-overlay.toml` 默认值改为：`width_px = 1600`，`min_width_px = 52`，`min_height_px = 50`，`padding_x_px = 14`，`padding_y_px = 8`，`text_align = "center"`，`background_color = "#0B0B0B"`，`background_alpha = 190`
+- live E2E 稳定性门禁改为检查中心点稳定：允许宽度随字数增长，但 `max_center_x_delta_px`、top、height 不能异常漂移
+- live E2E 新增视觉门禁：`hud_white_panel` 防白色面板，`hud_multiline_panel` 防回到多行大面板，`hud_short_text_wide_panel` 防短文本仍显示大面板
+- 打包脚本不再从旧 dist 保留 HUD 的白色尺寸/颜色/对齐配置；新包强制使用黑色单行胶囊默认样式，同时继续保留字体和显示保留时间
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop acceptance` 已通过，1/1 pass
+- Windows 真机 `cargo test -p ainput-shell` 已通过，6/6 pass
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过，24/24 pass
+- Windows 真机 `cargo test -p ainput-output` 已通过，9/9 pass
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，报告：`tmp\streaming-live-e2e\20260430-140234-142`，`hud_center` 最大 `0/0`，`hud_panel` 全 `0/0/0`
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，报告：`tmp\streaming-live-e2e\20260430-140252-617`，`hud_center` 最大 `1/0`，`hud_panel` 全 `0/0/0`
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-140634-134`，`hud_center` 最大 `0/0`，`hud_panel` 全 `0/0/0`
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-140652-187`，`hud_center` 最大 `1/0`，`hud_panel` 全 `0/0/0`
+- `dist\ainput-1.0.0-preview.24.zip` 已重建，大小 `456341974` bytes，时间 `2026-04-30 14:06:21`
+
+2026-04-30 Exactly-once 上屏与自触发保护：
+
+- 修复流式按住说话热键为 `Ctrl` 时，最终上屏阶段程序自身 `Ctrl+V` 有概率被全局热键钩子误判成下一轮语音的问题
+- 流式最终提交和非流式输出共享保护：程序输出期间临时屏蔽语音热键识别，避免一次 release 后出现两次上屏
+- DirectPaste / NativeEdit 上屏前清理中文 IME composition，避免残留拼音如 `wan`、`ngl`、`us`、`gxi` 被提交到目标框
+- 流式 DirectPaste 前稳定等待提升到 `120ms`；Win32/RichEdit 目标优先走 `NativeEdit`，非原生目标再回退 DirectPaste
+- live E2E 新增提交后 `1500ms` 观察窗口，目标框如果出现 `final+final` 或 `final+错误片段` 会失败为 `target_duplicate_commit` / `target_extra_commit_fragment`
+- live E2E 新增 `output_commit_count_mismatch`，任意 case 的 `commit_request_count != 1` 直接失败，防止一次 release 产生两次上屏请求
+- live E2E 执行前会停掉旧 `ainput-desktop.exe` 托盘进程并复查残留；源码态 E2E 会先 build 最新 debug exe，避免旧二进制污染测试
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop hotkey` 已通过，4/4 pass
+- Windows 真机 `cargo test -p ainput-desktop acceptance` 已通过，5/5 pass
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过，30/30 pass
+- Windows 真机 `cargo test -p ainput-output` / `cargo test -p ainput-shell` / `cargo test -p ainput-rewrite` 均已通过
+- Windows 真机 `scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass
+- 源码态 synthetic live E2E 已通过，报告：`tmp\streaming-live-e2e\20260430-175340-791`，3/3 pass，`bad_commit_count=0`，`bad_readback=0`
+- 源码态 wav live E2E 连续通过，报告：`tmp\streaming-live-e2e\20260430-175123-400`、`tmp\streaming-live-e2e\20260430-175228-953`，均 6/6 pass，`bad_commit_count=0`，`bad_readback=0`
+- 包内 synthetic live E2E 已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-175630-487`，3/3 pass，`bad_commit_count=0`，`bad_readback=0`
+- 包内 wav live E2E 连续通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-175703-183`、`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-175813-905`，均 6/6 pass，`bad_commit_count=0`，`bad_readback=0`
+- `dist\ainput-1.0.0-preview.24.zip` 已重建，大小 `456367554` bytes，时间 `2026-04-30 17:55:57`
+- raw corpus 本轮未覆盖：当前 `logs\streaming-raw-captures` 没有足够大的 raw wav；本轮问题属于输出 exactly-once，不依赖 raw ASR 回放
+
+2026-04-30 启动空闲误触发修复：
+
+- 问题根因：流式模式曾把配置里的 `hotkeys.voice_input` 覆盖成单独 `Ctrl`，用户没有按 `Alt+Z` 也可能因普通 Ctrl 操作触发语音识别
+- 修复方向：流式和非流式都使用同一个配置热键；默认仍是 `Alt+Z`
+- 热键 hook 启动时会 reset 状态并加启动冷却，避免启动瞬间残留按键状态触发录音
+- 语音热键触发日志会标注来源：keyboard primary、modifier-only 或 mouse middle
+- 新增 `scripts\run-startup-idle-acceptance.ps1`，用于验证启动后不按热键时不会录音、不会上屏、不会产生 raw capture
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop hotkey` 已通过，4/4 pass
+- Windows 真机 `cargo test -p ainput-desktop acceptance` 已通过，5/5 pass
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过，30/30 pass
+- Windows 真机 `cargo test -p ainput-output` / `cargo test -p ainput-shell` / `cargo test -p ainput-rewrite` 已通过
+- Windows 真机 `scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass
+- 源码态 startup idle 已通过，报告：`tmp\startup-idle-acceptance\20260430-195103-794`，2/2 pass，`expected_voice_hotkey=Alt+Z`
+- 包内 startup idle 已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\startup-idle-acceptance\20260430-195614-253`，3/3 pass，`expected_voice_hotkey=Alt+Z`
+- 包内 synthetic live E2E 已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-195810-447`，3/3 pass
+- 包内 wav live E2E 已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-195830-871`，6/6 pass
+- `dist\ainput-1.0.0-preview.24.zip` 已重建；包内 `scripts\run-startup-idle-acceptance.ps1` 可直接运行
+
+2026-04-30 语义标点与尾字保护：
+
+- 本轮不接入 AI rewrite；`voice.streaming.ai_rewrite.enabled = false` 继续保持关闭
+- 停顿 endpoint 不再把 pause 当句末：停顿只 flush 尾音和 reset streaming recognizer，不再调用标点模型强制补 `。！？；`
+- endpoint rollover 不再整段 `freeze_with_committed_text`；只冻结已经存在明确句末标点的前缀，没结束的 live tail 继续可改
+- preview/final 标点统一去重，新增 raw/live 门禁拦截 `，，`、`,,`、`。。`、`？？`、`？！`、`，。` 等重复或冲突标点
+- final 提交新增非流式 SenseVoice 兜底校对：当 streaming final 少尾字而非流式结果是同前缀更长文本时，用非流式结果补尾巴
+- 实时轻量语义逗号新增 `另外/然后/还是/尤其是/或者/比如` 等连接词处理，只插逗号，不靠停顿插句号
+- `scripts\run-streaming-raw-corpus.ps1` 新增 `raw_final_tail_dropped`、`raw_duplicate_punctuation`、`raw_punctuation_forced_by_pause` 门禁，并跳过太短无法产生 partial 的 raw
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过，30/30 pass
+- Windows 真机 `cargo test -p ainput-desktop acceptance` 已通过，1/1 pass
+- Windows 真机 `cargo test -p ainput-output` 已通过，9/9 pass
+- Windows 真机 `cargo test -p ainput-shell` 已通过，6/6 pass
+- Windows 真机 `cargo test -p ainput-rewrite` 已通过，16/16 pass
+- Windows 真机 `scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass
+- 源码态 raw corpus 抽样已通过，报告：`tmp\streaming-raw-corpus\20260430-145208-844`，4 条 pass，`final_missing_chars=0`，无重复标点/无 pause 强插句号
+- 源码态 synthetic live E2E 已通过，报告：`tmp\streaming-live-e2e\20260430-145346-906`，3/3 pass，HUD flash/panel 全 0
+- 源码态 wav live E2E 已通过，报告：`tmp\streaming-live-e2e\20260430-145402-148`，6/6 pass，HUD flash/panel 全 0
+- 包内 raw corpus 抽样已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-raw-corpus\20260430-150531-347`，当前包内有效 raw 样本 1 条 pass
+- 包内 synthetic live E2E 已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-150531-487`，3/3 pass
+- 包内 wav live E2E 已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-150548-099`，6/6 pass
+- `dist\ainput-1.0.0-preview.24.zip` 已重建，大小 `456359936` bytes，时间 `2026-04-30 15:05:14`
+
+2026-04-30 按住停顿补尾字与实时标点：
+
+- 本轮不接入 AI rewrite；`voice.streaming.ai_rewrite.enabled = false` 保持关闭，基础流式验收不混入语义改写
+- `[voice.streaming.endpoint]` 默认启用，`pause_ms = 720`，`min_segment_ms = 900`，`tail_padding_ms = 480`
+- 按住不松但检测到停顿时，应用层 endpoint 会 soft finalize 当前片段：补短静音、调用 streaming `input_finished()`、刷新 HUD/稳定前缀，然后 reset recognizer 继续听；不会提前上屏
+- 实时 preview 和停顿边界都会复用常驻标点模型；标点结果如果导致内容字减少会被拒绝，避免标点模型裁掉尾字
+- 新增 `scripts\run-streaming-raw-corpus.ps1`，默认从最近 raw captures 中抽短句和长句各 2 条，不需要每轮跑满 20 条
+- raw corpus 门禁会检查至少覆盖短句+长句、最后一个 HUD partial 与 final 的内容字差距不超过 1、长语音 final 带标点时 partial 阶段也必须已经有标点
+- 打包脚本会把 `scripts\run-streaming-raw-corpus.ps1` 一并放入 dist，包内也能直接跑 raw 抽样验收
+- 打包脚本会在重建 dist 前暂存 `logs\streaming-raw-captures\`，zip 完成后再恢复到 dist 目录，避免后续重打包清掉本地近 20 条 raw 留样；本轮旧 dist 中的 20 条样本已被重打包清空，当前只能后续重新积累
+- Windows 真机 `cargo check -p ainput-desktop` 已通过
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过，24/24 pass
+- Windows 真机 `cargo test -p ainput-output` 已通过，9/9 pass
+- Windows 真机 `cargo test -p ainput-desktop acceptance` 已通过，1/1 pass
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass
+- 源码态 raw corpus 抽样已通过，报告：`tmp\streaming-raw-corpus\20260430-121618-781`，4 条 pass，短句+长句覆盖，`final_extra_chars=0`，partial/final 均有标点
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，HUD move/size/flash 全为 0，报告：`tmp\streaming-live-e2e\20260430-121740-655`
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，HUD move/size/flash 全为 0，报告：`tmp\streaming-live-e2e\20260430-121756-340`
+- 包内 raw corpus fixture 抽样已通过，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-raw-corpus\20260430-123441-839`，4 条 pass，短句+长句覆盖，`final_extra_chars=0`，partial/final 均有标点
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，HUD move/size/flash 全为 0，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-123514-026`
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，HUD move/size/flash 全为 0，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-123527-953`
+- `dist\ainput-1.0.0-preview.24.zip` 已重建，大小 `456340280` bytes，时间 `2026-04-30 12:34:14`
+
+2026-04-30 流式松手提交、HUD 残影与原始录音留样修复：
+
+- 修复流式 Ctrl+V fallback 在粘贴前恢复旧剪贴板的问题；流式 fallback 现在写入识别文本后不提前恢复旧剪贴板，避免松手贴出其他剪贴板内容
+- 流式提交前会等待语音热键修饰键释放，减少 Ctrl 仍按住时发 Ctrl+V 的顺序问题
+- 松手收尾改为语音活动驱动 drain：最小等待 `160ms`，检测尾音静稳，最长 `900ms`，再做 final decode 和最终 HUD flush
+- 最终解码静音 padding 增加到 `720ms`，避免最后一个字因为松手瞬间中断被吃掉
+- `StreamingStarted` 会清空 HUD target/display/message/window text；live E2E 增加 `hud_after_case_reset`，新一句开头残留上一句会失败为 `hud_stale_text`
+- HUD final flush 和提交后的完成态都保持流式稳定尺寸；live E2E 增加 `hud_after_commit_hold`，提交后 HUD 不可见或不等于 final text 会失败
+- live E2E 每次 commit 前写入旧剪贴板哨兵，目标框读到哨兵会失败为 `clipboard_stale_paste`
+- `probe-streaming-live` 和真实流式热键路径都会写入 `logs\streaming-raw-captures\`，每次保存 wav + json，自动只保留最近 `20` 组
+- Windows 真机 `cargo test -p ainput-output` 已通过
+- Windows 真机 `cargo test -p ainput-desktop acceptance` 已通过
+- Windows 真机 `cargo test -p ainput-desktop streaming` 已通过
+- Windows 真机 `cargo test -p ainput-desktop worker::tests::raw_capture_writer_keeps_only_recent_twenty_wavs` 已通过
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-selftest.ps1` 已通过，6/6 cases pass
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，报告：`tmp\streaming-live-e2e\20260430-110516-575`
+- 源码态 `.\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，报告：`tmp\streaming-live-e2e\20260430-110528-184`
+- 源码态 `.\target\debug\ainput-desktop.exe probe-streaming-live 1` 已写入：`logs\streaming-raw-captures\streaming-raw-1777514764552.wav` + `.json`
+- Windows 真机 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-release.ps1` 已通过，产出 `dist\ainput-1.0.0-preview.24\` 与 `dist\ainput-1.0.0-preview.24.zip`
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask` 已通过，3/3 cases pass，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-111750-538`
+- 包内 `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask` 已通过，6/6 cases pass，报告：`dist\ainput-1.0.0-preview.24\tmp\streaming-live-e2e\20260430-111805-306`
+- 包内 `dist\ainput-1.0.0-preview.24\ainput-desktop.exe probe-streaming-live 1` 已写入：`dist\ainput-1.0.0-preview.24\logs\streaming-raw-captures\streaming-raw-1777515538735.wav` + `.json`
+- `dist\ainput-1.0.0-preview.24.zip` 已重建，大小 `456334310` bytes，时间 `2026-04-30 11:17:34`
+
+2026-04-21 preview.24 打包收口：
 
 - Windows 真机 `cargo fmt --all` 已通过
 - Windows 真机 `cargo check -p ainput-desktop` 已通过
@@ -452,9 +675,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\streaming-regression.ps1
 
 - 当前默认还是 `CPU` 推理，不走 GPU
 - 默认热路径已经不依赖外网；若手动开启实验 AI rewrite，服务不可用时会降级回无 AI 改写
-- 当前 AI 改写只处理“冻结前缀之后的最新尾巴”，不是对整段全文做大模型重写
-- `HUD 即最终结果` 已经做成同一状态机，但最后几个字、停顿边界和少数应用里的粘贴时机仍然需要继续靠真实前台使用打磨
-- `scripts\live-streaming-acceptance.ps1` 仍然是人工热键验收，不是无人值守自动化
+- 当前 AI 改写只处理 committed prefix 之后的最新尾巴，不是对整段全文做大模型重写
+- `HUD 即最终结果` 已经做成同一 revision 状态机；短停顿 endpoint 默认关闭
+- `scripts\run-streaming-live-e2e.ps1 -InteractiveTask` 是当前无人值守前台 synthetic 验收入口
+- `scripts\live-streaming-acceptance.ps1` 仍然只用于人工真实麦克风热键验收
 - 语音热键与截图热键已经可配置，但当前仍以编辑 `ainput.toml` 为主
 - 截图热键走 Windows 原生 `RegisterHotKey`
 - 语音为了保留“按住说话/松开停止”的行为，仍需要低层按键监听配合
@@ -528,7 +752,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 发包前门禁：
 
 - `.\scripts\streaming-regression.ps1 -Version 1.0.0-preview.24`
-- `.\scripts\live-streaming-acceptance.ps1 -Version 1.0.0-preview.24`
+- `.\scripts\run-streaming-selftest.ps1`
+- `.\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask`
+- `.\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask`
+- `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Synthetic -InteractiveTask`
+- `dist\ainput-1.0.0-preview.24\scripts\run-streaming-live-e2e.ps1 -Wav -InteractiveTask`
 - `python .\scripts\readme_closeout_guard.py .`
 
 ## 项目结构

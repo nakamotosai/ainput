@@ -1,5 +1,7 @@
 # HUD 微流式吐字平滑 SPEC
 
+> 状态：已被 `../streaming-realtime-rewrite-v3/` 取代。本文只保留历史背景；继续开发和验收以 V3 `SPEC.md` / `PLAN.md` / `TASKLIST.md` 为准。
+
 ## 目标
 
 - 解决当前流式模式里“HUD 上字是一块一块冒出来，不够丝滑”的体感问题。

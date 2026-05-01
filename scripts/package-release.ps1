@@ -8,9 +8,15 @@ $repoRoot = if ((Split-Path -Leaf $PSScriptRoot) -eq "scripts") {
 } else {
     $PSScriptRoot
 }
+$distRoot = Join-Path $repoRoot "dist"
+$cargoTomlPath = Join-Path $repoRoot "Cargo.toml"
 
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $cargoTomlPath = Join-Path $repoRoot "Cargo.toml"
+function Get-WorkspacePackageVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CargoTomlPath
+    )
+
     $insideWorkspacePackage = $false
     foreach ($line in Get-Content $cargoTomlPath -Encoding UTF8) {
         if ($line -match '^\s*\[workspace\.package\]\s*$') {
@@ -21,19 +27,95 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
             break
         }
         if ($insideWorkspacePackage -and $line -match '^\s*version\s*=\s*"([^"]+)"') {
-            $Version = $Matches[1]
+            return $Matches[1]
+        }
+    }
+
+    throw "failed to derive workspace package version from $CargoTomlPath"
+}
+
+function Set-WorkspacePackageVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CargoTomlPath,
+        [Parameter(Mandatory = $true)]
+        [string]$NewVersion
+    )
+
+    $lines = [System.IO.File]::ReadAllLines($CargoTomlPath, [System.Text.Encoding]::UTF8)
+    $insideWorkspacePackage = $false
+    $updated = $false
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i]
+        if ($line -match '^\s*\[workspace\.package\]\s*$') {
+            $insideWorkspacePackage = $true
+            continue
+        }
+        if ($insideWorkspacePackage -and $line -match '^\s*\[') {
+            break
+        }
+        if ($insideWorkspacePackage -and $line -match '^\s*version\s*=') {
+            $lines[$i] = ('version = "' + $NewVersion + '"')
+            $updated = $true
             break
         }
     }
-    if ([string]::IsNullOrWhiteSpace($Version)) {
-        throw "failed to derive workspace package version from $cargoTomlPath"
+
+    if (-not $updated) {
+        throw "failed to update workspace package version in $CargoTomlPath"
     }
+
+    [System.IO.File]::WriteAllLines($CargoTomlPath, $lines, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+function Get-NextPackageVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentVersion,
+        [Parameter(Mandatory = $true)]
+        [string]$DistRoot
+    )
+
+    if ($CurrentVersion -notmatch '^(?<prefix>.+-preview\.)(?<number>\d+)$') {
+        $stamp = Get-Date -Format "yyyyMMddHHmmss"
+        return ($CurrentVersion + "." + $stamp)
+    }
+
+    $prefix = $Matches["prefix"]
+    $maxNumber = [int]$Matches["number"]
+    $escapedPrefix = [regex]::Escape("ainput-" + $prefix)
+    if (Test-Path $DistRoot) {
+        $names = @()
+        $names += Get-ChildItem $DistRoot -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+        $names += Get-ChildItem $DistRoot -File -Filter "ainput-*.zip" -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName }
+        foreach ($name in $names) {
+            if ($name -match ('^' + $escapedPrefix + '(?<number>\d+)$')) {
+                $number = [int]$Matches["number"]
+                if ($number -gt $maxNumber) {
+                    $maxNumber = $number
+                }
+            }
+        }
+    }
+
+    return ($prefix + ($maxNumber + 1))
+}
+
+$workspaceVersion = Get-WorkspacePackageVersion -CargoTomlPath $cargoTomlPath
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = Get-NextPackageVersion -CurrentVersion $workspaceVersion -DistRoot $distRoot
+}
+if ($Version -ne $workspaceVersion) {
+    Set-WorkspacePackageVersion -CargoTomlPath $cargoTomlPath -NewVersion $Version
+    Write-Host "Updated workspace package version: $workspaceVersion -> $Version"
 }
 
 $packageName = "ainput-$Version"
-$distRoot = Join-Path $repoRoot "dist"
 $packageDir = Join-Path $distRoot $packageName
 $zipPath = Join-Path $distRoot "$packageName.zip"
+if ((Test-Path $packageDir) -or (Test-Path $zipPath)) {
+    throw "package version already exists, refusing to overwrite: $packageName"
+}
 $modelSource = Join-Path $repoRoot "models\sense-voice\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 $modelTarget = Join-Path $packageDir "models\sense-voice"
 $streamingModelName = "sherpa-onnx-streaming-paraformer-bilingual-zh-en"
@@ -88,24 +170,10 @@ function Copy-HudOverlayTemplateWithValues {
     if (Test-Path $SourcePath) {
         $sourceLines = Get-Content $SourcePath
         $keys = @(
-            "anchor",
-            "offset_x_px",
-            "offset_y_px",
-            "width_px",
-            "min_width_px",
-            "min_height_px",
-            "min_text_width_px",
-            "padding_x_px",
-            "padding_y_px",
-            "corner_radius_px",
             "display_hold_ms",
             "font_height_px",
             "font_weight",
-            "font_family",
-            "text_align",
-            "text_color",
-            "background_color",
-            "background_alpha"
+            "font_family"
         )
 
         foreach ($key in $keys) {
@@ -229,6 +297,56 @@ function Sync-MainConfigSectionKeys {
 
     for ($offset = 0; $offset -lt $insertLines.Count; $offset++) {
         $mutableLines.Insert($sectionEndIndex + $offset, $insertLines[$offset])
+    }
+
+    [System.IO.File]::WriteAllLines($ConfigPath, $mutableLines, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+function Ensure-MainConfigSection {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$CanonicalConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$SectionName
+    )
+
+    $configLines = [System.IO.File]::ReadAllLines($ConfigPath, [System.Text.Encoding]::UTF8)
+    foreach ($line in $configLines) {
+        if ($line -match ('^\s*\[' + [regex]::Escape($SectionName) + '\]\s*$')) {
+            return
+        }
+    }
+
+    $canonicalLines = [System.IO.File]::ReadAllLines($CanonicalConfigPath, [System.Text.Encoding]::UTF8)
+    $sectionLines = New-Object System.Collections.Generic.List[string]
+    $insideSection = $false
+    foreach ($canonicalLine in $canonicalLines) {
+        if ($canonicalLine -match ('^\s*\[' + [regex]::Escape($SectionName) + '\]\s*$')) {
+            $insideSection = $true
+        } elseif ($insideSection -and $canonicalLine -match '^\s*\[') {
+            break
+        }
+
+        if ($insideSection) {
+            $sectionLines.Add($canonicalLine) | Out-Null
+        }
+    }
+
+    if ($sectionLines.Count -eq 0) {
+        throw "failed to find canonical section [$SectionName] in $CanonicalConfigPath"
+    }
+
+    $mutableLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $configLines) {
+        $mutableLines.Add($line) | Out-Null
+    }
+    if ($mutableLines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($mutableLines[$mutableLines.Count - 1])) {
+        $mutableLines.Add("") | Out-Null
+    }
+    foreach ($sectionLine in $sectionLines) {
+        $mutableLines.Add($sectionLine) | Out-Null
     }
 
     [System.IO.File]::WriteAllLines($ConfigPath, $mutableLines, (New-Object System.Text.UTF8Encoding($true)))
@@ -398,6 +516,13 @@ for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 250
 }
 
+$rawCaptureBackupDir = $null
+$existingRawCaptureDir = Join-Path $packageDir "logs\streaming-raw-captures"
+if (Test-Path $existingRawCaptureDir) {
+    $rawCaptureBackupDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ainput-streaming-raw-captures-" + [Guid]::NewGuid().ToString("N"))
+    Copy-Item $existingRawCaptureDir $rawCaptureBackupDir -Recurse -Force
+}
+
 if (Test-Path $packageDir) {
     Remove-ItemWithRetry -Path $packageDir
 }
@@ -412,9 +537,7 @@ if (Test-Path $zipPath) {
     }
 }
 
-$mainConfigSource = Get-PreferredConfigSource `
-    -FileName "ainput.toml" `
-    -FallbackPath (Join-Path $repoRoot "config\ainput.toml")
+$mainConfigSource = Join-Path $repoRoot "config\ainput.toml"
 $hudConfigSource = Get-PreferredConfigSource `
     -FileName "hud-overlay.toml" `
     -FallbackPath (Join-Path $repoRoot "config\hud-overlay.toml")
@@ -428,9 +551,32 @@ New-Item -ItemType Directory -Force -Path $streamingPunctuationModelTarget | Out
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "logs") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "assets") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "scripts") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-hud-e2e") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-selftest") | Out-Null
 
 Copy-Item $releaseExe (Join-Path $packageDir "ainput-desktop.exe") -Force
 Copy-Item $mainConfigSource (Join-Path $packageDir "config\ainput.toml") -Force
+Ensure-MainConfigSection `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.endpoint"
+Ensure-MainConfigSection `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.stability"
+Ensure-MainConfigSection `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.finalize"
+Ensure-MainConfigSection `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.performance"
+Ensure-MainConfigSection `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.commit"
 Sync-MainConfigSectionKeys `
     -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
     -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
@@ -440,6 +586,31 @@ Sync-MainConfigSectionKeys `
         model_dir = ('model_dir = "models/' + $streamingModelName + '"')
         punctuation_model_dir = ('punctuation_model_dir = "models/punctuation/' + $streamingPunctuationModelName + '"')
     }
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.endpoint" `
+    -Keys @("enabled", "pause_ms", "soft_flush_ms", "min_segment_ms", "max_segment_ms", "tail_padding_ms", "preroll_ms")
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.stability" `
+    -Keys @("min_agreement", "max_rollback_chars")
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.finalize" `
+    -Keys @("release_drain_min_ms", "release_drain_idle_settle_ms", "release_drain_max_ms", "final_decode_timeout_ms", "release_to_commit_hard_ms", "allow_display_fallback_on_timeout")
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.performance" `
+    -Keys @("asr_num_threads", "punctuation_num_threads", "final_num_threads", "background_writer_threads", "gpu_enabled")
+Sync-MainConfigSectionKeys `
+    -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
+    -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
+    -SectionName "voice.streaming.commit" `
+    -Keys @("single_commit_envelope", "reject_post_hud_flush_mutations", "require_hud_flush_before_commit")
 Sync-MainConfigSectionKeys `
     -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
     -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
@@ -462,6 +633,11 @@ Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $packageDir "README.md") 
 Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "assets\app-icon.ico") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
 Copy-Item (Join-Path $repoRoot "data\terms\base_terms.json") (Join-Path $packageDir "data\terms\base_terms.json") -Force
+Copy-Item (Join-Path $repoRoot "scripts\run-streaming-live-e2e.ps1") (Join-Path $packageDir "scripts\run-streaming-live-e2e.ps1") -Force
+Copy-Item (Join-Path $repoRoot "scripts\run-streaming-raw-corpus.ps1") (Join-Path $packageDir "scripts\run-streaming-raw-corpus.ps1") -Force
+Copy-Item (Join-Path $repoRoot "scripts\run-startup-idle-acceptance.ps1") (Join-Path $packageDir "scripts\run-startup-idle-acceptance.ps1") -Force
+Copy-Item (Join-Path $repoRoot "fixtures\streaming-hud-e2e\manifest.json") (Join-Path $packageDir "fixtures\streaming-hud-e2e\manifest.json") -Force
+Copy-Item (Join-Path $repoRoot "fixtures\streaming-selftest\*") (Join-Path $packageDir "fixtures\streaming-selftest") -Recurse -Force
 Copy-Item $modelSource $modelTarget -Recurse -Force
 if (!(Test-Path $streamingPunctuationModelSource)) {
     throw "missing streaming punctuation model directory: $streamingPunctuationModelSource"
@@ -495,6 +671,11 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     ("- models\\punctuation\\" + $streamingPunctuationModelName + "\\: streaming punctuation model"),
     "- assets\app-icon.ico: tray icon resource",
     "- data\terms\base_terms.json: built-in AI terms",
+    "- scripts\run-streaming-live-e2e.ps1: streaming HUD/readback acceptance script",
+    "- scripts\run-streaming-raw-corpus.ps1: raw capture replay acceptance script",
+    "- scripts\run-startup-idle-acceptance.ps1: startup idle no-auto-recording acceptance script",
+    "- fixtures\streaming-hud-e2e\: synthetic HUD/readback acceptance fixtures",
+    "- fixtures\streaming-selftest\: fixed wav streaming acceptance fixtures",
     "- logs\: runtime logs",
     "",
     "Notes:",
@@ -504,7 +685,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Streaming voice now uses hold Ctrl to trigger the local streaming paraformer model, and submits the finalized text after release",
     "- You can open config\hud-overlay.toml directly from the tray menu to adjust font size, color, width, and position",
     "- Saving config\hud-overlay.toml hot-reloads the HUD immediately",
-    "- New preview packages reuse the latest dist config files when available so HUD settings are kept",
+    "- New preview packages reuse the latest dist HUD config when available so HUD settings are kept",
     "- Clipboard fallback is used when direct paste fails",
     "- Recording options are available from the tray: audio, mouse, watermark, FPS, and quality",
     "- During automation recording and playback, the tray icon, HUD, and click feedback show the current state",
@@ -519,6 +700,13 @@ Set-Content -Path (Join-Path $packageDir "logs\README.txt") -Encoding UTF8 -Valu
 )
 
 Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $zipPath -Force
+
+if (![string]::IsNullOrWhiteSpace($rawCaptureBackupDir) -and (Test-Path $rawCaptureBackupDir)) {
+    $restoredRawCaptureDir = Join-Path $packageDir "logs\streaming-raw-captures"
+    New-Item -ItemType Directory -Force -Path $restoredRawCaptureDir | Out-Null
+    Copy-Item (Join-Path $rawCaptureBackupDir "*") $restoredRawCaptureDir -Recurse -Force
+    Remove-Item $rawCaptureBackupDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Output $packageDir
 Write-Output $zipPath

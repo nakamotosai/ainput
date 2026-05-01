@@ -68,7 +68,60 @@ pub struct StreamingVoiceConfig {
     pub punctuation_model_dir: String,
     pub punctuation_num_threads: i32,
     pub chunk_ms: u32,
+    pub endpoint: StreamingEndpointConfig,
+    pub stability: StreamingStabilityConfig,
+    pub finalize: StreamingFinalizeConfig,
+    pub performance: StreamingPerformanceConfig,
+    pub commit: StreamingCommitConfig,
     pub ai_rewrite: StreamingAiRewriteConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingEndpointConfig {
+    pub enabled: bool,
+    pub pause_ms: u64,
+    pub soft_flush_ms: u64,
+    pub min_segment_ms: u64,
+    pub max_segment_ms: u64,
+    pub tail_padding_ms: u64,
+    pub preroll_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingStabilityConfig {
+    pub min_agreement: usize,
+    pub max_rollback_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingFinalizeConfig {
+    pub release_drain_min_ms: u64,
+    pub release_drain_idle_settle_ms: u64,
+    pub release_drain_max_ms: u64,
+    pub final_decode_timeout_ms: u64,
+    pub release_to_commit_hard_ms: u64,
+    pub allow_display_fallback_on_timeout: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingPerformanceConfig {
+    pub asr_num_threads: i32,
+    pub punctuation_num_threads: i32,
+    pub final_num_threads: i32,
+    pub background_writer_threads: i32,
+    pub gpu_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingCommitConfig {
+    pub single_commit_envelope: bool,
+    pub reject_post_hud_flush_mutations: bool,
+    pub require_hud_flush_before_commit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +266,11 @@ impl Default for StreamingVoiceConfig {
                     .to_string(),
             punctuation_num_threads: 1,
             chunk_ms: 60,
+            endpoint: StreamingEndpointConfig::default(),
+            stability: StreamingStabilityConfig::default(),
+            finalize: StreamingFinalizeConfig::default(),
+            performance: StreamingPerformanceConfig::default(),
+            commit: StreamingCommitConfig::default(),
             ai_rewrite: StreamingAiRewriteConfig::default(),
         }
     }
@@ -234,26 +292,84 @@ impl Default for StreamingAiRewriteConfig {
     }
 }
 
+impl Default for StreamingEndpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pause_ms: 720,
+            soft_flush_ms: 360,
+            min_segment_ms: 900,
+            max_segment_ms: 16_000,
+            tail_padding_ms: 480,
+            preroll_ms: 180,
+        }
+    }
+}
+
+impl Default for StreamingStabilityConfig {
+    fn default() -> Self {
+        Self {
+            min_agreement: 2,
+            max_rollback_chars: 8,
+        }
+    }
+}
+
+impl Default for StreamingFinalizeConfig {
+    fn default() -> Self {
+        Self {
+            release_drain_min_ms: 160,
+            release_drain_idle_settle_ms: 160,
+            release_drain_max_ms: 500,
+            final_decode_timeout_ms: 900,
+            release_to_commit_hard_ms: 1200,
+            allow_display_fallback_on_timeout: true,
+        }
+    }
+}
+
+impl Default for StreamingPerformanceConfig {
+    fn default() -> Self {
+        Self {
+            asr_num_threads: 6,
+            punctuation_num_threads: 1,
+            final_num_threads: 8,
+            background_writer_threads: 1,
+            gpu_enabled: false,
+        }
+    }
+}
+
+impl Default for StreamingCommitConfig {
+    fn default() -> Self {
+        Self {
+            single_commit_envelope: true,
+            reject_post_hud_flush_mutations: true,
+            require_hud_flush_before_commit: true,
+        }
+    }
+}
+
 impl Default for HudOverlayConfig {
     fn default() -> Self {
         Self {
             anchor: HudAnchor::BottomCenter,
             offset_x_px: 0,
             offset_y_px: -6,
-            width_px: 560,
-            min_width_px: 220,
-            min_height_px: 84,
-            min_text_width_px: 140,
-            padding_x_px: 20,
-            padding_y_px: 14,
+            width_px: 1600,
+            min_width_px: 52,
+            min_height_px: 50,
+            min_text_width_px: 1,
+            padding_x_px: 14,
+            padding_y_px: 8,
             font_height_px: 34,
             font_weight: 700,
             font_family: "Microsoft YaHei".to_string(),
-            text_align: HudTextAlign::Left,
-            text_color: "#111111".to_string(),
-            background_color: "#F3F3F3".to_string(),
-            background_alpha: 212,
-            corner_radius_px: 26,
+            text_align: HudTextAlign::Center,
+            text_color: "#FFFFFF".to_string(),
+            background_color: "#0B0B0B".to_string(),
+            background_alpha: 190,
+            corner_radius_px: 18,
             display_hold_ms: 650,
         }
     }
@@ -503,6 +619,12 @@ fn discover_root_dir() -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("resolve executable directory"))?;
 
+    if looks_like_cargo_target_dir(&exe_dir)
+        && let Some(found) = find_project_root(&exe_dir)
+    {
+        return Ok(found);
+    }
+
     if has_runtime_asset_markers(&exe_dir) {
         return Ok(exe_dir);
     }
@@ -520,6 +642,19 @@ fn discover_root_dir() -> Result<PathBuf> {
         current_dir.display(),
         exe_dir.display()
     ))
+}
+
+fn looks_like_cargo_target_dir(candidate: &Path) -> bool {
+    let leaf = candidate
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let parent = candidate
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    matches!(leaf, "debug" | "release") && parent == "target"
 }
 
 fn find_runtime_root(start: &Path) -> Option<PathBuf> {
@@ -818,6 +953,80 @@ punctuation_num_threads = {streaming_punctuation_num_threads}
 # 数值越小，HUD 更新会更勤；数值越大，吞吐更稳但刷新会更慢。
 chunk_ms = {streaming_chunk_ms}
 
+[voice.streaming.endpoint]
+# 是否启用应用层分段；启用后不再主要依赖 ASR 内置 10 秒静音端点。
+enabled = {streaming_endpoint_enabled}
+
+# 暂停超过多少毫秒后，flush 当前片段尾音并刷新 HUD；停顿本身不代表句末。
+pause_ms = {streaming_endpoint_pause_ms}
+
+# 按住期间 HUD 尾部追帧等待。只刷新 HUD，不上屏、不强制句末标点。
+soft_flush_ms = {streaming_endpoint_soft_flush_ms}
+
+# 太短的片段不自动滚动，避免一个词就被切开。
+min_segment_ms = {streaming_endpoint_min_segment_ms}
+
+# 单个流式片段最长持续时间，超过后会强制滚动。
+max_segment_ms = {streaming_endpoint_max_segment_ms}
+
+# 停顿尾音 flush 和松开 final decode 前补的静音尾巴长度。
+tail_padding_ms = {streaming_endpoint_tail_padding_ms}
+
+# 按下热键时从常驻录音缓冲里回带的开头音频长度。
+preroll_ms = {streaming_endpoint_preroll_ms}
+
+[voice.streaming.stability]
+# 连续多少次 hypothesis 前缀一致后，才把尾巴提升为稳定文本。
+min_agreement = {streaming_stability_min_agreement}
+
+# 已稳定尾巴允许被回滚的最大字符数；超过则拒绝这次前缀改写。
+max_rollback_chars = {streaming_stability_max_rollback_chars}
+
+[voice.streaming.finalize]
+# 松开 Ctrl 后至少等待多少毫秒，让最后的尾音进入录音缓冲。
+release_drain_min_ms = {streaming_finalize_release_drain_min_ms}
+
+# 松开后最近一段持续静音达到多少毫秒，就结束尾音等待。
+release_drain_idle_settle_ms = {streaming_finalize_release_drain_idle_settle_ms}
+
+# 松开后尾音等待常规上限。超过后必须 fallback，不能无限等最后一个字。
+release_drain_max_ms = {streaming_finalize_release_drain_max_ms}
+
+# final decode 预算。超时策略是使用 HUD 当前文本做 fallback。
+final_decode_timeout_ms = {streaming_finalize_final_decode_timeout_ms}
+
+# 从松开 Ctrl 到发起上屏的硬门禁。
+release_to_commit_hard_ms = {streaming_finalize_release_to_commit_hard_ms}
+
+# final repair 超预算时允许使用 HUD 文本兜底。
+allow_display_fallback_on_timeout = {streaming_finalize_allow_display_fallback_on_timeout}
+
+[voice.streaming.performance]
+# 流式 ASR 线程数；0 表示沿用 [asr].num_threads。
+asr_num_threads = {streaming_performance_asr_num_threads}
+
+# 标点模型线程数。
+punctuation_num_threads = {streaming_performance_punctuation_num_threads}
+
+# 松手后的 final repair 线程数；0 表示沿用 [asr].num_threads。
+final_num_threads = {streaming_performance_final_num_threads}
+
+# 后台写 raw capture / trace 的线程预算。
+background_writer_threads = {streaming_performance_background_writer_threads}
+
+# 本轮固定为 false，GPU 后续单独实验。
+gpu_enabled = {streaming_performance_gpu_enabled}
+
+[voice.streaming.commit]
+# 每轮松手只允许创建一个最终上屏 envelope。
+single_commit_envelope = {streaming_commit_single_commit_envelope}
+
+# HUD final flush 之后，迟到的 partial/final 不允许再改本轮文本。
+reject_post_hud_flush_mutations = {streaming_commit_reject_post_hud_flush_mutations}
+
+# 必须先把最终文本 flush 到 HUD，再发起 clipboard + Ctrl+V 上屏。
+require_hud_flush_before_commit = {streaming_commit_require_hud_flush_before_commit}
+
 [voice.streaming.ai_rewrite]
 # 是否启用实验性 AI 尾巴改写。
 # 默认关闭，不属于默认热路径。
@@ -951,6 +1160,51 @@ file_name = "{log_file_name}"
         streaming_punctuation_model_dir = config.voice.streaming.punctuation_model_dir,
         streaming_punctuation_num_threads = config.voice.streaming.punctuation_num_threads,
         streaming_chunk_ms = config.voice.streaming.chunk_ms,
+        streaming_endpoint_enabled = config.voice.streaming.endpoint.enabled,
+        streaming_endpoint_pause_ms = config.voice.streaming.endpoint.pause_ms,
+        streaming_endpoint_soft_flush_ms = config.voice.streaming.endpoint.soft_flush_ms,
+        streaming_endpoint_min_segment_ms = config.voice.streaming.endpoint.min_segment_ms,
+        streaming_endpoint_max_segment_ms = config.voice.streaming.endpoint.max_segment_ms,
+        streaming_endpoint_tail_padding_ms = config.voice.streaming.endpoint.tail_padding_ms,
+        streaming_endpoint_preroll_ms = config.voice.streaming.endpoint.preroll_ms,
+        streaming_stability_min_agreement = config.voice.streaming.stability.min_agreement,
+        streaming_stability_max_rollback_chars =
+            config.voice.streaming.stability.max_rollback_chars,
+        streaming_finalize_release_drain_min_ms =
+            config.voice.streaming.finalize.release_drain_min_ms,
+        streaming_finalize_release_drain_idle_settle_ms =
+            config.voice.streaming.finalize.release_drain_idle_settle_ms,
+        streaming_finalize_release_drain_max_ms =
+            config.voice.streaming.finalize.release_drain_max_ms,
+        streaming_finalize_final_decode_timeout_ms =
+            config.voice.streaming.finalize.final_decode_timeout_ms,
+        streaming_finalize_release_to_commit_hard_ms =
+            config.voice.streaming.finalize.release_to_commit_hard_ms,
+        streaming_finalize_allow_display_fallback_on_timeout = config
+            .voice
+            .streaming
+            .finalize
+            .allow_display_fallback_on_timeout,
+        streaming_performance_asr_num_threads = config.voice.streaming.performance.asr_num_threads,
+        streaming_performance_punctuation_num_threads =
+            config.voice.streaming.performance.punctuation_num_threads,
+        streaming_performance_final_num_threads =
+            config.voice.streaming.performance.final_num_threads,
+        streaming_performance_background_writer_threads =
+            config.voice.streaming.performance.background_writer_threads,
+        streaming_performance_gpu_enabled = config.voice.streaming.performance.gpu_enabled,
+        streaming_commit_single_commit_envelope =
+            config.voice.streaming.commit.single_commit_envelope,
+        streaming_commit_reject_post_hud_flush_mutations = config
+            .voice
+            .streaming
+            .commit
+            .reject_post_hud_flush_mutations,
+        streaming_commit_require_hud_flush_before_commit = config
+            .voice
+            .streaming
+            .commit
+            .require_hud_flush_before_commit,
         streaming_ai_rewrite_enabled = config.voice.streaming.ai_rewrite.enabled,
         streaming_ai_rewrite_endpoint_url = config
             .voice
@@ -1029,12 +1283,12 @@ fn render_hud_overlay_config_file(config: &HudOverlayConfig) -> String {
 # 2. 每个参数上方都有中文注释，按注释改完后保存文件。
 # 3. 保存文件后会自动热加载，不需要重启。
 # 4. 如果当前 HUD 正显示着，保存后会立刻按新参数刷新位置、大小、颜色和字体。
-# 5. 颜色统一写成 "#RRGGBB" 格式，例如黑色 "#111111"，白色 "#FFFFFF"。
+# 5. 默认是单行黑色半透明胶囊，文字有多少，底板就扩展到多少。
 
 [layout]
 # HUD 停靠位置。
 # 可选值：
-# - "bottom_center" = 屏幕正下方，默认推荐
+# - "bottom_center" = 任务栏上方的屏幕中心，默认推荐
 # - "bottom_left" = 屏幕左下角
 anchor = "{anchor}"
 
@@ -1047,20 +1301,20 @@ offset_x_px = {offset_x_px}
 # 默认给一个轻微负值，让 HUD 正好贴在任务栏上方。
 offset_y_px = {offset_y_px}
 
-# HUD 的目标宽度（像素）。
-# 字太长时会在这个宽度附近自动换行。
+# HUD 的最大目标宽度（像素）。
+# 实际宽度会按文字内容自动缩小或扩展，不换行。
 width_px = {width_px}
 
 # HUD 的最小宽度（像素）。
-# 字很少时也不会比这个更窄。
+# 一个字时也只保留一小块底板。
 min_width_px = {min_width_px}
 
 # HUD 的最小高度（像素）。
-# 字很少时也不会比这个更矮。
+# 默认按单行胶囊高度设置。
 min_height_px = {min_height_px}
 
 # 文本区域的最小宽度（像素）。
-# 如果只显示“请说话”这类短字，仍然至少保留这么宽的文本区。
+# 保持很小，避免一个字时出现大面板。
 min_text_width_px = {min_text_width_px}
 
 # HUD 左右内边距（像素）。
@@ -1072,7 +1326,7 @@ padding_x_px = {padding_x_px}
 padding_y_px = {padding_y_px}
 
 # HUD 圆角半径（像素）。
-# 0 = 直角；数值越大越圆。
+# 默认做成胶囊感。
 corner_radius_px = {corner_radius_px}
 
 # 松手后“已识别”提示至少保留多久（毫秒）。
@@ -1098,7 +1352,7 @@ font_weight = {font_weight}
 # - "SimHei"
 font_family = "{font_family}"
 
-# 文本对齐方式。
+# 文本对齐方式。流式 HUD 默认居中。
 # 可选值：
 # - "left" = 左对齐
 # - "center" = 居中
@@ -1351,6 +1605,11 @@ text_color = "#111111"
     #[test]
     fn render_config_file_contains_streaming_ai_rewrite_section() {
         let rendered = render_config_file(&AppConfig::default());
+        assert!(rendered.contains("[voice.streaming.endpoint]"));
+        assert!(rendered.contains("pause_ms = 720"));
+        assert!(rendered.contains("soft_flush_ms = 360"));
+        assert!(rendered.contains("[voice.streaming.stability]"));
+        assert!(rendered.contains("min_agreement = 2"));
         assert!(rendered.contains("[voice.streaming.ai_rewrite]"));
         assert!(rendered.contains("endpoint_url = \"http://127.0.0.1:8080/v1/chat/completions\""));
         assert!(rendered.contains("model = \"Qwen3-0.6B\""));

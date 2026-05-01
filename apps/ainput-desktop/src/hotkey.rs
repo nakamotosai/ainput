@@ -1,23 +1,23 @@
 use std::sync::{
     Arc, OnceLock, RwLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL,
-    VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3,
-    VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_HOME, VK_INSERT,
-    VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK,
-    VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7,
-    VK_NUMPAD8, VK_NUMPAD9, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEINPUT,
+    SendInput, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE,
+    VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8,
+    VK_F9, VK_F10, VK_F11, VK_F12, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT,
+    VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2,
+    VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9, VK_PAUSE,
+    VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
@@ -30,7 +30,8 @@ use winit::event_loop::EventLoopProxy;
 const HOTKEY_CONTROL_MESSAGE: u32 = WM_APP + 7;
 const MOUSE_MIDDLE_HOLD_DELAY_MS: u64 = 200;
 const VOICE_HOTKEY_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(8);
-const MODIFIER_ONLY_VOICE_TRIGGER_DELAY_MS: u64 = 70;
+const MODIFIER_ONLY_VOICE_TRIGGER_DELAY_MS: u64 = 260;
+const VOICE_HOTKEY_OUTPUT_COOLDOWN_MS: u64 = 350;
 
 #[derive(Clone, Copy)]
 pub enum HotkeyState {
@@ -103,6 +104,25 @@ static MOUSE_MIDDLE_TOKEN: AtomicU64 = AtomicU64::new(0);
 static MODIFIER_ONLY_VOICE_PENDING: AtomicBool = AtomicBool::new(false);
 static MODIFIER_ONLY_VOICE_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
 static MODIFIER_ONLY_VOICE_TOKEN: AtomicU64 = AtomicU64::new(0);
+static VOICE_HOTKEY_SUPPRESSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VOICE_HOTKEY_SUPPRESS_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+pub struct VoiceHotkeySuppressionGuard {
+    active: bool,
+}
+
+impl Drop for VoiceHotkeySuppressionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            VOICE_HOTKEY_SUPPRESSION_COUNT.fetch_sub(1, Ordering::Relaxed);
+            VOICE_HOTKEY_SUPPRESS_UNTIL_MS.store(
+                now_epoch_ms().saturating_add(VOICE_HOTKEY_OUTPUT_COOLDOWN_MS),
+                Ordering::Relaxed,
+            );
+            self.active = false;
+        }
+    }
+}
 
 impl GlobalHotkeyMonitor {
     pub fn start(
@@ -236,6 +256,13 @@ pub fn voice_hotkey_uses_alt() -> bool {
     current_config().is_some_and(|config| config.voice.modifiers.alt)
 }
 
+pub fn suppress_voice_hotkey_for_output() -> VoiceHotkeySuppressionGuard {
+    VOICE_HOTKEY_SUPPRESSION_COUNT.fetch_add(1, Ordering::Relaxed);
+    cancel_pending_modifier_only_voice_trigger();
+    VOICE_ACTIVE.store(false, Ordering::Relaxed);
+    VoiceHotkeySuppressionGuard { active: true }
+}
+
 pub fn reset_hotkey_state() {
     CTRL_DOWN.store(false, Ordering::Relaxed);
     ALT_DOWN.store(false, Ordering::Relaxed);
@@ -255,6 +282,7 @@ pub fn reset_hotkey_state() {
     MOUSE_MIDDLE_ACTIVE.store(false, Ordering::Relaxed);
     MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
     MODIFIER_ONLY_VOICE_PASSTHROUGH.store(false, Ordering::Relaxed);
+    VOICE_HOTKEY_SUPPRESS_UNTIL_MS.store(0, Ordering::Relaxed);
 }
 
 impl Drop for GlobalHotkeyMonitor {
@@ -276,6 +304,10 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         let is_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
         let is_up = message == WM_KEYUP || message == WM_SYSKEYUP;
         let vk = VIRTUAL_KEY(keyboard.vkCode as u16);
+
+        if keyboard.flags.0 & 0x10 != 0 {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
 
         update_modifier_state(vk, is_down, is_up);
 
@@ -420,6 +452,12 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 SCREENSHOT_ACTIVE.store(false, Ordering::Relaxed);
             }
 
+            if voice_hotkey_suppressed_for_output() {
+                cancel_pending_modifier_only_voice_trigger();
+                VOICE_ACTIVE.store(false, Ordering::Relaxed);
+                return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+            }
+
             if let Some(primary_key) = config.voice.key {
                 if vk == primary_key && is_down && config.voice.modifiers.matches_pressed() {
                     if !VOICE_ACTIVE.swap(true, Ordering::Relaxed) {
@@ -476,7 +514,7 @@ fn handle_modifier_only_voice_hotkey(
 
     if is_down && !relevant_modifier {
         if pending || active {
-            cancel_modifier_only_voice_capture(voice, active);
+            cancel_modifier_only_voice_capture(active);
         }
         return None;
     }
@@ -485,12 +523,12 @@ fn handle_modifier_only_voice_hotkey(
         if !pending && !active {
             arm_modifier_only_voice_pending(voice.modifiers);
         }
-        return Some(LRESULT(1));
+        return None;
     }
 
     if is_down && relevant_modifier {
         if pending || active {
-            cancel_modifier_only_voice_capture(voice, active);
+            cancel_modifier_only_voice_capture(active);
         }
         return None;
     }
@@ -498,15 +536,31 @@ fn handle_modifier_only_voice_hotkey(
     if is_up && relevant_modifier {
         MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
         if active && VOICE_ACTIVE.swap(false, Ordering::Relaxed) {
+            tracing::info!("modifier-only voice hotkey released in keyboard hook");
             send_hotkey_state(HotkeyState::VoiceReleased);
-            return Some(LRESULT(1));
-        }
-        if pending || exact_match {
-            return Some(LRESULT(1));
         }
     }
 
     None
+}
+
+fn voice_hotkey_suppressed_for_output() -> bool {
+    VOICE_HOTKEY_SUPPRESSION_COUNT.load(Ordering::Relaxed) > 0
+        || now_epoch_ms() < VOICE_HOTKEY_SUPPRESS_UNTIL_MS.load(Ordering::Relaxed)
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn cancel_pending_modifier_only_voice_trigger() {
+    MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
+    MODIFIER_ONLY_VOICE_PASSTHROUGH.store(false, Ordering::Relaxed);
+    MODIFIER_ONLY_VOICE_TOKEN.fetch_add(1, Ordering::Relaxed);
 }
 
 fn arm_modifier_only_voice_pending(modifiers: HotkeyModifiers) {
@@ -529,18 +583,19 @@ fn arm_modifier_only_voice_pending(modifiers: HotkeyModifiers) {
         }
         MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
         if !VOICE_ACTIVE.swap(true, Ordering::Relaxed) {
+            tracing::info!("modifier-only voice hotkey matched in keyboard hook");
             send_hotkey_state(HotkeyState::VoicePressed);
         }
     });
 }
 
-fn cancel_modifier_only_voice_capture(voice: &ParsedHotkey, active: bool) {
+fn cancel_modifier_only_voice_capture(active: bool) {
     MODIFIER_ONLY_VOICE_PENDING.store(false, Ordering::Relaxed);
     MODIFIER_ONLY_VOICE_PASSTHROUGH.store(true, Ordering::Relaxed);
     if active && VOICE_ACTIVE.swap(false, Ordering::Relaxed) {
+        tracing::info!("modifier-only voice hotkey cancelled by chord in keyboard hook");
         send_hotkey_state(HotkeyState::VoiceReleased);
     }
-    synthesize_modifier_keydowns(voice.modifiers);
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -761,8 +816,12 @@ fn handle_middle_button_down() {
         if MOUSE_MIDDLE_TOKEN.load(Ordering::Relaxed) != token {
             return;
         }
+        if voice_hotkey_suppressed_for_output() {
+            return;
+        }
 
         if !MOUSE_MIDDLE_ACTIVE.swap(true, Ordering::Relaxed) {
+            tracing::info!("mouse middle hold voice hotkey matched");
             send_hotkey_state(HotkeyState::VoicePressed);
         }
     });
@@ -813,37 +872,6 @@ fn synthesize_middle_click() {
     ];
 
     let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-}
-
-fn synthesize_modifier_keydowns(modifiers: HotkeyModifiers) {
-    let mut inputs = Vec::new();
-    if modifiers.ctrl {
-        inputs.push(keyboard_input(VK_LCONTROL));
-    }
-    if modifiers.alt {
-        inputs.push(keyboard_input(VK_LMENU));
-    }
-    if modifiers.shift {
-        inputs.push(keyboard_input(VK_LSHIFT));
-    }
-    if modifiers.win {
-        inputs.push(keyboard_input(VK_LWIN));
-    }
-    if !inputs.is_empty() {
-        let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    }
-}
-
-fn keyboard_input(vk: VIRTUAL_KEY) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                ..Default::default()
-            },
-        },
-    }
 }
 
 fn send_hotkey_state(state: HotkeyState) {
@@ -927,5 +955,80 @@ mod tests {
         assert!(!wait_for_voice_hotkey_release(Duration::from_millis(20)));
 
         reset_hotkey_state();
+    }
+
+    #[test]
+    fn modifier_only_ctrl_never_swallows_ctrl_down_or_up() {
+        let _guard = test_guard();
+        reset_hotkey_state();
+        install_test_config("Ctrl");
+        let config = current_config().expect("test config should be installed");
+
+        CTRL_DOWN.store(true, Ordering::Relaxed);
+        assert!(
+            handle_modifier_only_voice_hotkey(VK_CONTROL, true, false, &config.voice).is_none()
+        );
+        assert!(MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed));
+
+        CTRL_DOWN.store(false, Ordering::Relaxed);
+        assert!(
+            handle_modifier_only_voice_hotkey(VK_CONTROL, false, true, &config.voice).is_none()
+        );
+        assert!(!MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed));
+        assert!(!VOICE_ACTIVE.load(Ordering::Relaxed));
+
+        reset_hotkey_state();
+    }
+
+    #[test]
+    fn ctrl_letter_shortcut_cancels_voice_capture_without_swallowing_shortcut() {
+        let _guard = test_guard();
+        reset_hotkey_state();
+        install_test_config("Ctrl");
+        let config = current_config().expect("test config should be installed");
+
+        CTRL_DOWN.store(true, Ordering::Relaxed);
+        assert!(
+            handle_modifier_only_voice_hotkey(VK_CONTROL, true, false, &config.voice).is_none()
+        );
+        assert!(MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed));
+
+        assert!(
+            handle_modifier_only_voice_hotkey(VIRTUAL_KEY(0x43), true, false, &config.voice)
+                .is_none()
+        );
+        assert!(!MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed));
+        assert!(MODIFIER_ONLY_VOICE_PASSTHROUGH.load(Ordering::Relaxed));
+
+        CTRL_DOWN.store(false, Ordering::Relaxed);
+        assert!(
+            handle_modifier_only_voice_hotkey(VK_CONTROL, false, true, &config.voice).is_none()
+        );
+        assert!(!MODIFIER_ONLY_VOICE_PASSTHROUGH.load(Ordering::Relaxed));
+
+        reset_hotkey_state();
+    }
+
+    #[test]
+    fn output_suppression_tracks_guard_lifetime_and_cancels_pending_ctrl_voice() {
+        let _guard = test_guard();
+        reset_hotkey_state();
+        install_test_config("Ctrl");
+        CTRL_DOWN.store(true, Ordering::Relaxed);
+        MODIFIER_ONLY_VOICE_PENDING.store(true, Ordering::Relaxed);
+        let old_token = MODIFIER_ONLY_VOICE_TOKEN.load(Ordering::Relaxed);
+
+        {
+            let _suppression = suppress_voice_hotkey_for_output();
+            assert!(voice_hotkey_suppressed_for_output());
+            assert!(!MODIFIER_ONLY_VOICE_PENDING.load(Ordering::Relaxed));
+            assert!(MODIFIER_ONLY_VOICE_TOKEN.load(Ordering::Relaxed) > old_token);
+            assert!(!VOICE_ACTIVE.load(Ordering::Relaxed));
+        }
+
+        assert!(voice_hotkey_suppressed_for_output());
+        assert!(VOICE_HOTKEY_SUPPRESS_UNTIL_MS.load(Ordering::Relaxed) >= now_epoch_ms());
+        reset_hotkey_state();
+        assert!(!voice_hotkey_suppressed_for_output());
     }
 }

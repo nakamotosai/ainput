@@ -434,13 +434,21 @@ fn default_builtin_terms() -> BuiltinTermsFile {
         description: "ainput built-in AI coding terms".to_string(),
         terms: vec![
             alias(&["codex", "code x"], "Codex"),
+            alias(&["codex cli", "condex cli", "code x cli"], "Codex CLI"),
+            alias(&["codex ci", "condex ci", "code x ci"], "Codex CI"),
             alias(&["open ai", "openai"], "OpenAI"),
             alias(&["chat gpt", "chatgpt"], "ChatGPT"),
             alias(&["gpt five", "g p t 5", "gpt 5"], "GPT-5"),
             alias(&["gpt four point one", "gpt 4.1", "g p t 4.1"], "GPT-4.1"),
+            alias(&["gpt 4o", "gpt4o", "gpt-4o", "g p t 4 o"], "GPT-4o"),
             alias(&["claude"], "Claude"),
+            alias(
+                &["claude opus", "claude ops", "cloud ops", "cloud opus"],
+                "Claude Opus",
+            ),
             alias(&["anthropic"], "Anthropic"),
             alias(&["gemini"], "Gemini"),
+            alias(&["google gemini", "google germany"], "Google Gemini"),
             alias(&["cursor"], "Cursor"),
             alias(&["windsurf"], "Windsurf"),
             alias(&["aider"], "Aider"),
@@ -645,13 +653,17 @@ fn correct_ascii_token(
     exact_aliases: &HashMap<String, String>,
     glossary: &[String],
 ) -> Option<String> {
-    if !token.is_ascii() || token.chars().count() < 4 {
+    if !token.is_ascii() {
         return None;
     }
 
     let lowered = token.to_ascii_lowercase();
     if let Some(replacement) = exact_aliases.get(&lowered) {
         return Some(replacement.clone());
+    }
+
+    if token.chars().count() < 4 {
+        return None;
     }
 
     for canonical in glossary {
@@ -740,6 +752,22 @@ mod tests {
         assert_eq!(
             correct_ascii_terms("please ask open ai", &aliases, &glossary),
             "please ask OpenAI"
+        );
+    }
+
+    #[test]
+    fn exact_aliases_apply_to_short_ascii_terms_and_brand_phrases() {
+        let mut aliases = HashMap::new();
+        aliases.insert("cli".to_string(), "CLI".to_string());
+        aliases.insert("google germany".to_string(), "Google Gemini".to_string());
+        let glossary = vec!["CLI".to_string(), "Google Gemini".to_string()];
+        assert_eq!(
+            correct_ascii_terms("run cli now", &aliases, &glossary),
+            "run CLI now"
+        );
+        assert_eq!(
+            correct_ascii_terms("open google germany please", &aliases, &glossary),
+            "open Google Gemini please"
         );
     }
 

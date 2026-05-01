@@ -6,8 +6,9 @@
 # 4. 流式语音 HUD 的字体、颜色、大小、位置等参数，统一在 config\hud-overlay.toml 里调整。
 
 [hotkeys]
-# 按住说话的主热键。
-# 当前默认：Alt+Z
+# 极速模式下按住说话的主热键。
+# 流式模式固定使用 Ctrl，避免普通输入时被 Alt 组合键干扰。
+# 当前极速默认：Alt+Z
 voice_input = "Alt+Z"
 
 # 触发截图的主热键。
@@ -25,7 +26,7 @@ enabled = true
 # 当前语音模式。
 # fast = 极速语音识别
 # streaming = 流式语音识别
-mode = "fast"
+mode = "streaming"
 
 # 是否优先尝试“直接粘贴到当前输入框”。
 # true = 先写剪贴板再模拟 Ctrl+V
@@ -78,6 +79,80 @@ punctuation_num_threads = 1
 # 流式音频块时长（毫秒）。
 # 数值越小，HUD 更新会更勤；数值越大，吞吐更稳但刷新会更慢。
 chunk_ms = 60
+
+[voice.streaming.endpoint]
+# 是否启用按住期间的停顿收尾。开启后只刷新 HUD 和稳定前缀，不会提前上屏。
+enabled = true
+
+# 暂停超过多少毫秒后，flush 当前片段尾音并刷新 HUD；停顿本身不代表句末。
+pause_ms = 720
+
+# 按住期间 HUD 尾部追帧等待。只刷新 HUD，不上屏、不强制句末标点。
+soft_flush_ms = 360
+
+# 太短的片段不自动滚动，避免一个词就被切开。
+min_segment_ms = 900
+
+# 单个流式片段最长持续时间，超过后会强制滚动。
+max_segment_ms = 16000
+
+# 停顿尾音 flush 和松开 final decode 前补的静音尾巴长度。
+tail_padding_ms = 480
+
+# 按下热键时从常驻录音缓冲里回带的开头音频长度。
+preroll_ms = 180
+
+[voice.streaming.stability]
+# 连续多少次 hypothesis 前缀一致后，才把尾巴提升为稳定文本。
+min_agreement = 2
+
+# 已稳定尾巴允许被回滚的最大字符数；超过则拒绝这次前缀改写。
+max_rollback_chars = 8
+
+[voice.streaming.finalize]
+# 松开 Ctrl 后至少等待多少毫秒，让最后的尾音进入录音缓冲。
+release_drain_min_ms = 160
+
+# 松开后最近一段持续静音达到多少毫秒，就结束尾音等待。
+release_drain_idle_settle_ms = 160
+
+# 松开后尾音等待常规上限。超过后必须 fallback，不能无限等最后一个字。
+release_drain_max_ms = 500
+
+# final decode 预算。超时策略是使用 HUD 当前文本做 fallback。
+final_decode_timeout_ms = 900
+
+# 从松开 Ctrl 到发起上屏的硬门禁。
+release_to_commit_hard_ms = 1200
+
+# final repair 超预算时允许使用 HUD 文本兜底。
+allow_display_fallback_on_timeout = true
+
+[voice.streaming.performance]
+# 流式 ASR 线程数；0 表示沿用 [asr].num_threads。
+asr_num_threads = 6
+
+# 标点模型线程数。
+punctuation_num_threads = 1
+
+# 松手后的 final repair 线程数；0 表示沿用 [asr].num_threads。
+final_num_threads = 8
+
+# 后台写 raw capture / trace 的线程预算。
+background_writer_threads = 1
+
+# 本轮固定为 false，GPU 后续单独实验。
+gpu_enabled = false
+
+[voice.streaming.commit]
+# 每轮松手只允许创建一个最终上屏 envelope。
+single_commit_envelope = true
+
+# HUD final flush 之后，迟到的 partial/final 不允许再改本轮文本。
+reject_post_hud_flush_mutations = true
+
+# 必须先把最终文本 flush 到 HUD，再发起 clipboard + Ctrl+V 上屏。
+require_hud_flush_before_commit = true
 
 [voice.streaming.ai_rewrite]
 # 是否启用实验性 AI 尾巴改写。

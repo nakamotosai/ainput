@@ -1,4 +1,4 @@
-﻿{
+{
     "version":  1,
     "fixture_root":  ".",
     "cases":  [
@@ -6,6 +6,10 @@
                       "id":  "sentence_01",
                       "wav_path":  "sentence-01.wav",
                       "expected_text":  "喂喂喂，你好你好，怎么回事啊？",
+                      "keywords":  [
+                                       "你好",
+                                       "怎么回事"
+                                   ],
                       "min_partial_updates":  2,
                       "shortfall_tolerance_chars":  3
                   },
@@ -13,6 +17,10 @@
                       "id":  "sentence_02",
                       "wav_path":  "sentence-02.wav",
                       "expected_text":  "我的名字叫老蔡，现在这个吐字不够丝滑。",
+                      "keywords":  [
+                                       "我的名字叫老蔡",
+                                       "丝滑"
+                                   ],
                       "min_partial_updates":  2,
                       "shortfall_tolerance_chars":  3
                   },
@@ -20,6 +28,10 @@
                       "id":  "sentence_03",
                       "wav_path":  "sentence-03.wav",
                       "expected_text":  "然后不管我说多少个字，它永远只能显示出来两个字。",
+                      "keywords":  [
+                                       "多少个字",
+                                       "显示出来两个"
+                                   ],
                       "min_partial_updates":  3,
                       "shortfall_tolerance_chars":  3
                   },
@@ -27,6 +39,11 @@
                       "id":  "sentence_04",
                       "wav_path":  "sentence-04.wav",
                       "expected_text":  "应该是我不断地说话之后，它能不断地出现文字。",
+                      "keywords":  [
+                                       "不断",
+                                       "说话之后",
+                                       "出现"
+                                   ],
                       "min_partial_updates":  3,
                       "shortfall_tolerance_chars":  3
                   },
@@ -34,6 +51,11 @@
                       "id":  "sentence_05",
                       "wav_path":  "sentence-05.wav",
                       "expected_text":  "明明这个HUD上面已经把正确的文案显示出来了，但是它有时候上屏还是慢。",
+                      "keywords":  [
+                                       "正确的文案",
+                                       "显示出来",
+                                       "上屏"
+                                   ],
                       "min_partial_updates":  4,
                       "shortfall_tolerance_chars":  4
                   },
@@ -41,6 +63,14 @@
                       "id":  "sentence_combo_long",
                       "wav_path":  "sentence-combo-long.wav",
                       "expected_text":  "然后不管我说多少个字，它永远只能显示出来两个字。应该是我不断地说话之后，它能不断地出现文字。明明这个HUD上面已经把正确的文案显示出来了，但是它有时候上屏还是慢。",
+                      "keywords":  [
+                                       "多少个字",
+                                       "显示出来两个",
+                                       "说话之后",
+                                       "出现文字",
+                                       "正确的文案",
+                                       "上屏"
+                                   ],
                       "min_partial_updates":  5,
                       "shortfall_tolerance_chars":  5
                   }

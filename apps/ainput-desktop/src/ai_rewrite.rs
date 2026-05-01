@@ -99,7 +99,11 @@ impl AiRewriteClient {
             current_tail: "浏览七".to_string(),
             context: OutputContextSnapshot {
                 process_name: Some("ainput-prewarm".to_string()),
+                window_title: Some("ainput".to_string()),
                 kind: OutputContextKind::EditableAtEnd,
+                selected_text: None,
+                text_before_cursor: None,
+                text_after_cursor: None,
             },
         };
 
@@ -473,6 +477,17 @@ fn build_system_prompt(max_output_chars: usize) -> String {
 
 fn build_user_prompt(request: &AiRewriteRequest, max_context_chars: usize) -> String {
     let process_name = request.context.process_name.as_deref().unwrap_or("unknown");
+    let window_title = request.context.window_title.as_deref().unwrap_or("unknown");
+    let selected_text =
+        context_text_or_empty(request.context.selected_text.as_deref(), max_context_chars);
+    let text_before_cursor = context_text_or_empty(
+        request.context.text_before_cursor.as_deref(),
+        max_context_chars,
+    );
+    let text_after_cursor = context_text_or_empty(
+        request.context.text_after_cursor.as_deref(),
+        max_context_chars,
+    );
     let frozen_prefix = if request.frozen_prefix.trim().is_empty() {
         "(空)".to_string()
     } else {
@@ -480,12 +495,24 @@ fn build_user_prompt(request: &AiRewriteRequest, max_context_chars: usize) -> St
     };
 
     format!(
-        "下面是一次实时语音输入改写请求。\n请结合应用场景和冻结前文，纠正“当前尾巴”里的语音识别错误。\n当前应用: {}\n光标环境: {}\n冻结前缀(只做参考，绝不能输出):\n{}\n当前尾巴(只改这里):\n{}\n\n请直接输出纠正后的当前尾巴。",
+        "下面是一次实时语音输入改写请求。\n请结合应用场景、窗口标题、光标附近文本和冻结前文，纠正“当前尾巴”里的语音识别错误。\n当前应用: {}\n窗口标题: {}\n光标环境: {}\n选中文本: {}\n光标前文本: {}\n光标后文本: {}\n冻结前缀(只做参考，绝不能输出):\n{}\n当前尾巴(只改这里):\n{}\n\n请直接输出纠正后的当前尾巴。",
         process_name,
+        window_title,
         describe_output_context_kind(request.context.kind),
+        selected_text,
+        text_before_cursor,
+        text_after_cursor,
         frozen_prefix,
         request.current_tail.trim()
     )
+}
+
+fn context_text_or_empty(value: Option<&str>, max_context_chars: usize) -> String {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| take_last_chars(text, max_context_chars))
+        .unwrap_or_else(|| "(空)".to_string())
 }
 
 fn describe_output_context_kind(kind: OutputContextKind) -> &'static str {
@@ -585,14 +612,20 @@ mod tests {
                 current_tail: "第二句先是错字".to_string(),
                 context: OutputContextSnapshot {
                     process_name: Some("Code.exe".to_string()),
+                    window_title: Some("main.rs - Visual Studio Code".to_string()),
                     kind: OutputContextKind::EditableAtEnd,
+                    selected_text: Some("旧文本".to_string()),
+                    text_before_cursor: Some("fn main() {".to_string()),
+                    text_after_cursor: Some("}".to_string()),
                 },
             },
             12,
         );
 
         assert!(prompt.contains("当前应用: Code.exe"));
+        assert!(prompt.contains("窗口标题: main.rs - Visual Studio Code"));
         assert!(prompt.contains("光标环境: 可编辑，光标在末尾"));
+        assert!(prompt.contains("选中文本: 旧文本"));
         assert!(prompt.contains("第一句已经稳定。"));
         assert!(prompt.contains("第二句先是错字"));
     }

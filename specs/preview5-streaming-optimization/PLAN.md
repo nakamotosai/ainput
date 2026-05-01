@@ -1,5 +1,7 @@
 # preview.5 真流式标点重构 PLAN
 
+> 状态：已被 `../streaming-realtime-rewrite-v3/` 取代。本文只保留历史背景；继续开发和验收以 V3 `SPEC.md` / `PLAN.md` / `TASKLIST.md` 为准。
+
 ## Phase 1: 配置与规格回正
 
 ### 目标

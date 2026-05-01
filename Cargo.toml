@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 members = [
     "apps/ainput-desktop",
     "crates/ainput-automation",
@@ -16,7 +16,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Proprietary"
-version = "1.0.0-preview.24"
+version = "1.0.0-preview.43"
 authors = ["sai"]
 
 [workspace.dependencies]

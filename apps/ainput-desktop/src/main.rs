@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acceptance;
 mod ai_rewrite;
 mod hotkey;
 mod instance;
@@ -19,10 +20,12 @@ use maintenance::{MaintenanceHandle, SharedRuntimeState};
 use reqwest::Url;
 use reqwest::blocking::Client;
 use serde::Serialize;
+use serde_json::json;
 use std::any::Any;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{
@@ -47,23 +50,50 @@ const RUN_REGISTRY_VALUE_NAME: &str = "ainput";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const HUD_CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HUD_TICK_INTERVAL: Duration = Duration::from_millis(16);
+const STREAMING_HUD_FINAL_ACK_TIMEOUT: Duration = Duration::from_millis(360);
+const STREAMING_HUD_FINAL_ACK_STABLE_TICKS: usize = 2;
 const TRAY_LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(220);
 const OLLAMA_STARTUP_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const OLLAMA_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const JSON_OUTPUT_PATH_ENV: &str = "AINPUT_JSON_OUTPUT_PATH";
-const STREAMING_ENDPOINT_TRAILING_SILENCE_SECS: f32 = 10.0;
-const STREAMING_ENDPOINT_MAX_UTTERANCE_SECS: f32 = 20.0;
+const STREAMING_SHERPA_FALLBACK_TRAILING_SILENCE_SECS: f32 = 60.0;
+const STREAMING_SHERPA_FALLBACK_MAX_UTTERANCE_SECS: f32 = 60.0;
 const STREAMING_HOLD_TO_TALK_HOTKEY: &str = "Ctrl";
 
 fn main() {
     ainput_recording::configure_dpi_awareness();
+    let cli_invocation = is_cli_invocation();
     if let Err(error) = try_main() {
         tracing::error!(error = %error, "ainput startup failed");
+        if cli_invocation {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
         show_error_dialog(
             "ainput 启动失败",
             &format!("ainput 没有成功启动。\n\n{}", error),
         );
     }
+}
+
+fn is_cli_invocation() -> bool {
+    matches!(
+        std::env::args().nth(1).as_deref(),
+        Some(
+            "transcribe-wav"
+                | "transcribe-streaming-wav"
+                | "record-once"
+                | "test-ai-rewrite"
+                | "probe-streaming-live"
+                | "replay-streaming-wav"
+                | "replay-streaming-manifest"
+                | "run-streaming-live-e2e-synthetic"
+                | "run-streaming-live-e2e-wav"
+                | "bootstrap"
+                | "clipboard-selftest-image"
+                | "capture-fullscreen-selftest"
+        )
+    )
 }
 
 fn try_main() -> Result<()> {
@@ -138,7 +168,11 @@ fn try_main() -> Result<()> {
             current_tail: current_tail.clone(),
             context: OutputContextSnapshot {
                 process_name: Some("ainput-cli".to_string()),
+                window_title: Some("ainput CLI".to_string()),
                 kind: OutputContextKind::EditableAtEnd,
+                selected_text: None,
+                text_before_cursor: None,
+                text_after_cursor: None,
             },
         })?;
         if let Some(response) = response {
@@ -172,6 +206,7 @@ fn try_main() -> Result<()> {
             "single",
             std::path::Path::new(wav_path),
             expected_text,
+            &[],
             1,
             None,
             3,
@@ -202,10 +237,80 @@ fn try_main() -> Result<()> {
         return Ok(());
     }
 
+    if args.get(1).map(String::as_str) == Some("run-streaming-live-e2e-synthetic") {
+        let runtime = build_runtime(&bootstrap, true)?;
+        let manifest_path = args
+            .get(2)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| acceptance::default_synthetic_manifest_path(&runtime));
+        let report_dir = args.get(3).map(PathBuf::from);
+        let report = acceptance::run_synthetic_live_e2e(
+            &runtime,
+            Path::new(&manifest_path),
+            report_dir.as_deref(),
+        )?;
+        emit_json_report(&report)?;
+        return Ok(());
+    }
+
+    if args.get(1).map(String::as_str) == Some("run-streaming-live-e2e-wav") {
+        let runtime = build_runtime(&bootstrap, true)?;
+        let manifest_path = args
+            .get(2)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| acceptance::default_wav_manifest_path(&runtime));
+        let report_dir = args.get(3).map(PathBuf::from);
+        let case_limit = args
+            .get(4)
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0);
+        append_acceptance_command_event(
+            report_dir.as_deref(),
+            "wav_command_entered",
+            json!({
+                "manifest": manifest_path.display().to_string(),
+                "case_limit": case_limit,
+            }),
+        )?;
+        append_acceptance_command_event(
+            report_dir.as_deref(),
+            "wav_recognizer_build_started",
+            json!({}),
+        )?;
+        let recognizer = build_streaming_recognizer(&runtime)?;
+        append_acceptance_command_event(
+            report_dir.as_deref(),
+            "wav_recognizer_build_finished",
+            json!({}),
+        )?;
+        let report = acceptance::run_wav_live_e2e(
+            &runtime,
+            &recognizer,
+            Path::new(&manifest_path),
+            report_dir.as_deref(),
+            case_limit,
+        )?;
+        append_acceptance_command_event(
+            report_dir.as_deref(),
+            "wav_command_finished",
+            json!({
+                "overall_status": report.overall_status,
+                "cases_passed": report.cases_passed,
+                "cases_total": report.cases_total,
+            }),
+        )?;
+        emit_json_report(&report)?;
+        return Ok(());
+    }
+
     if args.get(1).map(String::as_str) == Some("bootstrap") {
+        let effective_voice_hotkey = effective_voice_hotkey_binding(
+            bootstrap.config.voice.mode,
+            &bootstrap.config.hotkeys.voice_input,
+        );
         println!(
             "ainput bootstrap ready: voice_hotkey={}, voice_mode={}, capture_hotkey={}, config={}",
-            bootstrap.config.hotkeys.voice_input,
+            effective_voice_hotkey,
             match bootstrap.config.voice.mode {
                 ainput_shell::VoiceMode::Fast => "fast",
                 ainput_shell::VoiceMode::Streaming => "streaming",
@@ -235,10 +340,10 @@ fn try_main() -> Result<()> {
 
 fn effective_voice_hotkey_binding(
     mode: ainput_shell::VoiceMode,
-    configured_fast_hotkey: &str,
+    configured_hotkey: &str,
 ) -> String {
     match mode {
-        ainput_shell::VoiceMode::Fast => configured_fast_hotkey.to_string(),
+        ainput_shell::VoiceMode::Fast => configured_hotkey.to_string(),
         ainput_shell::VoiceMode::Streaming => STREAMING_HOLD_TO_TALK_HOTKEY.to_string(),
     }
 }
@@ -258,6 +363,45 @@ fn emit_json_report<T: Serialize>(report: &T) -> Result<()> {
     } else {
         println!("{}", String::from_utf8(report_json)?);
     }
+    Ok(())
+}
+
+fn append_acceptance_command_event(
+    report_dir: Option<&Path>,
+    event: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    let Some(report_dir) = report_dir else {
+        return Ok(());
+    };
+    fs::create_dir_all(report_dir)
+        .with_context(|| format!("create acceptance report dir {}", report_dir.display()))?;
+
+    let mut event_map = serde_json::Map::new();
+    event_map.insert("event".to_string(), json!(event));
+    event_map.insert(
+        "system_time_ms".to_string(),
+        json!(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ),
+    );
+    if let serde_json::Value::Object(payload) = payload {
+        for (key, value) in payload {
+            event_map.insert(key, value);
+        }
+    }
+
+    let progress_path = report_dir.join("command-progress.jsonl");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&progress_path)
+        .with_context(|| format!("open acceptance progress {}", progress_path.display()))?;
+    serde_json::to_writer(&mut file, &serde_json::Value::Object(event_map))?;
+    file.write_all(b"\n")?;
     Ok(())
 }
 
@@ -507,10 +651,10 @@ fn build_streaming_recognizer(
         sample_rate_hz: runtime.config.asr.sample_rate_hz as i32,
         num_threads: runtime.config.asr.num_threads,
         decoding_method: "greedy_search".to_string(),
-        enable_endpoint: true,
-        rule1_min_trailing_silence: STREAMING_ENDPOINT_TRAILING_SILENCE_SECS,
-        rule2_min_trailing_silence: STREAMING_ENDPOINT_TRAILING_SILENCE_SECS,
-        rule3_min_utterance_length: STREAMING_ENDPOINT_MAX_UTTERANCE_SECS,
+        enable_endpoint: false,
+        rule1_min_trailing_silence: STREAMING_SHERPA_FALLBACK_TRAILING_SILENCE_SECS,
+        rule2_min_trailing_silence: STREAMING_SHERPA_FALLBACK_TRAILING_SILENCE_SECS,
+        rule3_min_utterance_length: STREAMING_SHERPA_FALLBACK_MAX_UTTERANCE_SECS,
     })
 }
 
@@ -567,6 +711,20 @@ pub(crate) struct AppRuntime {
     shared_state: SharedRuntimeState,
     ai_rewriter: Option<Arc<ai_rewrite::AiRewriteClient>>,
     maintenance: MaintenanceHandle,
+}
+
+impl AppRuntime {
+    pub(crate) fn root_dir(&self) -> &Path {
+        &self.runtime_paths.root_dir
+    }
+
+    pub(crate) fn config(&self) -> &ainput_shell::AppConfig {
+        &self.config
+    }
+
+    pub(crate) fn output_controller(&self) -> &ainput_output::OutputController {
+        &self.output_controller
+    }
 }
 
 pub(crate) enum AppEvent {
@@ -1011,6 +1169,14 @@ impl DesktopApp {
         None
     }
 
+    fn streaming_completion_message(text: &str) -> Option<String> {
+        let message = text.trim();
+        if !message.is_empty() {
+            return Some(message.to_string());
+        }
+        None
+    }
+
     fn startup_ready_message(&self) -> String {
         match self.runtime.config.voice.mode {
             ainput_shell::VoiceMode::Fast => format!(
@@ -1114,6 +1280,66 @@ impl DesktopApp {
     fn clear_streaming_status_overlay(&mut self) {
         if let Some(overlay) = &mut self.overlay {
             overlay.clear_status_hud();
+        }
+    }
+
+    fn acknowledge_streaming_final_hud(
+        &mut self,
+        final_text: &str,
+    ) -> worker::StreamingHudCommitAck {
+        let started_at = Instant::now();
+        let final_text = match Self::streaming_completion_message(final_text) {
+            Some(text) => text,
+            None => {
+                return worker::StreamingHudCommitAck {
+                    text: String::new(),
+                    visible: false,
+                    elapsed_ms: started_at.elapsed().as_millis(),
+                };
+            }
+        };
+
+        if !self.runtime.config.voice.streaming.panel_enabled {
+            return worker::StreamingHudCommitAck {
+                text: final_text,
+                visible: false,
+                elapsed_ms: started_at.elapsed().as_millis(),
+            };
+        }
+
+        self.show_streaming_status_overlay(&final_text, true, false);
+
+        let mut stable_match_ticks = 0usize;
+        let mut last_display_text = final_text.clone();
+        let mut last_visible = false;
+
+        while started_at.elapsed() <= STREAMING_HUD_FINAL_ACK_TIMEOUT {
+            if let Some(overlay) = &mut self.overlay {
+                overlay.tick();
+                let snapshot = overlay.acceptance_snapshot();
+                last_display_text = snapshot.display_text.trim().to_string();
+                last_visible = snapshot.visible;
+
+                if last_visible && last_display_text == final_text {
+                    stable_match_ticks += 1;
+                    if stable_match_ticks >= STREAMING_HUD_FINAL_ACK_STABLE_TICKS {
+                        break;
+                    }
+                } else {
+                    stable_match_ticks = 0;
+                }
+            } else {
+                last_display_text = final_text.clone();
+                last_visible = false;
+                break;
+            }
+            thread::sleep(HUD_TICK_INTERVAL);
+        }
+
+        worker::StreamingHudCommitAck {
+            text: last_display_text,
+            visible: last_visible,
+            elapsed_ms: started_at.elapsed().as_millis(),
         }
     }
 
@@ -1825,6 +2051,11 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
         self.start_overlay_tick_once();
         self.prewarm_current_voice_worker();
         if self.hotkey_monitor.is_none() {
+            tracing::info!(
+                voice_hotkey = %self.current_voice_hotkey_binding(),
+                voice_mode = %Self::voice_mode_label(self.runtime.config.voice.mode),
+                "starting global hotkey monitor"
+            );
             match hotkey::GlobalHotkeyMonitor::start(
                 self.proxy.clone(),
                 self.shutdown.clone(),
@@ -1948,19 +2179,42 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.set_tray_visual_state(TrayVisualState::Voice, 1);
                     self.set_tray_status("状态：流式语音识别收尾中");
                 }
+                WorkerEvent::StreamingFinalHudCommitRequest {
+                    final_text,
+                    response_tx,
+                } => {
+                    self.mode = AppMode::Voice;
+                    self.set_tray_visual_state(TrayVisualState::Voice, 1);
+                    self.set_tray_status("状态：HUD 最终文本确认中");
+                    let ack = self.acknowledge_streaming_final_hud(&final_text);
+                    tracing::info!(
+                        final_text = %final_text,
+                        hud_text = %ack.text,
+                        hud_visible = ack.visible,
+                        hud_ack_elapsed_ms = ack.elapsed_ms,
+                        "streaming final HUD commit acknowledged"
+                    );
+                    let _ = response_tx.send(ack);
+                }
                 WorkerEvent::StreamingClipboardFallback(text) => {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：流式整理结果已复制到剪贴板");
-                    let _ = text;
-                    self.clear_streaming_status_overlay();
+                    if let Some(message) = Self::streaming_completion_message(&text) {
+                        self.show_streaming_status_overlay(&message, false, false);
+                    } else {
+                        self.clear_streaming_status_overlay();
+                    }
                 }
                 WorkerEvent::StreamingFinal(text) => {
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：流式整理结果已完成");
-                    let _ = text;
-                    self.clear_streaming_status_overlay();
+                    if let Some(message) = Self::streaming_completion_message(&text) {
+                        self.show_streaming_status_overlay(&message, false, false);
+                    } else {
+                        self.clear_streaming_status_overlay();
+                    }
                 }
                 WorkerEvent::Error(message) => {
                     self.handle_worker_error(&message);
@@ -3415,5 +3669,14 @@ mod tests {
         );
         assert_eq!(DesktopApp::streaming_partial_message("   "), None);
         assert_eq!(DesktopApp::streaming_partial_message("\t"), None);
+    }
+
+    #[test]
+    fn streaming_completion_message_prefers_text_and_skips_empty_text() {
+        assert_eq!(
+            DesktopApp::streaming_completion_message("  最终结果到了 "),
+            Some("最终结果到了".to_string())
+        );
+        assert_eq!(DesktopApp::streaming_completion_message("   "), None);
     }
 }

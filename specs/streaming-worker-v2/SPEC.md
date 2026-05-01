@@ -1,5 +1,7 @@
 # Streaming Worker V2 SPEC
 
+> 状态：已被 `../streaming-realtime-rewrite-v3/` 取代。本文只保留历史背景；继续开发和验收以 V3 `SPEC.md` / `PLAN.md` / `TASKLIST.md` 为准。
+
 ## 目标
 
 把 `ainput` 的流式语音模式改成“在线流负责 HUD 预览 + 同模型整段 rescore 负责最终提交”的稳态方案，并同时压缩松手后的最终提交延迟，让长句不再只显示前几个字。

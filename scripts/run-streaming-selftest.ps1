@@ -66,6 +66,11 @@ foreach ($case in $report.cases) {
         behavior = $case.behavior_status
         content = $case.content_status
         partials = $case.partial_updates
+        first_ms = $case.first_partial_ms
+        final_ms = $case.final_commit_ms
+        rollbacks = $case.rollback_count
+        max_rb = $case.max_rollback_chars
+        kw = if ($null -eq $case.keyword_coverage) { "" } else { "{0:P0}" -f [double]$case.keyword_coverage }
         final_chars = $case.final_visible_chars
         commit_source = $case.commit_source
         final_text = $case.final_text
