@@ -5,6 +5,28 @@
 
 ---
 
+## Round 27：流式首字测速口径修正
+
+- [x] 新增 Spec：`specs/streaming-first-partial-latency-v14/`
+- [x] 复盘 v13 latency，确认 P2 主要来自 raw 样本开头静音，而不是模型处理墙钟
+- [x] 实测 `streaming-zipformer-small-bilingual-zh-en`，因 5 条里 3 条失败，拒绝切默认模型
+- [x] replay 报告增加 `speech_start_ms` 与 `first_partial_after_speech_ms`
+- [x] latency benchmark / full audit 改为优先用 `speech_start -> first_partial` 判定 P2
+- [x] 打包新 preview：`dist\ainput-1.0.0-preview.48`
+- [x] 最新版本启动到用户交互桌面：`preview.48` PID `38548`
+
+完成判定：
+
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] `cargo test -p ainput-desktop streaming -- --nocapture` 通过
+- [x] `cargo test -p ainput-desktop hotkey -- --nocapture` 通过
+- [x] `cargo test -p ainput-rewrite -- --nocapture` 通过
+- [x] `scripts\run-streaming-full-audit.ps1 -Version 1.0.0-preview.48 -LatencyRepeats 1 -LiveCaseLimit 3` 通过，P0=0/P1=0/P2=0，报告：`tmp\streaming-full-audit\20260501-223721-227\full-audit-report.json`
+- [x] latency smoke 通过，`first_partial_processing_lag_avg_ms=0`
+- [x] README / v14 RESULTS 已回写
+
+---
+
 ## Round 26：HUD 成为流式最终真相源
 
 - [x] 新增 Spec：`specs/streaming-hud-truth-source-v11/`

@@ -238,26 +238,31 @@ function Add-LatencyFindings {
     }
     if ($baseline.Count -gt 0) {
         $b = $baseline[0]
-        if ($b.first_partial_p95_ms -ne $null -and [double]$b.first_partial_p95_ms -gt 1600) {
-            Add-Finding -Severity "P2" -Area "latency" -Title "First partial p95 is high" -Evidence "baseline=$($b.variant_id) first_partial_p95_ms=$($b.first_partial_p95_ms)" -Recommendation "Investigate model load, chunk size, and online decode cadence."
+        $firstPartialP95 = if ($b.first_partial_after_speech_p95_ms -ne $null) { $b.first_partial_after_speech_p95_ms } else { $b.first_partial_p95_ms }
+        $firstPartialAvg = if ($b.first_partial_after_speech_avg_ms -ne $null) { $b.first_partial_after_speech_avg_ms } else { $b.first_partial_avg_ms }
+        $firstPartialLabel = if ($b.first_partial_after_speech_p95_ms -ne $null) { "speech_to_first_partial" } else { "audio_to_first_partial" }
+        if ($firstPartialP95 -ne $null -and [double]$firstPartialP95 -gt 1200) {
+            Add-Finding -Severity "P2" -Area "latency" -Title "Speech-to-first-partial p95 is high" -Evidence "baseline=$($b.variant_id) metric=$firstPartialLabel p95_ms=$firstPartialP95 audio_start_p95_ms=$($b.first_partial_p95_ms)" -Recommendation "Investigate model emission cadence or a content-safe smaller bilingual streaming model."
         }
-        if ($b.first_partial_avg_ms -ne $null -and [double]$b.first_partial_avg_ms -gt 1100) {
-            Add-Finding -Severity "P2" -Area "latency" -Title "First partial average is not hand-following" -Evidence "baseline=$($b.variant_id) first_partial_avg_ms=$($b.first_partial_avg_ms)" -Recommendation "Prefer the fastest passing latency variant or reduce gating before HUD display."
+        if ($firstPartialAvg -ne $null -and [double]$firstPartialAvg -gt 800) {
+            Add-Finding -Severity "P2" -Area "latency" -Title "Speech-to-first-partial average is not hand-following" -Evidence "baseline=$($b.variant_id) metric=$firstPartialLabel avg_ms=$firstPartialAvg audio_start_avg_ms=$($b.first_partial_avg_ms)" -Recommendation "Prefer the fastest passing latency variant or reduce gating before HUD display."
         }
         if ($b.processing_rtf_avg -ne $null -and [double]$b.processing_rtf_avg -gt 0.45) {
             Add-Finding -Severity "P2" -Area "latency" -Title "Processing realtime factor is high" -Evidence "baseline=$($b.variant_id) processing_rtf_avg=$($b.processing_rtf_avg)" -Recommendation "Tune thread count or model variant."
         }
     }
-    $passing = @($Summary.summary_by_variant | Where-Object { [int]$_.failed_cases -eq 0 } | Sort-Object first_partial_avg_ms)
+    $passing = @($Summary.summary_by_variant | Where-Object { [int]$_.failed_cases -eq 0 } | Sort-Object @{ Expression = { if ($_.first_partial_after_speech_avg_ms -ne $null) { [double]$_.first_partial_after_speech_avg_ms } else { [double]$_.first_partial_avg_ms } } })
     if ($passing.Count -gt 1) {
         $fastest = $passing[0]
         $baseline = @($passing | Where-Object { $_.variant_id -eq "paraformer_bilingual_asr6_chunk60" } | Select-Object -First 1)
         if ($baseline.Count -gt 0) {
             $b = $baseline[0]
-            if ($b.first_partial_avg_ms -ne $null -and $fastest.first_partial_avg_ms -ne $null) {
-                $gain = [double]$b.first_partial_avg_ms - [double]$fastest.first_partial_avg_ms
+            $baselineAvg = if ($b.first_partial_after_speech_avg_ms -ne $null) { $b.first_partial_after_speech_avg_ms } else { $b.first_partial_avg_ms }
+            $fastestAvg = if ($fastest.first_partial_after_speech_avg_ms -ne $null) { $fastest.first_partial_after_speech_avg_ms } else { $fastest.first_partial_avg_ms }
+            if ($baselineAvg -ne $null -and $fastestAvg -ne $null) {
+                $gain = [double]$baselineAvg - [double]$fastestAvg
                 if ($gain -gt 120) {
-                    Add-Finding -Severity "P2" -Area "latency" -Title "A faster passing latency variant exists" -Evidence "baseline=$($b.variant_id) avg=$($b.first_partial_avg_ms); fastest=$($fastest.variant_id) avg=$($fastest.first_partial_avg_ms); gain_ms=$([Math]::Round($gain, 1))" -Recommendation "Consider switching config if follow-up replay/live gates still pass."
+                    Add-Finding -Severity "P2" -Area "latency" -Title "A faster passing latency variant exists" -Evidence "baseline=$($b.variant_id) avg=$baselineAvg; fastest=$($fastest.variant_id) avg=$fastestAvg; gain_ms=$([Math]::Round($gain, 1))" -Recommendation "Consider switching config if follow-up replay/live gates still pass."
                 }
             }
         }

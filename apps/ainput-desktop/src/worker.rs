@@ -1469,6 +1469,8 @@ pub(crate) fn replay_streaming_wav(
     );
 
     let activity = analyze_audio_activity(&session.captured_samples);
+    let speech_start_ms =
+        estimate_speech_start_ms(&session.captured_samples, session.sample_rate_hz);
     let prepared_commit = prepare_final_streaming_commit(
         recognizer,
         offline_final_recognizer.as_ref(),
@@ -1505,6 +1507,20 @@ pub(crate) fn replay_streaming_wav(
         });
         session.last_display_text = final_text.clone();
     }
+    let first_partial_ms = partial_timeline.first().map(|entry| entry.offset_ms);
+    let first_partial_processing_elapsed_ms = partial_timeline
+        .first()
+        .map(|entry| entry.processing_elapsed_ms);
+    let first_partial_after_speech_ms = first_partial_ms.map(|first_partial_ms| {
+        speech_start_ms.map_or(first_partial_ms, |speech_start_ms| {
+            first_partial_ms.saturating_sub(speech_start_ms)
+        })
+    });
+    let first_partial_processing_lag_ms = first_partial_ms.and_then(|first_partial_ms| {
+        first_partial_processing_elapsed_ms.map(|processing_elapsed_ms| {
+            processing_elapsed_ms.saturating_sub(first_partial_ms as u128)
+        })
+    });
     let last_partial_content_chars = partial_timeline
         .last()
         .map(|entry| entry.content_chars)
@@ -1601,7 +1617,11 @@ pub(crate) fn replay_streaming_wav(
         total_chunks_fed: session.total_chunks_fed,
         total_decode_steps: session.total_decode_steps,
         partial_updates: session.partial_updates,
-        first_partial_ms: partial_timeline.first().map(|entry| entry.offset_ms),
+        speech_start_ms,
+        first_partial_ms,
+        first_partial_after_speech_ms,
+        first_partial_processing_elapsed_ms,
+        first_partial_processing_lag_ms,
         final_commit_ms: input_duration_ms,
         processing_wall_elapsed_ms,
         processing_realtime_factor,
@@ -4186,6 +4206,40 @@ fn analyze_audio_activity(samples: &[f32]) -> AudioActivity {
     }
 }
 
+fn estimate_speech_start_ms(samples: &[f32], sample_rate_hz: i32) -> Option<u64> {
+    if samples.is_empty() || sample_rate_hz <= 0 {
+        return None;
+    }
+
+    let frame_samples =
+        ((sample_rate_hz as usize) * AUDIO_ACTIVITY_FRAME_MS as usize / 1000).max(1);
+    let required_consecutive_frames = 2usize;
+    let mut consecutive_voice_frames = 0usize;
+
+    for (frame_index, frame) in samples.chunks(frame_samples).enumerate() {
+        let frame_rms = (frame
+            .iter()
+            .map(|sample| {
+                let sample = *sample as f64;
+                sample * sample
+            })
+            .sum::<f64>()
+            / frame.len() as f64)
+            .sqrt() as f32;
+        if frame_rms >= AUDIO_ACTIVITY_SPEECH_FRAME_RMS {
+            consecutive_voice_frames += 1;
+            if consecutive_voice_frames >= required_consecutive_frames {
+                let first_voice_frame = frame_index + 1 - required_consecutive_frames;
+                return Some(first_voice_frame as u64 * AUDIO_ACTIVITY_FRAME_MS);
+            }
+        } else {
+            consecutive_voice_frames = 0;
+        }
+    }
+
+    None
+}
+
 fn analyze_recent_audio_activity(
     samples: &[f32],
     sample_rate_hz: i32,
@@ -5035,7 +5089,7 @@ mod tests {
         append_with_suffix_prefix_overlap, apply_streaming_semantic_commas,
         build_streaming_ai_rewrite_candidate, dedupe_streaming_punctuation,
         effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
-        finalize_streaming_commit_text, merge_rolled_over_prefix,
+        estimate_speech_start_ms, finalize_streaming_commit_text, merge_rolled_over_prefix,
         merge_streaming_offline_tail_repair, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
         resolve_streaming_rollover_commit_text, sanitize_ai_rewrite_output,
@@ -5130,6 +5184,29 @@ mod tests {
             "帮我看一下这里有没有问题",
             &activity
         ));
+    }
+
+    #[test]
+    fn speech_start_estimate_ignores_leading_silence() {
+        let sample_rate_hz = 16_000;
+        let mut samples = vec![0.0; 16_000];
+        samples.extend(vec![0.012; 1_600]);
+
+        assert_eq!(
+            estimate_speech_start_ms(&samples, sample_rate_hz),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn speech_start_estimate_requires_sustained_voice() {
+        let sample_rate_hz = 16_000;
+        let mut samples = vec![0.0; 320];
+        samples.extend(vec![0.012; 320]);
+        samples.extend(vec![0.0; 320]);
+        samples.extend(vec![0.012; 640]);
+
+        assert_eq!(estimate_speech_start_ms(&samples, sample_rate_hz), Some(60));
     }
 
     #[test]

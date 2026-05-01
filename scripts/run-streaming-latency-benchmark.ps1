@@ -92,8 +92,18 @@ if ($IncludeZhReference -and !($ModelIds -contains "zh_zipformer_reference")) {
     $ModelIds += "zh_zipformer_reference"
 }
 
+function Test-HasNumericValue([object]$Value) {
+    if ($null -eq $Value) {
+        return $false
+    }
+    if ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+    return $true
+}
+
 function Get-MedianNumber([object[]]$Values) {
-    $numbers = @($Values | Where-Object { $null -ne $_ -and $_ -ne "" } | ForEach-Object { [double]$_ } | Sort-Object)
+    $numbers = @($Values | Where-Object { Test-HasNumericValue $_ } | ForEach-Object { [double]$_ } | Sort-Object)
     if ($numbers.Count -eq 0) {
         return $null
     }
@@ -105,7 +115,7 @@ function Get-MedianNumber([object[]]$Values) {
 }
 
 function Get-PercentileNumber([object[]]$Values, [double]$Percentile) {
-    $numbers = @($Values | Where-Object { $null -ne $_ -and $_ -ne "" } | ForEach-Object { [double]$_ } | Sort-Object)
+    $numbers = @($Values | Where-Object { Test-HasNumericValue $_ } | ForEach-Object { [double]$_ } | Sort-Object)
     if ($numbers.Count -eq 0) {
         return $null
     }
@@ -115,7 +125,7 @@ function Get-PercentileNumber([object[]]$Values, [double]$Percentile) {
 }
 
 function Get-AverageNumber([object[]]$Values) {
-    $numbers = @($Values | Where-Object { $null -ne $_ -and $_ -ne "" } | ForEach-Object { [double]$_ })
+    $numbers = @($Values | Where-Object { Test-HasNumericValue $_ } | ForEach-Object { [double]$_ })
     if ($numbers.Count -eq 0) {
         return $null
     }
@@ -123,10 +133,21 @@ function Get-AverageNumber([object[]]$Values) {
 }
 
 function Round-Nullable([object]$Value, [int]$Digits) {
-    if ($null -eq $Value -or $Value -eq "") {
+    if (!(Test-HasNumericValue $Value)) {
         return $null
     }
     return [Math]::Round([double]$Value, $Digits)
+}
+
+function Get-OptionalProperty([object]$Object, [string]$Name) {
+    if ($null -eq $Object) {
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
 }
 
 function Set-TomlSectionValue([string]$Text, [string]$Section, [string]$Key, [string]$ValueLiteral) {
@@ -377,7 +398,11 @@ foreach ($variantId in $variantsByKey.Keys) {
                 behavior_status = $caseReport.behavior_status
                 content_status = $caseReport.content_status
                 input_duration_ms = $caseReport.input_duration_ms
+                speech_start_ms = Get-OptionalProperty $caseReport "speech_start_ms"
                 first_partial_ms = $caseReport.first_partial_ms
+                first_partial_after_speech_ms = Get-OptionalProperty $caseReport "first_partial_after_speech_ms"
+                first_partial_processing_elapsed_ms = Get-OptionalProperty $caseReport "first_partial_processing_elapsed_ms"
+                first_partial_processing_lag_ms = Get-OptionalProperty $caseReport "first_partial_processing_lag_ms"
                 partial_updates = $caseReport.partial_updates
                 last_partial_to_final_gap_ms = $caseReport.last_partial_to_final_gap_ms
                 final_extra_content_chars = $caseReport.final_extra_content_chars
@@ -415,9 +440,14 @@ foreach ($group in ($allRows | Group-Object variant_id)) {
         chunk_ms = $variant.chunk_ms
         cases = $rows.Count
         failed_cases = $failed.Count
+        first_partial_after_speech_avg_ms = Round-Nullable (Get-AverageNumber $rows.first_partial_after_speech_ms) 1
+        first_partial_after_speech_p50_ms = Round-Nullable (Get-MedianNumber $rows.first_partial_after_speech_ms) 1
+        first_partial_after_speech_p95_ms = Round-Nullable (Get-PercentileNumber $rows.first_partial_after_speech_ms 95) 1
         first_partial_avg_ms = Round-Nullable (Get-AverageNumber $rows.first_partial_ms) 1
         first_partial_p50_ms = Round-Nullable (Get-MedianNumber $rows.first_partial_ms) 1
         first_partial_p95_ms = Round-Nullable (Get-PercentileNumber $rows.first_partial_ms 95) 1
+        first_partial_processing_lag_avg_ms = Round-Nullable (Get-AverageNumber $rows.first_partial_processing_lag_ms) 1
+        first_partial_processing_lag_p95_ms = Round-Nullable (Get-PercentileNumber $rows.first_partial_processing_lag_ms 95) 1
         processing_wall_avg_ms = Round-Nullable (Get-AverageNumber $rows.processing_wall_elapsed_ms) 1
         processing_wall_p95_ms = Round-Nullable (Get-PercentileNumber $rows.processing_wall_elapsed_ms 95) 1
         processing_wall_max_ms = Round-Nullable (($rows.processing_wall_elapsed_ms | ForEach-Object { [double]$_ } | Measure-Object -Maximum).Maximum) 1
@@ -434,7 +464,7 @@ $summaryCsv = Join-Path $ReportDir "summary_by_variant.csv"
 $summaryJson = Join-Path $ReportDir "summary.json"
 $markdownPath = Join-Path $ReportDir "SUMMARY.md"
 $allRows | Export-Csv -Path $casesCsv -NoTypeInformation -Encoding UTF8
-$variantSummaries | Sort-Object failed_cases, first_partial_avg_ms, processing_rtf_avg | Export-Csv -Path $summaryCsv -NoTypeInformation -Encoding UTF8
+$variantSummaries | Sort-Object failed_cases, first_partial_after_speech_avg_ms, processing_rtf_avg | Export-Csv -Path $summaryCsv -NoTypeInformation -Encoding UTF8
 
 $summary = [ordered]@{
     overall_status = if ($runFailures.Count -eq 0 -and (!$FailOnContentRegression -or (@($allRows | Where-Object { $_.status -ne "pass" }).Count -eq 0))) { "pass" } else { "fail" }
@@ -448,7 +478,7 @@ $summary = [ordered]@{
     cases = $cases
     variants = @($variantsByKey.Values)
     failures = $runFailures
-    summary_by_variant = @($variantSummaries | Sort-Object failed_cases, first_partial_avg_ms, processing_rtf_avg)
+    summary_by_variant = @($variantSummaries | Sort-Object failed_cases, first_partial_after_speech_avg_ms, processing_rtf_avg)
 }
 $summary | ConvertTo-Json -Depth 10 | Set-Content -Path $summaryJson -Encoding UTF8
 
@@ -464,10 +494,10 @@ $md += "- cases: $($cases.Count)"
 $md += "- variants: $($variantsByKey.Count)"
 $md += "- repeats: $Repeats"
 $md += ""
-$md += "| variant | failed | first avg | first p50 | first p95 | proc rtf | proc avg | proc p95 | proc max | offline avg | punct avg | partial avg | final extra max |"
-$md += "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-foreach ($row in ($variantSummaries | Sort-Object failed_cases, first_partial_avg_ms, processing_rtf_avg)) {
-    $md += "| $($row.variant_id) | $($row.failed_cases)/$($row.cases) | $($row.first_partial_avg_ms) | $($row.first_partial_p50_ms) | $($row.first_partial_p95_ms) | $($row.processing_rtf_avg) | $($row.processing_wall_avg_ms) | $($row.processing_wall_p95_ms) | $($row.processing_wall_max_ms) | $($row.offline_final_avg_ms) | $($row.punctuation_avg_ms) | $($row.partial_updates_avg) | $($row.final_extra_chars_max) |"
+$md += "| variant | failed | speech->first avg | speech->first p50 | speech->first p95 | audio->first avg | audio->first p95 | proc lag avg | proc lag p95 | proc rtf | proc avg | proc p95 | offline avg | punct avg | partial avg | final extra max |"
+$md += "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+foreach ($row in ($variantSummaries | Sort-Object failed_cases, first_partial_after_speech_avg_ms, processing_rtf_avg)) {
+    $md += "| $($row.variant_id) | $($row.failed_cases)/$($row.cases) | $($row.first_partial_after_speech_avg_ms) | $($row.first_partial_after_speech_p50_ms) | $($row.first_partial_after_speech_p95_ms) | $($row.first_partial_avg_ms) | $($row.first_partial_p95_ms) | $($row.first_partial_processing_lag_avg_ms) | $($row.first_partial_processing_lag_p95_ms) | $($row.processing_rtf_avg) | $($row.processing_wall_avg_ms) | $($row.processing_wall_p95_ms) | $($row.offline_final_avg_ms) | $($row.punctuation_avg_ms) | $($row.partial_updates_avg) | $($row.final_extra_chars_max) |"
 }
 $md += ""
 $md += "Notes:"
