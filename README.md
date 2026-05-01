@@ -671,6 +671,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 - Windows 真机 `python .\scripts\readme_closeout_guard.py .` 已通过
 - 已成功打包 `dist\ainput-1.0.0-preview.24\` 和 `dist\ainput-1.0.0-preview.24.zip`
 
+## 下一轮交接 / Handoff
+
+- 当前进度：`1.0.0-preview.43` 是当前可实测版本，已启动到 Windows 交互桌面；流式提交已改成 HUD final ack 作为最终真相源，HUD 显示、output commit、目标框读回必须一致。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.43\ainput-desktop.exe`；当前运行进程曾确认 PID `4412`。
+- 下一轮优先看：`specs\streaming-hud-truth-source-v11\RESULTS.md`、根 `TASKLIST.md` Round 26、`apps\ainput-desktop\src\worker.rs`、`apps\ainput-desktop\src\overlay.rs`、`crates\ainput-output\src\lib.rs`。
+- 未完成事项：真正的 AI 语义改写还没有接入；基础流式/HUD/上屏稳定后，下一轮再按新 spec 做 HUD 内完成改写、再上屏。
+- 已知风险：不要改坏非流式 `Alt+Z`；不要把流式 `Ctrl` 从“只监听不拦截”改回吞键；不要把 `preview.42` 当成可交付版本；不要让 `ainput-output` 在 HUD ack 后再改写文本。
+- 推荐下一步：先复跑 `scripts\run-startup-idle-acceptance.ps1`、`scripts\run-streaming-live-e2e.ps1 -Synthetic`、`scripts\run-streaming-live-e2e.ps1 -Wav`，确认当前基线仍过，再开始 AI rewrite 或延迟优化。
+- 回滚点：当前收口 commit `5b4976a` 对应 `preview.43`；如果后续调试出问题，先退回 `dist\ainput-1.0.0-preview.43\` 验证基线。
+
 ## 当前边界
 
 - 当前默认还是 `CPU` 推理，不走 GPU
