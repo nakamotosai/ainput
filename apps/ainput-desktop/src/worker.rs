@@ -36,7 +36,6 @@ const STREAMING_IDLE_FINALIZE_TAIL_PADDING_MS: u64 = 480;
 const STREAMING_HUD_SOFT_FLUSH_MS: u64 = 360;
 const STREAMING_HUD_SOFT_FLUSH_MIN_VISIBLE_CHARS: usize = 4;
 const STREAMING_HUD_SOFT_FLUSH_TAIL_PADDING_MS: u64 = 240;
-const STREAMING_FINAL_AI_REWRITE_WAIT_MS: u64 = 280;
 const STREAMING_HUD_FINAL_ACK_TIMEOUT_MS: u64 = 650;
 const STREAMING_PREVIEW_SHORTFALL_TOLERANCE_CHARS: usize = 3;
 const STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS: usize = 3;
@@ -143,6 +142,8 @@ struct StreamingCoreSession {
     last_ai_rewrite_input: String,
     last_ai_rewrite_output: String,
     last_ai_rewrite_at: Option<Instant>,
+    ai_rewrite_epoch: u64,
+    ai_rewrite_closed: bool,
     total_decode_steps: usize,
     total_chunks_fed: usize,
     partial_updates: usize,
@@ -306,6 +307,8 @@ impl StreamingCoreSession {
             last_ai_rewrite_input: String::new(),
             last_ai_rewrite_output: String::new(),
             last_ai_rewrite_at: None,
+            ai_rewrite_epoch: 0,
+            ai_rewrite_closed: false,
             total_decode_steps: 0,
             total_chunks_fed: 0,
             partial_updates: 0,
@@ -836,14 +839,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                         }
 
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFlushing));
-                        if let Err(error) =
-                            drain_final_streaming_ai_rewrite(&runtime, &mut session, &proxy)
-                        {
-                            tracing::warn!(
-                                error = %error,
-                                "streaming final AI rewrite drain failed; continue with final ASR result"
-                            );
-                        }
+                        cancel_streaming_ai_rewrite(&mut session, "hotkey_release");
                         let prepared_commit = prepare_final_streaming_commit(
                             &recognizer,
                             final_repair_recognizer.as_ref(),
@@ -2309,6 +2305,7 @@ struct StreamingAiRewriteCandidate {
     frozen_prefix: String,
     current_tail: String,
     revision: u64,
+    epoch: u64,
 }
 
 #[derive(Debug)]
@@ -2324,6 +2321,7 @@ struct StreamingAiRewriteDisplayUpdate {
     request_key: String,
     display_text: String,
     revision: u64,
+    accepted_stale: bool,
 }
 
 fn prepare_final_streaming_commit(
@@ -3067,15 +3065,19 @@ fn maybe_apply_streaming_ai_rewrite(
     session: &mut StreamingCoreSession,
     selected_preview_text: &str,
 ) -> Result<String> {
+    if session.ai_rewrite_closed {
+        return Ok(selected_preview_text.trim().to_string());
+    }
     let Some(ai_rewriter) = runtime.ai_rewriter.as_ref() else {
         tracing::debug!("streaming AI rewrite skipped because client is unavailable");
         return Ok(selected_preview_text.trim().to_string());
     };
     let config = &runtime.config.voice.streaming.ai_rewrite;
-    if let Some(update) = poll_streaming_ai_rewrite_result(session, config) {
+    if let Some(update) = poll_streaming_ai_rewrite_result(session, config, selected_preview_text) {
         tracing::info!(
             request_key = %short_log_text(&update.request_key, 120),
             revision = update.revision,
+            accepted_stale = update.accepted_stale,
             display_text = %short_log_text(&update.display_text, 120),
             "streaming AI rewrite result adopted into current preview"
         );
@@ -3093,6 +3095,7 @@ fn maybe_apply_streaming_ai_rewrite(
         selected_preview_text,
         effective_min_visible_chars,
         session.state.revision,
+        session.ai_rewrite_epoch,
     ) else {
         let (_, current_tail) = split_frozen_prefix(trimmed_preview);
         tracing::info!(
@@ -3207,6 +3210,7 @@ fn spawn_streaming_ai_rewrite_request(
 fn poll_streaming_ai_rewrite_result(
     session: &mut StreamingCoreSession,
     config: &ainput_shell::StreamingAiRewriteConfig,
+    current_display_text: &str,
 ) -> Option<StreamingAiRewriteDisplayUpdate> {
     let Some(result_rx) = session.ai_rewrite_result_rx.take() else {
         return None;
@@ -3217,12 +3221,34 @@ fn poll_streaming_ai_rewrite_result(
             session.ai_rewrite_inflight_input.clear();
             session.last_ai_rewrite_output.clear();
 
-            if outcome.candidate.revision != session.state.revision {
+            if !is_ai_rewrite_outcome_current(
+                session.ai_rewrite_closed,
+                session.ai_rewrite_epoch,
+                outcome.candidate.epoch,
+            ) {
+                tracing::info!(
+                    request_key = %short_log_text(&outcome.request_key, 120),
+                    request_epoch = outcome.candidate.epoch,
+                    current_epoch = session.ai_rewrite_epoch,
+                    closed = session.ai_rewrite_closed,
+                    "streaming AI rewrite result dropped because session is closed or epoch moved on"
+                );
+                return None;
+            }
+
+            let accepted_stale = outcome.candidate.revision != session.state.revision;
+            if accepted_stale
+                && !ai_rewrite_candidate_still_matches_current_display(
+                    current_display_text,
+                    &outcome.candidate,
+                )
+            {
                 tracing::info!(
                     request_key = %short_log_text(&outcome.request_key, 120),
                     request_revision = outcome.candidate.revision,
                     current_revision = session.state.revision,
-                    "streaming AI rewrite result dropped because state revision moved on"
+                    current_display = %short_log_text(current_display_text, 120),
+                    "streaming AI rewrite stale result dropped because current HUD tail diverged"
                 );
                 return None;
             }
@@ -3252,20 +3278,24 @@ fn poll_streaming_ai_rewrite_result(
                 effective_ai_rewrite_min_visible_chars(config.min_visible_chars),
                 config.max_output_chars,
             ) {
+                let display_text = merge_ai_rewrite_tail_into_current_display(
+                    current_display_text,
+                    &outcome.candidate,
+                    &rewritten_tail,
+                )?;
                 tracing::info!(
                     request_key = %short_log_text(&session.last_ai_rewrite_input, 120),
                     raw_tail = %short_log_text(&raw_tail, 120),
                     rewritten_tail = %short_log_text(&rewritten_tail, 120),
+                    accepted_stale,
                     "streaming AI rewrite result adopted"
                 );
                 session.last_ai_rewrite_output = rewritten_tail;
                 return Some(StreamingAiRewriteDisplayUpdate {
                     request_key: session.last_ai_rewrite_input.clone(),
                     revision: outcome.candidate.revision,
-                    display_text: format!(
-                        "{}{}",
-                        outcome.candidate.frozen_prefix, session.last_ai_rewrite_output
-                    ),
+                    display_text,
+                    accepted_stale,
                 });
             } else {
                 tracing::info!(
@@ -3288,94 +3318,20 @@ fn poll_streaming_ai_rewrite_result(
     }
 }
 
-fn drain_final_streaming_ai_rewrite(
-    runtime: &AppRuntime,
-    session: &mut StreamingCoreSession,
-    proxy: &EventLoopProxy<AppEvent>,
-) -> Result<()> {
-    let current_display = effective_streaming_display_text(session);
-    if current_display.trim().is_empty() {
-        return Ok(());
-    }
-
+fn cancel_streaming_ai_rewrite(session: &mut StreamingCoreSession, reason: &'static str) {
+    let had_pending =
+        session.ai_rewrite_result_rx.is_some() || !session.ai_rewrite_inflight_input.is_empty();
+    session.ai_rewrite_epoch = session.ai_rewrite_epoch.saturating_add(1);
+    session.ai_rewrite_closed = true;
+    session.ai_rewrite_result_rx = None;
+    session.ai_rewrite_inflight_input.clear();
     session.last_ai_rewrite_at = None;
-    let preview_after_cached_rewrite =
-        maybe_apply_streaming_ai_rewrite(runtime, session, &current_display)?;
-    if preview_after_cached_rewrite != current_display {
-        emit_streaming_partial_override(
-            session,
-            &current_display,
-            &preview_after_cached_rewrite,
-            "ai_rewrite_cached",
-            proxy,
-            streaming_stability_policy(&runtime.config.voice.streaming.stability),
-        );
-    }
-
-    let wait_started_at = Instant::now();
-    let wait_budget = Duration::from_millis(STREAMING_FINAL_AI_REWRITE_WAIT_MS);
-    let config = &runtime.config.voice.streaming.ai_rewrite;
-    let mut received_result = false;
-
-    while wait_started_at.elapsed() < wait_budget {
-        if apply_ready_streaming_ai_rewrite_result(
-            session,
-            config,
-            proxy,
-            streaming_stability_policy(&runtime.config.voice.streaming.stability),
-        ) {
-            received_result = true;
-            break;
-        }
-        if session.ai_rewrite_result_rx.is_none() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(STREAMING_RELEASE_POLL_INTERVAL_MS));
-    }
-
-    if !received_result {
-        received_result = apply_ready_streaming_ai_rewrite_result(
-            session,
-            config,
-            proxy,
-            streaming_stability_policy(&runtime.config.voice.streaming.stability),
-        );
-    }
-
     tracing::info!(
-        waited_ms = wait_started_at.elapsed().as_millis(),
-        received_result,
-        pending_after_wait = session.ai_rewrite_result_rx.is_some(),
-        "streaming final AI rewrite wait finished"
+        reason,
+        had_pending,
+        ai_rewrite_epoch = session.ai_rewrite_epoch,
+        "streaming AI rewrite cancelled"
     );
-
-    Ok(())
-}
-
-fn apply_ready_streaming_ai_rewrite_result(
-    session: &mut StreamingCoreSession,
-    config: &ainput_shell::StreamingAiRewriteConfig,
-    proxy: &EventLoopProxy<AppEvent>,
-    stability_policy: StreamingStabilityPolicy,
-) -> bool {
-    let Some(update) = poll_streaming_ai_rewrite_result(session, config) else {
-        return false;
-    };
-
-    emit_streaming_partial_override(
-        session,
-        &update.display_text,
-        &update.display_text,
-        "ai_rewrite_async",
-        proxy,
-        stability_policy,
-    );
-    tracing::info!(
-        request_key = %short_log_text(&update.request_key, 120),
-        display_text = %short_log_text(&update.display_text, 120),
-        "streaming AI rewrite result synced into HUD before final commit"
-    );
-    true
 }
 
 fn request_streaming_final_hud_commit_ack(
@@ -3417,32 +3373,6 @@ fn request_streaming_final_hud_commit_ack(
     }
 
     Ok(ack)
-}
-
-fn emit_streaming_partial_override(
-    session: &mut StreamingCoreSession,
-    raw_text: &str,
-    display_text: &str,
-    source: &'static str,
-    proxy: &EventLoopProxy<AppEvent>,
-    stability_policy: StreamingStabilityPolicy,
-) {
-    let Some(update) = apply_streaming_partial_update(
-        session,
-        raw_text,
-        display_text,
-        display_text,
-        source,
-        None,
-        stability_policy,
-    ) else {
-        return;
-    };
-
-    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
-        raw_text: update.raw_text,
-        prepared_text: update.display_text,
-    }));
 }
 
 fn apply_streaming_partial_update(
@@ -3501,6 +3431,7 @@ fn build_streaming_ai_rewrite_candidate(
     display_text: &str,
     min_visible_chars: usize,
     revision: u64,
+    epoch: u64,
 ) -> Option<StreamingAiRewriteCandidate> {
     let trimmed = display_text.trim();
     if trimmed.is_empty() {
@@ -3516,11 +3447,76 @@ fn build_streaming_ai_rewrite_candidate(
         frozen_prefix,
         current_tail: current_tail.trim().to_string(),
         revision,
+        epoch,
     })
 }
 
 fn effective_ai_rewrite_min_visible_chars(configured_min_visible_chars: usize) -> usize {
     configured_min_visible_chars.clamp(2, 48)
+}
+
+fn ai_rewrite_candidate_still_matches_current_display(
+    current_display_text: &str,
+    candidate: &StreamingAiRewriteCandidate,
+) -> bool {
+    current_ai_rewrite_tail(current_display_text, candidate).is_some()
+}
+
+fn is_ai_rewrite_outcome_current(closed: bool, current_epoch: u64, candidate_epoch: u64) -> bool {
+    !closed && current_epoch == candidate_epoch
+}
+
+fn merge_ai_rewrite_tail_into_current_display(
+    current_display_text: &str,
+    candidate: &StreamingAiRewriteCandidate,
+    rewritten_tail: &str,
+) -> Option<String> {
+    let current_tail = current_ai_rewrite_tail(current_display_text, candidate)?;
+    let suffix = current_tail
+        .strip_prefix(candidate.current_tail.trim())
+        .unwrap_or_default();
+    Some(format!(
+        "{}{}{}",
+        candidate.frozen_prefix,
+        rewritten_tail.trim(),
+        suffix
+    ))
+}
+
+fn current_ai_rewrite_tail(
+    current_display_text: &str,
+    candidate: &StreamingAiRewriteCandidate,
+) -> Option<String> {
+    let current_display = current_display_text.trim();
+    let frozen_prefix = candidate.frozen_prefix.trim();
+    let current_tail = if frozen_prefix.is_empty() {
+        current_display.to_string()
+    } else {
+        current_display
+            .strip_prefix(frozen_prefix)?
+            .trim_start()
+            .to_string()
+    };
+    if current_tail.is_empty() {
+        return None;
+    }
+
+    let original_tail = candidate.current_tail.trim();
+    if current_tail == original_tail
+        || current_tail.starts_with(original_tail)
+        || original_tail.starts_with(&current_tail)
+    {
+        return Some(current_tail);
+    }
+
+    let common_prefix = longest_common_prefix_chars(&current_tail, original_tail);
+    let shorter =
+        visible_text_char_count(&current_tail).min(visible_text_char_count(original_tail));
+    if shorter >= 6 && common_prefix + 2 >= shorter {
+        return Some(current_tail);
+    }
+
+    None
 }
 
 fn sanitize_ai_rewrite_output(
@@ -3581,6 +3577,8 @@ fn short_log_text(text: &str, max_chars: usize) -> String {
 }
 
 fn reset_streaming_ai_rewrite_cache(session: &mut StreamingCoreSession) {
+    session.ai_rewrite_epoch = session.ai_rewrite_epoch.saturating_add(1);
+    session.ai_rewrite_closed = false;
     session.ai_rewrite_result_rx = None;
     session.ai_rewrite_inflight_input.clear();
     session.last_ai_rewrite_input.clear();
@@ -5184,9 +5182,11 @@ mod tests {
         STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT, StreamingCommitSource,
         StreamingOfflineFinalScope, StreamingResampler, analyze_recent_audio_activity,
         append_with_suffix_prefix_overlap, apply_streaming_semantic_commas,
-        build_streaming_ai_rewrite_candidate, dedupe_streaming_punctuation,
-        effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
-        estimate_speech_start_ms, finalize_streaming_commit_text, merge_rolled_over_prefix,
+        build_streaming_ai_rewrite_candidate, current_ai_rewrite_tail,
+        dedupe_streaming_punctuation, effective_ai_rewrite_min_visible_chars,
+        ensure_terminal_sentence_boundary, estimate_speech_start_ms,
+        finalize_streaming_commit_text, is_ai_rewrite_outcome_current,
+        merge_ai_rewrite_tail_into_current_display, merge_rolled_over_prefix,
         merge_streaming_offline_tail_repair, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
         resolve_streaming_rollover_commit_text, sanitize_ai_rewrite_output,
@@ -5633,11 +5633,58 @@ mod tests {
     #[test]
     fn ai_rewrite_candidate_only_targets_latest_tail() {
         let candidate =
-            build_streaming_ai_rewrite_candidate("第一句已经稳定。第二句先是错字", 2, 7)
+            build_streaming_ai_rewrite_candidate("第一句已经稳定。第二句先是错字", 2, 7, 3)
                 .expect("candidate");
         assert_eq!(candidate.frozen_prefix, "第一句已经稳定。");
         assert_eq!(candidate.current_tail, "第二句先是错字");
         assert_eq!(candidate.revision, 7);
+        assert_eq!(candidate.epoch, 3);
+    }
+
+    #[test]
+    fn ai_rewrite_accepts_stale_compatible_tail_and_preserves_new_suffix() {
+        let candidate =
+            build_streaming_ai_rewrite_candidate("第一句已经稳定。第二句先是错字", 2, 7, 3)
+                .expect("candidate");
+        assert_eq!(
+            current_ai_rewrite_tail("第一句已经稳定。第二句先是错字继续", &candidate).as_deref(),
+            Some("第二句先是错字继续")
+        );
+        assert_eq!(
+            merge_ai_rewrite_tail_into_current_display(
+                "第一句已经稳定。第二句先是错字继续",
+                &candidate,
+                "第二句现在是正确的"
+            )
+            .as_deref(),
+            Some("第一句已经稳定。第二句现在是正确的继续")
+        );
+    }
+
+    #[test]
+    fn ai_rewrite_rejects_stale_incompatible_tail() {
+        let candidate =
+            build_streaming_ai_rewrite_candidate("第一句已经稳定。第二句先是错字", 2, 7, 3)
+                .expect("candidate");
+        assert_eq!(
+            current_ai_rewrite_tail("第一句已经稳定。完全换了一个话题", &candidate),
+            None
+        );
+        assert_eq!(
+            merge_ai_rewrite_tail_into_current_display(
+                "第一句已经稳定。完全换了一个话题",
+                &candidate,
+                "第二句现在是正确的"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ai_rewrite_release_epoch_drops_late_results() {
+        assert!(is_ai_rewrite_outcome_current(false, 3, 3));
+        assert!(!is_ai_rewrite_outcome_current(true, 3, 3));
+        assert!(!is_ai_rewrite_outcome_current(false, 4, 3));
     }
 
     #[test]
@@ -5666,6 +5713,20 @@ mod tests {
                 20
             ),
             Some("第二句已经修正".to_string())
+        );
+    }
+
+    #[test]
+    fn ai_rewrite_keeps_true_bilingual_tail() {
+        assert_eq!(
+            sanitize_ai_rewrite_output(
+                "",
+                "这个功能支持 Windows 版本",
+                "这个功能支持 Windows 版本。",
+                2,
+                64
+            ),
+            Some("这个功能支持 Windows 版本。".to_string())
         );
     }
 

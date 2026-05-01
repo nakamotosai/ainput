@@ -5,6 +5,33 @@
 
 ---
 
+## Round 29：流式 AI HUD 尾巴改写 v16
+
+- [x] 新增 Spec：`specs/streaming-ai-rewrite-v16/`
+- [x] 确认 vps-jp `cliproxyapi` 8317 生产配置包含 NVIDIA provider 和 `qwen/qwen3.5-122b-a10b`
+- [x] Windows User 环境变量 `AINPUT_CLIPROXYAPI_8317_KEY` 已设置；key 不写入 TOML / README / git
+- [x] 默认 AI rewrite 配置指向 `http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions`
+- [x] AI client 改为 JSON tail contract：优先解析 `{"tail":"..."}`
+- [x] 流式运行态增加 AI epoch / closed 防守；松开 `Ctrl` 立即取消 AI 改写
+- [x] 兼容迟到结果可合并当前 HUD 尾巴；不兼容或 release 后迟到结果丢弃
+- [x] 打包新 preview：`dist\ainput-1.0.0-preview.50`
+- [x] 最新版本启动到用户交互桌面：`preview.50` PID `64444`
+
+完成判定：
+
+- [x] `cargo fmt` / `cargo fmt --check` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] `cargo test -p ainput-desktop ai_rewrite -- --nocapture` 通过，12/12 pass
+- [x] `cargo test -p ainput-desktop streaming -- --nocapture` 通过，32/32 pass
+- [x] `cargo test -p ainput-desktop hotkey -- --nocapture` 通过，7/7 pass
+- [x] `cargo test -p ainput-rewrite -- --nocapture` 通过，16/16 pass
+- [x] `cargo test -p ainput-shell streaming_ai_rewrite -- --nocapture` 通过，2/2 pass
+- [x] 远端模型实测通过：`test-ai-rewrite "我觉的这个工能不太队"` 返回 `我觉得这个功能不太对`
+- [x] `scripts\run-streaming-full-audit.ps1 -Version 1.0.0-preview.50 -LatencyRepeats 1 -LiveCaseLimit 3` 通过，P0=0/P1=0/P2=0，报告：`tmp\streaming-full-audit\20260502-013018-999\full-audit-report.json`
+- [x] README / v16 RESULTS 已回写
+
+---
+
 ## Round 28：流式 offline final 乱码尾巴修复
 
 - [x] 新增 Spec：`specs/streaming-offline-final-garbled-tail-v15/`

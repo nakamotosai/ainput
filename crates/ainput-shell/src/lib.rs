@@ -279,15 +279,15 @@ impl Default for StreamingVoiceConfig {
 impl Default for StreamingAiRewriteConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            endpoint_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
-            model: "Qwen3-0.6B".to_string(),
-            api_key_env: String::new(),
-            timeout_ms: 260,
-            debounce_ms: 260,
-            min_visible_chars: 8,
-            max_context_chars: 80,
-            max_output_chars: 96,
+            enabled: true,
+            endpoint_url: "http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions".to_string(),
+            model: "qwen/qwen3.5-122b-a10b".to_string(),
+            api_key_env: "AINPUT_CLIPROXYAPI_8317_KEY".to_string(),
+            timeout_ms: 1200,
+            debounce_ms: 220,
+            min_visible_chars: 6,
+            max_context_chars: 160,
+            max_output_chars: 128,
         }
     }
 }
@@ -1029,19 +1029,19 @@ require_hud_flush_before_commit = {streaming_commit_require_hud_flush_before_com
 
 [voice.streaming.ai_rewrite]
 # 是否启用实验性 AI 尾巴改写。
-# 默认关闭，不属于默认热路径。
-# 只会改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
+# 按住 Ctrl 时可逐步改写 HUD 当前尾巴；松开后立即停止参与本轮提交。
+# 只允许改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
 enabled = {streaming_ai_rewrite_enabled}
 
 # 可选：OpenAI 兼容改写服务地址。
-# 默认占位值是本地地址；只有手动打开 enabled 才会使用。
+# 默认走 vps-jp 上的 cliproxyapi 8317。
 endpoint_url = "{streaming_ai_rewrite_endpoint_url}"
 
 # 改写模型名称。
 model = "{streaming_ai_rewrite_model}"
 
 # 可选：从哪个环境变量读取 API Key。
-# 纯本地服务通常留空；云端实验时再配置。
+# API key 只放 Windows 用户环境变量，不写入 TOML。
 api_key_env = "{streaming_ai_rewrite_api_key_env}"
 
 # 单次 AI 改写超时（毫秒）。
@@ -1611,17 +1611,25 @@ text_color = "#111111"
         assert!(rendered.contains("[voice.streaming.stability]"));
         assert!(rendered.contains("min_agreement = 2"));
         assert!(rendered.contains("[voice.streaming.ai_rewrite]"));
-        assert!(rendered.contains("endpoint_url = \"http://127.0.0.1:8080/v1/chat/completions\""));
-        assert!(rendered.contains("model = \"Qwen3-0.6B\""));
+        assert!(rendered.contains(
+            "endpoint_url = \"http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions\""
+        ));
+        assert!(rendered.contains("model = \"qwen/qwen3.5-122b-a10b\""));
     }
 
     #[test]
-    fn streaming_ai_rewrite_defaults_are_disabled_but_present() {
+    fn streaming_ai_rewrite_defaults_target_cliproxyapi_but_stay_fallback_safe() {
         let config = StreamingAiRewriteConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.timeout_ms, 260);
-        assert_eq!(config.debounce_ms, 260);
-        assert_eq!(config.max_output_chars, 96);
+        assert!(config.enabled);
+        assert_eq!(
+            config.endpoint_url,
+            "http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions"
+        );
+        assert_eq!(config.model, "qwen/qwen3.5-122b-a10b");
+        assert_eq!(config.api_key_env, "AINPUT_CLIPROXYAPI_8317_KEY");
+        assert_eq!(config.timeout_ms, 1200);
+        assert_eq!(config.debounce_ms, 220);
+        assert_eq!(config.max_output_chars, 128);
     }
 
     fn temp_runtime_paths(label: &str) -> RuntimePaths {

@@ -156,35 +156,35 @@ require_hud_flush_before_commit = true
 
 [voice.streaming.ai_rewrite]
 # 是否启用实验性 AI 尾巴改写。
-# 默认关闭，不属于默认热路径。
+# 按住 Ctrl 时可逐步改写 HUD 当前尾巴；松开后立即停止参与本轮提交。
 # 只允许改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
-enabled = false
+enabled = true
 
 # 可选：OpenAI 兼容改写服务地址。
-# 默认占位值是本地地址；只有手动打开 enabled 才会使用。
-endpoint_url = "http://127.0.0.1:8080/v1/chat/completions"
+# 默认走 vps-jp 上的 cliproxyapi 8317。
+endpoint_url = "http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions"
 
 # 改写模型名称。
-model = "Qwen3-0.6B"
+model = "qwen/qwen3.5-122b-a10b"
 
 # 可选：鉴权环境变量名。
-# 纯本地服务通常留空；云端实验时再配置。
-api_key_env = ""
+# API key 只放 Windows 用户环境变量，不写入 TOML。
+api_key_env = "AINPUT_CLIPROXYAPI_8317_KEY"
 
 # 单次 AI 改写超时（毫秒）。
-timeout_ms = 260
+timeout_ms = 1200
 
 # 两次改写之间的最短间隔（毫秒）。
-debounce_ms = 260
+debounce_ms = 220
 
 # 至少累计多少个可见字，才触发 AI 改写。
-min_visible_chars = 8
+min_visible_chars = 6
 
 # 发送给模型的冻结前缀最大字符数。
-max_context_chars = 80
+max_context_chars = 160
 
 # 允许模型返回的尾巴最大字符数。
-max_output_chars = 96
+max_output_chars = 128
 
 [capture]
 # 是否启用截图主功能。
