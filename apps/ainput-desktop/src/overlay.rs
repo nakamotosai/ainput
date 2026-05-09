@@ -47,7 +47,9 @@ const CLICK_ALPHA_MAX: u8 = 208;
 const CLICK_LIFETIME: Duration = Duration::from_millis(420);
 const CLICK_OUTER_COLOR: COLORREF = COLORREF(0x001A8CFF);
 const CLICK_INNER_COLOR: COLORREF = COLORREF(0x00FFFFFF);
-const HUD_CHAR_STREAM_INTERVAL: Duration = Duration::from_millis(14);
+const HUD_CHAR_STREAM_INTERVAL: Duration = Duration::from_millis(16);
+const HUD_CHAR_STREAM_CATCHUP_TICKS: usize = 8;
+const HUD_CHAR_STREAM_MAX_CHARS_PER_TICK: usize = 8;
 const HUD_LISTENING_PLACEHOLDER: &str = "请说话";
 
 pub struct RecordingOverlay {
@@ -650,7 +652,12 @@ impl RecordingOverlay {
             return;
         }
 
-        self.hud_stream.advance_one_char();
+        let advance_chars = self
+            .hud_stream
+            .pending_char_count()
+            .div_ceil(HUD_CHAR_STREAM_CATCHUP_TICKS)
+            .clamp(1, HUD_CHAR_STREAM_MAX_CHARS_PER_TICK);
+        self.hud_stream.advance_chars(advance_chars);
         let next_display = self.hud_stream.display_message();
         self.hud_window.set_status_text(&next_display, true);
         self.hud_last_char_tick_at = now;
@@ -1310,6 +1317,13 @@ impl HudMicrostreamState {
         self.display_suffix != self.target_suffix
     }
 
+    fn pending_char_count(&self) -> usize {
+        self.target_suffix
+            .chars()
+            .count()
+            .saturating_sub(self.display_suffix.chars().count())
+    }
+
     fn retarget(&mut self, message: &str) -> HudRetargetStats {
         let previous_target_message = self.target_message();
         let previous_target_suffix = self.target_suffix.clone();
@@ -1367,12 +1381,16 @@ impl HudMicrostreamState {
     }
 
     fn advance_one_char(&mut self) {
+        self.advance_chars(1);
+    }
+
+    fn advance_chars(&mut self, char_count: usize) {
         if self.display_suffix == self.target_suffix {
             return;
         }
 
-        let next_char_count =
-            (self.display_suffix.chars().count() + 1).min(self.target_suffix.chars().count());
+        let next_char_count = (self.display_suffix.chars().count() + char_count.max(1))
+            .min(self.target_suffix.chars().count());
         self.display_suffix = take_prefix_chars(&self.target_suffix, next_char_count);
     }
 }
@@ -1496,6 +1514,22 @@ mod tests {
         assert_eq!(state.committed_prefix, "这是第一句。");
         assert_eq!(state.display_message(), "这是第一句。帮我看一下这里有没");
         assert!(state.has_pending_chars());
+    }
+
+    #[test]
+    fn hud_microstream_can_advance_multiple_chars_without_overshooting() {
+        let mut state = HudMicrostreamState::default();
+        let _ = state.retarget("这是一段需要快速吐出来的长句子");
+        assert_eq!(state.display_message(), "");
+        assert_eq!(state.pending_char_count(), 15);
+
+        state.advance_chars(8);
+        assert_eq!(state.display_message(), "这是一段需要快速");
+        assert_eq!(state.pending_char_count(), 7);
+
+        state.advance_chars(99);
+        assert_eq!(state.display_message(), "这是一段需要快速吐出来的长句子");
+        assert!(!state.has_pending_chars());
     }
 
     #[test]

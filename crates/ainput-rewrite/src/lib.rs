@@ -23,6 +23,10 @@ const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
     ("google germany", "Google Gemini"),
 ];
 const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
+    ("千万三ASR", "Qwen3-ASR"),
+    ("千万三asr", "Qwen3-ASR"),
+    ("千问三ASR", "Qwen3-ASR"),
+    ("千问三asr", "Qwen3-ASR"),
     ("证确", "正确"),
     ("土字", "吐字"),
     ("强治", "简直"),
@@ -49,6 +53,7 @@ pub fn normalize_transcription(text: &str) -> String {
     let mut current = collapse_whitespace(text);
     current = collapse_known_duplicates(&current);
     current = cleanup_punctuation_spacing(&current);
+    current = normalize_common_text_rewrites(&current);
     current = normalize_chinese_number_sequences(&current);
     current = merge_spelled_ascii_sequences(&current);
     current = normalize_common_product_names(&current);
@@ -228,6 +233,12 @@ fn should_normalize_chinese_number_segment(
 
     let char_count = segment.chars().count();
     if segment.chars().any(is_chinese_unit_char) {
+        if next.is_some_and(is_ascii_term_char) {
+            return false;
+        }
+        if has_high_unit_bare_digit_tail(segment) {
+            return false;
+        }
         return char_count >= 2;
     }
 
@@ -236,6 +247,20 @@ fn should_normalize_chinese_number_segment(
     }
 
     previous.is_some_and(is_ascii_term_char) && next.is_some_and(is_ascii_term_char)
+}
+
+fn has_high_unit_bare_digit_tail(segment: &str) -> bool {
+    let Some((index, _)) = segment
+        .char_indices()
+        .filter(|(_, ch)| matches!(ch, '万' | '亿'))
+        .last()
+    else {
+        return false;
+    };
+
+    let tail_start = index + '万'.len_utf8();
+    let tail = &segment[tail_start..];
+    !tail.is_empty() && tail.chars().all(is_chinese_digit_char)
 }
 
 fn normalize_chinese_number_segment(segment: &str) -> Option<String> {
@@ -729,6 +754,23 @@ mod tests {
         assert_eq!(normalize_transcription("今年是二零二六年"), "今年是2026年");
         assert_eq!(normalize_transcription("一百二十三个"), "123个");
         assert_eq!(normalize_transcription("g p t 四 o 模式"), "GPT-4o 模式");
+    }
+
+    #[test]
+    fn normalize_transcription_does_not_turn_qwen3_asr_mishear_into_huge_number() {
+        assert_eq!(
+            normalize_transcription("这个千万三ASR模型还是可以的"),
+            "这个Qwen3-ASR模型还是可以的"
+        );
+        assert_eq!(
+            normalize_transcription("这个千问三asr模型速度很快"),
+            "这个Qwen3-ASR模型速度很快"
+        );
+        assert_eq!(
+            normalize_transcription("这个千万三模型还是可以的"),
+            "这个千万三模型还是可以的"
+        );
+        assert_eq!(normalize_transcription("这个一万三预算"), "这个一万三预算");
     }
 
     #[test]

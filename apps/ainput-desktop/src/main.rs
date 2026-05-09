@@ -2190,7 +2190,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.set_tray_status("状态：流式实时识别中");
                     let _ = raw_text;
                     if let Some(message) = Self::streaming_partial_message(&prepared_text) {
-                        self.show_streaming_status_overlay(&message, true, false);
+                        self.show_streaming_status_overlay(&message, true, true);
                     }
                 }
                 WorkerEvent::StreamingFlushing => {

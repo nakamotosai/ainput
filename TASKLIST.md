@@ -5,6 +5,27 @@
 
 ---
 
+## Round 34：preview.59 HUD 视觉流畅度与 10000003 防误伤
+
+- [x] 确认 `10000003ASR` 根因是 `千万三ASR` / `千问三ASR` 被中文数字归一化误处理
+- [x] 增加 `Qwen3-ASR` 常见误听写法的前置归一化
+- [x] 阻止带中文单位且后接 ASCII 技术词的片段进入中文数字归一化
+- [x] 阻止 `万/亿` 后接裸数字尾巴的口语片段被错误算成超大数字
+- [x] 将 HUD partial 从整段替换改为自适应快速微流式显示
+- [x] 增加 HUD 多字符追赶回归测试
+
+完成判定：
+
+- [x] `cargo fmt --check` 通过
+- [x] `cargo test -p ainput-rewrite` 通过：17 passed
+- [x] `cargo test -p ainput-desktop` 通过：108 passed
+- [x] 打包 `dist\ainput-1.0.0-preview.59`
+- [x] Windows 交互桌面运行 preview.59
+- [x] Qwen sidecar `/health` 通过
+- [x] preview.59 包内日志确认 Qwen sidecar worker 以 `chunk_ms=500` 启动
+- [ ] 真实语音日志继续出现多条 `Qwen sidecar partial updated`
+- [ ] HUD partial 视觉不再整段跳变，且不能重新积压到松手才追上
+
 ## Round 33：preview.58 Qwen partial 策略旁路
 
 - [x] 确认 preview.57 live 日志仍然每段话只有 1 条 `Qwen sidecar partial updated`

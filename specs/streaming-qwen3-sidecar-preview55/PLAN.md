@@ -47,3 +47,14 @@
 - [x] Package `1.0.0-preview.58` into a new dist directory and zip.
 - [x] Launch preview.58 in the Windows interactive session.
 - [x] Verify live logs show multiple accepted Qwen partials before release.
+
+## Phase 7: Preview 59 HUD Visual Smoothness Closeout
+
+- [x] Fix `Qwen3-ASR` mishear normalization so `千万三ASR` / `千问三ASR` cannot become `10000003ASR`.
+- [x] Restore HUD partial char streaming with adaptive catch-up instead of full-text jumps.
+- [x] Cap visual catch-up so HUD cannot lag far behind the latest Qwen partial.
+- [x] Add regression tests for both the Qwen3-ASR normalization and HUD multi-char catch-up.
+- [x] Package `1.0.0-preview.59` into a new dist directory and zip.
+- [x] Launch preview.59 in the Windows interactive session.
+- [x] Verify live process version, sidecar health, and Qwen worker startup.
+- [ ] Verify Qwen partial logs and HUD visual behavior with a fresh real voice hold.

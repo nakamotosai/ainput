@@ -1,5 +1,24 @@
 # ainput OPLOG
 
+## 2026-05-10 打包 1.0.0-preview.59：HUD 快速微流式与 Qwen3-ASR 归一化防误伤
+
+- 根因确认：preview.58 已经让 Qwen partial 高频进入 HUD，但 `StreamingPartial` 每次直接整段替换文本，视觉上会像一块一块跳出来，而不是连续吐字。
+- 修复：HUD partial 重新启用 char streaming，但改成自适应追赶；每 16ms 按剩余字符量计算步长，最多 8 字一跳，目标约 8 帧追平当前 partial，避免回到 preview.57 的滞后。
+- 根因确认：`10000003ASR` 来自 `千万三ASR` / `千问三ASR` 被中文数字归一化逻辑当成数字词处理。
+- 修复：先把常见 `Qwen3-ASR` 误听写法归一到 `Qwen3-ASR`，并阻止带中文单位且后接 ASCII 技术词的片段进入中文数字归一化。
+- 追加修复：`千万三模型` / `一万三预算` 这类带 `万/亿` 后接裸数字尾巴的口语片段不再进入中文数字归一化，避免被算成 `10000003` / `10003`。
+- 保持 V19 架构：没有 offline final、没有 HUD/offline merge、没有 release hidden correction；release 只负责 drain tail、finish sidecar、用最终 HUD 文本提交。
+
+验证：
+- `cargo fmt --check` 通过。
+- `cargo test -p ainput-rewrite` 通过：17 passed。
+- `cargo test -p ainput-desktop` 通过：108 passed。
+- 已重打包 `dist\ainput-1.0.0-preview.59\` 与 `dist\ainput-1.0.0-preview.59.zip`。
+- 已启动到 Windows 交互桌面，当前进程路径为 `dist\ainput-1.0.0-preview.59\ainput-desktop.exe`。
+- 进程 FileVersion / ProductVersion 均为 `1.0.0-preview.59`。
+- Qwen sidecar `/health` 返回 `ok=true`、`model=Qwen/Qwen3-ASR-0.6B`。
+- preview.59 包内日志确认 Qwen sidecar worker 启动：`chunk_ms=500`。
+
 ## 2026-05-10 打包 1.0.0-preview.58：Qwen partial 绕开旧稳定策略
 
 - 根因确认：preview.57 已经取消 HUD 逐字 microstream，但 live 日志仍然每段话只出现 1 条 `Qwen sidecar partial updated`；Qwen raw replay 证明 sidecar 每 500ms 都在返回递增文本。
