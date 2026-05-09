@@ -42,6 +42,66 @@ impl ActiveRecording {
         Self::start_with_config(device, config)
     }
 
+    pub fn start_default_input_for_asr(
+        target_sample_rate_hz: i32,
+        target_channels: u16,
+    ) -> Result<Self> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device available"))?;
+        let default_config = device
+            .default_input_config()
+            .context("read default input device config")?;
+        let target_sample_rate = target_sample_rate_hz.max(1) as u32;
+
+        let direct_config = device.supported_input_configs().ok().and_then(|configs| {
+            configs
+                .filter(|config| {
+                    config.channels() == target_channels
+                        && config.min_sample_rate() <= target_sample_rate
+                        && config.max_sample_rate() >= target_sample_rate
+                })
+                .map(|config| config.with_sample_rate(target_sample_rate))
+                .next()
+        });
+
+        if let Some(config) = direct_config {
+            tracing::info!(
+                sample_format = ?config.sample_format(),
+                channels = config.channels(),
+                sample_rate_hz = config.sample_rate(),
+                target_channels,
+                target_sample_rate_hz,
+                direct_asr_format = true,
+                "start microphone recording with direct ASR format"
+            );
+            match Self::start_with_config(device.clone(), config) {
+                Ok(recording) => return Ok(recording),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        target_channels,
+                        target_sample_rate_hz,
+                        "direct ASR microphone format failed; falling back to default input config"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            sample_format = ?default_config.sample_format(),
+            channels = default_config.channels(),
+            sample_rate_hz = default_config.sample_rate(),
+            target_channels,
+            target_sample_rate_hz,
+            direct_asr_format = false,
+            "start microphone recording with device default format; ASR stream will be normalized per chunk"
+        );
+
+        Self::start_with_config(device, default_config)
+    }
+
     fn start_with_config(
         device: cpal::Device,
         supported_config: SupportedStreamConfig,
@@ -79,6 +139,10 @@ impl ActiveRecording {
 
     pub fn sample_rate_hz(&self) -> i32 {
         self.sample_rate_hz
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
     }
 
     pub fn sample_count(&self) -> usize {

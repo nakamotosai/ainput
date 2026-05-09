@@ -719,3 +719,37 @@
 - 目标是把截图进入速度恢复到接近旧版，同时保留暗膜反馈
 - 后续又进一步改成“进程内复用同一个截图窗口”，不再每次截图都创建/销毁全屏窗口
 - 这一步是为了继续压低任务栏右下角通知区域在截图开关瞬间的 Shell 抖动
+## 2026-05-09 preview.52 streaming final inserted-tail overlap fix
+Result:
+- Fixed preview.51 duplicated final commit text from the user case.
+- Root cause: offline final tail corrected a displayed suffix but previous merge treated it as append-only.
+- Packaged preview.52 and launched it in the Windows interactive session, PID 84284.
+Verification:
+- cargo test -p ainput-desktop passed: 103/103.
+- Exact raw capture replayed on preview.52 with duplicate_case=false.
+- Packaged raw corpus passed: 4/4.
+- Startup idle acceptance passed for preview.52.
+
+## 2026-05-09 preview.53 HUD truth single-chain v19
+Result:
+- Replaced the old streaming release path with the V19 HUD truth single-chain design.
+- Removed release-time offline final repair from the default streaming commit path.
+- Final paste now uses the drained HUD truth snapshot exactly once.
+- AI rewrite was moved out of the active streaming commit scope and left for a future spec.
+Verification:
+- cargo test -p ainput-desktop passed: 103/103 at the V19 checkpoint.
+- User preview.51 failure raw replayed without inserted duplicate tail.
+- Packaged preview.53 was built and launched in the Windows interactive session.
+## 2026-05-09 preview.54 punctuation and tray version closeout
+Result:
+- Removed default hard-coded streaming punctuation insertion for connector words and semantic cue words.
+- Sanitized unanchored generated question/exclamation marks so `这个怎么回事啊` does not become `这个怎么？回事啊？`.
+- Added the current package version to the tray tooltip and right-click menu: `当前版本：1.0.0-preview.54`.
+- Updated README handoff and packaged preview.54 as the current stop point.
+Verification:
+- cargo fmt --check passed.
+- cargo test -p ainput-rewrite passed: 16/16.
+- cargo test -p ainput-desktop streaming_punctuation passed: 4/4.
+- cargo test -p ainput-desktop passed: 106/106.
+- scripts\readme_closeout_guard.py passed.
+- Packaged exe file version is 1.0.0-preview.54 and the Windows interactive process is running from preview.54.

@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.50`
+当前预览版本：`1.0.0-preview.54`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -10,18 +10,17 @@
 
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
-- `流式语音识别` 源码主线已切到 V3：在线 partial 进入 `committed / stable / volatile / rewrite candidate` 四层状态，HUD 和最终提交共享同一 revision。
-- `1.0.0-preview.50` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
+- `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
+- `1.0.0-preview.54` 当前流式主模型固定为官方 `sherpa-onnx-streaming-paraformer-bilingual-zh-en`，默认发包只带 `encoder.int8.onnx / decoder.int8.onnx / tokens.txt` 三个核心文件。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
-- 流式模式默认不再用应用层短停顿 endpointing 硬切段；真实前台里短停顿会把半句话冻结，导致 HUD 和上屏文本分叉。
-- 流式模式的 HUD 继续保持“只显示文字本身”的单行面板，但内部恢复 target/display 双缓冲逐字追目标，并保留原有位置、热加载参数和占位符保护。
-- 默认热路径是“本地流式识别 + 本地轻整理 + HUD/最终提交同一状态机”，AI 尾巴改写作为按住 `Ctrl` 期间的非阻塞 sidecar，只允许改当前 HUD 尾巴。
-- AI rewrite 默认启用，固定走 vps-jp `cliproxyapi` 8317 的 NVIDIA `qwen/qwen3.5-122b-a10b`；松开 `Ctrl` 会立刻取消本轮 AI 改写，最终只提交当前 HUD 文本。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.50\` 与 `dist\ainput-1.0.0-preview.50.zip`。
+- 流式模式不再在松手后跑 offline final，不再做 HUD 文本和 offline 尾巴合并，也不再做 release-time final correction。
+- HUD 文本是最终真相源；最终上屏文本必须等于 drain 完成后的 HUD truth snapshot。
+- AI rewrite 不属于 V19：本版流式主链路会绕开/隔离已有改写代码，改写能力移到 Roadmap / Future Work。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.54\` 与 `dist\ainput-1.0.0-preview.54.zip`。
 
-它不做系统级 IME。当前默认热路径仍由本地 ASR/HUD 保底；AI rewrite 是可失败降级的在线尾巴改写链路。当前重点是把四条前台主链路做稳：
+它不做系统级 IME。当前默认热路径由本地 ASR/HUD 单链路负责；AI rewrite 暂不参与 V19 语音提交链路。当前重点是把四条前台主链路做稳：
 
-1. 按住语音热键开始录音，松开后离线识别并把文本送进当前输入区
+1. 按住语音热键开始录音，流式模式松开后继续 drain 未完成识别，再把 HUD 最终文本送进当前输入区
 1. 语音支持 `极速语音识别 / 流式语音识别` 双模式，直接从托盘一级菜单切换
 2. 按截图热键进入冻结框选态，完成后把图片送进剪贴板
 3. 按录屏热键框选区域，实时录下视频和系统音频并导出到桌面
@@ -58,15 +57,15 @@
   - `流式语音识别` 使用本地 `sherpa-onnx-streaming-paraformer-bilingual-zh-en` 作为在线流式识别主模型
   - 流式模式按住热键时显示 HUD 面板
   - 流式模式按住时持续显示流式文字，默认只走本地识别 + 本地轻整理
-  - 流式模式会持续喂入在线音频块，并以 `committed_prefix / stable_tail / volatile_tail / rewrite_candidate` 共享状态驱动 HUD 和最终提交
+  - 流式模式会持续喂入在线音频块，HUD truth state 是最终提交的唯一文本来源
   - 应用层短停顿 endpointing 仍保留为配置项，但默认关闭；流式默认在一次按住说话内保持同一条滚动状态
   - 默认流式块时长已压到 `60ms`，用于缩短 HUD 首字和增量刷新延迟
   - 流式模式的标点主链来自官方 `ct-transformer` 标点模型；模型缺失时只降级为无标点，不再让整个流式功能启动失败
-  - AI rewrite 只允许改“最新尾巴”；请求和响应都带 revision + epoch，兼容的迟到结果可合并，松手后迟到结果会被丢弃，服务不可用时只降级回当前轻整理链路
+  - V19 流式提交链路禁用 AI rewrite 写入；已有改写代码不能改 HUD truth 或最终上屏文本
   - HUD 默认停靠在屏幕正下方、任务栏上方
   - 可从托盘右键菜单直接打开 `HUD 参数文档`
   - `config\hud-overlay.toml` 保存后会自动热加载
-  - 松开热键后会继续收完最后尾音，再做最终解码和最终 HUD flush，随后才提交上屏；HUD 不会在松手瞬间立刻消失
+  - 松开热键后只停止继续收麦克风；HUD 会继续等待队列音频和 ASR 输出 drain，drain 完成后粘贴 HUD 文本一次并关闭
   - 流式模式会异步保存每次按住说话的原始录音到 `logs\streaming-raw-captures\`，自动只保留最近 `20` 组 wav + json
   - 语音热键可配置
   - 自动直贴失败时，可按配置降级到剪贴板
@@ -445,16 +444,45 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.50\`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.54\`
 - 默认启动模式是 `极速语音识别`
-- 当前源码流式主链是：`Paraformer bilingual zh-en + HUD raw-normalized 实时显示 + committed/stable/volatile 状态机 + HUD 双缓冲 + revision/epoch-guarded AI 尾巴改写 sidecar + 松手 final HUD ack + exact delivery 提交`
-- 默认热路径由本地 ASR/HUD 保底；AI rewrite 默认 `enabled = true`，失败会降级为本地轻整理，不阻塞上屏
-- 默认 AI rewrite 端点是 `http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions`
-- 默认 AI rewrite 模型是 `qwen/qwen3.5-122b-a10b`
-- `preview.50` 已接入按住 `Ctrl` 期间的 HUD 尾巴 AI 改写，并打包到 `dist\ainput-1.0.0-preview.50\` 与 `dist\ainput-1.0.0-preview.50.zip`
+- 当前源码流式主链是：`Paraformer bilingual zh-en + ASR-facing mono/16k + HUD truth state + release drain + exact HUD snapshot paste`
+- 默认热路径由本地 ASR/HUD 单链路负责；V19 不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本
+- AI rewrite 已从当前版本范围移出；V19 只保证已有改写代码不会改 HUD truth 或最终上屏文本
+- `preview.54` 已按 V20 标点修正 + 托盘版本可见性打包到 `dist\ainput-1.0.0-preview.54\` 与 `dist\ainput-1.0.0-preview.54.zip`
+- `preview.53` 保留为 V19 单链路回滚点：`dist\ainput-1.0.0-preview.53\ainput-desktop.exe`
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
+## Roadmap / Future Work
+
+- AI rewrite 暂停进入 V19，后续另开独立 spec 再做。
+- 后续改写只能选择明确产品模式：手动命令改写、用户明确接受的 post-drain cleanup、或 WebSocket/WebRTC 类双向实时改写。
+- 普通 server-output SSE / 一次性 HTTP 请求不能伪装成“一个请求持续吃后续 HUD 文本”；如果要持续接收 HUD 文本，就必须使用真正的双向会话协议。
+- 未来任何 AI rewrite 都不能绕过 HUD truth 规则：上屏文本必须来自用户可见的最终 HUD 文本。
+
 ## 本轮收口验证
+
+2026-05-09 preview.54 V20 punctuation + tray version visibility:
+
+- 本轮修正所有默认硬编码标点插入问题，不再因为 `然后 / 现在 / 还是 / 或者 / 比如` 等词强行加逗号，也不再靠 `吗 / 是不是 / 啊 / 呀 / 啦` 这类词表硬猜问号或感叹号。
+- 流式 HUD preview 会剥掉未锚定的模型生成 `？/！`；final 只允许已被源文本锚定的问号保留，未锚定尾部 `？/！` 会降级成句号，避免 `这个怎么？回事啊？` 这种错误上屏。
+- 本地 rewrite helper 不再给流式文本自动补逗号/句末标点，也移除了项目特定的 `简直就是灾难，标点符号` 强制改写。
+- 托盘 tooltip 改为 `ainput 1.0.0-preview.54` 开头；任务栏托盘图标右键菜单第一组新增禁用项 `当前版本：1.0.0-preview.54`，用于直接确认正在运行哪一版。
+- Windows 真机验证已通过：`cargo fmt --check`、`cargo test -p ainput-rewrite` 16/16、`cargo test -p ainput-desktop streaming_punctuation` 4/4、`cargo test -p ainput-desktop` 106/106。
+- Windows 真机打包已通过，产出 `dist\ainput-1.0.0-preview.54\` 与 `dist\ainput-1.0.0-preview.54.zip`；文件版本为 `1.0.0-preview.54`。
+- 已在 Windows console session 3 启动 `dist\ainput-1.0.0-preview.54\ainput-desktop.exe`，PID 89388；打包 exe 中已确认包含 `当前版本：1.0.0-preview.54` 与 `ainput 1.0.0-preview.54` 文案。
+
+2026-05-09 preview.53 V19 HUD truth 单链路：
+
+- 本轮只改流式 V19 主链路；AI rewrite 只进入 Roadmap / Future Work，不作为当前版本功能继续推进。
+- 新增并执行 `specs\streaming-hud-truth-single-chain-v19\`：按下 `Ctrl` 立即打开空白 HUD，按住期间持续 streaming ASR，松开后停麦但 HUD 保持可见，drain 完成后粘贴 HUD truth snapshot 一次并关闭 HUD。
+- 生产路径不再构建/调用 release-time offline final recognizer；最终提交来自 streaming ASR + `StreamingState`，报告字段固定包含 `hud_paste_equal`、`offline_final_invoked=false`、`ai_rewrite_mutation_count`。
+- ASR-facing 音频目标为 mono/16k；优先尝试直接 mono/16k capture，设备不支持时在 ASR 入口前逐块 normalize。
+- Windows 真机 `cargo test -p ainput-desktop` 已通过，103/103 pass。
+- 用户 preview.51 失败 raw：`dist\ainput-1.0.0-preview.51\logs\streaming-raw-captures\streaming-raw-1778293694109.wav` 已用 V19 链路回放通过；无 `案例来实失败` 重复尾巴，`hud_paste_equal=true`，`offline_final_invoked=false`，`ai_rewrite_mutation_count=0`。
+- Windows 真机 raw corpus 已用 `target\debug\ainput-desktop.exe` 和 `dist\ainput-1.0.0-preview.53\ainput-desktop.exe` 各跑通过，`overall_status=pass`，`cases_total=2`。
+- `scripts\run-streaming-latency-benchmark.ps1` 已改成 V19 报表口径：统计 `final_commit_ms / hud_paste_equal / offline_final_invoked / ai_rewrite_mutation_count`，并在 offline final 被调用、HUD/paste 不一致或 AI 改写发生 mutation 时 fail。
+- Windows 真机打包已通过，产出 `dist\ainput-1.0.0-preview.53\` 与 `dist\ainput-1.0.0-preview.53.zip`。
 
 2026-05-02 preview.50 流式 AI HUD 尾巴改写：
 
@@ -754,20 +782,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 下一轮交接 / Handoff
 
-- 当前进度：`1.0.0-preview.50` 是当前可实测版本；流式提交仍以 HUD final ack 作为最终真相源，v16 已接入按住 `Ctrl` 期间的 AI HUD 尾巴改写。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.50\ainput-desktop.exe`；本轮收口时已启动到 Windows 交互桌面，PID `64444`。
-- 下一轮优先看：`specs\streaming-ai-rewrite-v16\RESULTS.md`、`specs\streaming-ai-rewrite-v16\SPEC.md`、`apps\ainput-desktop\src\ai_rewrite.rs`、`apps\ainput-desktop\src\worker.rs`、`config\ainput.toml`、`scripts\run-streaming-full-audit.ps1`。
-- 未完成事项：需要用户真实麦克风体感回报 AI 改写质量；当前门禁已覆盖模型调用、HUD 尾巴 merge、release cancellation、full audit，但没有人工语义满意度打分。
-- 已知风险：不要改坏非流式 `Alt+Z`；不要把流式 `Ctrl` 从“只监听不拦截 + 延迟判定 + 组合键取消”改回吞键或立即触发；不要让 AI 在松手后重新改写最终文本；不要把 API key 写入 TOML、README、日志或 git。
-- 推荐下一步：先复跑 `scripts\run-streaming-full-audit.ps1 -Version 1.0.0-preview.50 -LatencyRepeats 1 -LiveCaseLimit 3`，确认当前基线仍过；若用户报 HUD 与上屏不一致，先查 `hud_final_ack / resolved_commit_text / ai_rewrite_epoch / streaming AI rewrite cancelled` 相关日志。
-- 回滚点：上一稳定包是 `dist\ainput-1.0.0-preview.49\`；当前稳定包是 `dist\ainput-1.0.0-preview.50\`。
-
+- 当前进度：本阶段暂时收口在 `1.0.0-preview.54`；用户已明确“暂时就做到这了”。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.54\ainput-desktop.exe`；已启动到 Windows 交互桌面 session 3。
+- 当前包：`dist\ainput-1.0.0-preview.54\` 与 `dist\ainput-1.0.0-preview.54.zip`；`preview.53` 保留为 V19 单链路回滚点。
+- 当前主链：流式模式按下热键打开空白 HUD，按住期间 streaming ASR 更新 HUD，松手后停麦但继续 drain，drain 完成后粘贴 HUD truth snapshot 一次并关闭 HUD。
+- 已移除的旧模式：不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本。
+- 本轮最后修复：V20 标点策略改为保守清洗，不再按连接词硬塞逗号，也不再靠词表硬猜 `？/！`；托盘右键菜单显示 `当前版本：1.0.0-preview.54`。
+- 已验证：`cargo fmt --check`、`cargo test -p ainput-rewrite` 16/16、`cargo test -p ainput-desktop streaming_punctuation` 4/4、`cargo test -p ainput-desktop` 106/106、`scripts\readme_closeout_guard.py` 均通过；打包 exe 文件版本为 `1.0.0-preview.54`。
+- 下一轮若继续：优先从用户真实麦克风体感反馈出发；若出现 HUD 与上屏不一致、重复尾巴、硬插标点，先查 `apps\ainput-desktop\src\worker.rs` 的 HUD truth/final commit 路径和 `crates\ainput-rewrite\src\lib.rs` 的流式 rewrite helper，不要恢复旧 offline final 合并链。
+- AI rewrite 状态：暂不属于当前版本；后续要另开独立 spec，且不能绕过 HUD truth 规则。
 ## 当前边界
 
 - 当前默认还是 `CPU` 推理，不走 GPU
-- 默认 ASR/HUD 热路径不依赖外网；AI rewrite 依赖 vps-jp 8317，但服务不可用时会降级回无 AI 改写
-- AI 语义改写已经接入为“按住 `Ctrl` 期间的 HUD 尾巴改写”，不是松手后的整段重写
-- `HUD 即最终结果` 已经做成同一 revision 状态机；短停顿 endpoint 默认关闭
+- 默认 ASR/HUD 热路径不依赖外网；AI rewrite 暂不属于当前版本，后续另开独立 spec
+- AI 语义改写已从当前版本范围移出；当前上屏文本只来自 HUD truth snapshot
+- `HUD 即最终结果` 是当前约束；短停顿 endpoint 和 release-time offline final 不能重新接回默认提交链
 - `scripts\run-streaming-live-e2e.ps1 -InteractiveTask` 是当前无人值守前台 synthetic 验收入口
 - `scripts\live-streaming-acceptance.ps1` 仍然只用于人工真实麦克风热键验收
 - 语音热键与截图热键已经可配置，但当前仍以编辑 `ainput.toml` 为主

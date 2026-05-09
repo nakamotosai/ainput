@@ -1,0 +1,3 @@
+- [x] T001 Split recoverable microphone-start failures from fatal worker errors.
+- [x] T002 Apply recoverable handling to fast and streaming microphone-start failures.
+- [ ] T003 Verify on Windows, package a new preview, and start it.

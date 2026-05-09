@@ -412,8 +412,10 @@ foreach ($variantId in $variantsByKey.Keys) {
                 processing_realtime_factor = $caseReport.processing_realtime_factor
                 final_decode_elapsed_ms = $caseReport.final_decode_elapsed_ms
                 online_final_elapsed_ms = $caseReport.online_final_elapsed_ms
-                offline_final_elapsed_ms = $caseReport.offline_final_elapsed_ms
-                offline_final_timed_out = $caseReport.offline_final_timed_out
+                final_commit_ms = Get-OptionalProperty $caseReport "final_commit_ms"
+                hud_paste_equal = Get-OptionalProperty $caseReport "hud_paste_equal"
+                offline_final_invoked = Get-OptionalProperty $caseReport "offline_final_invoked"
+                ai_rewrite_mutation_count = Get-OptionalProperty $caseReport "ai_rewrite_mutation_count"
                 punctuation_elapsed_ms = $caseReport.punctuation_elapsed_ms
                 process_manifest_wall_elapsed_ms = $watch.ElapsedMilliseconds
                 commit_source = $caseReport.commit_source
@@ -452,7 +454,10 @@ foreach ($group in ($allRows | Group-Object variant_id)) {
         processing_wall_p95_ms = Round-Nullable (Get-PercentileNumber $rows.processing_wall_elapsed_ms 95) 1
         processing_wall_max_ms = Round-Nullable (($rows.processing_wall_elapsed_ms | ForEach-Object { [double]$_ } | Measure-Object -Maximum).Maximum) 1
         processing_rtf_avg = Round-Nullable (Get-AverageNumber $rows.processing_realtime_factor) 3
-        offline_final_avg_ms = Round-Nullable (Get-AverageNumber $rows.offline_final_elapsed_ms) 1
+        final_commit_avg_ms = Round-Nullable (Get-AverageNumber $rows.final_commit_ms) 1
+        hud_paste_equal_all = (@($rows | Where-Object { $_.hud_paste_equal -eq $true }).Count -eq $rows.Count)
+        offline_final_invoked_count = @($rows | Where-Object { $_.offline_final_invoked -eq $true }).Count
+        ai_rewrite_mutation_count_sum = (($rows.ai_rewrite_mutation_count | Where-Object { $_ -ne $null } | ForEach-Object { [double]$_ } | Measure-Object -Sum).Sum)
         punctuation_avg_ms = Round-Nullable (Get-AverageNumber $rows.punctuation_elapsed_ms) 1
         partial_updates_avg = Round-Nullable (Get-AverageNumber $rows.partial_updates) 1
         final_extra_chars_max = (($rows.final_extra_content_chars | ForEach-Object { [double]$_ } | Measure-Object -Maximum).Maximum)
@@ -467,7 +472,7 @@ $allRows | Export-Csv -Path $casesCsv -NoTypeInformation -Encoding UTF8
 $variantSummaries | Sort-Object failed_cases, first_partial_after_speech_avg_ms, processing_rtf_avg | Export-Csv -Path $summaryCsv -NoTypeInformation -Encoding UTF8
 
 $summary = [ordered]@{
-    overall_status = if ($runFailures.Count -eq 0 -and (!$FailOnContentRegression -or (@($allRows | Where-Object { $_.status -ne "pass" }).Count -eq 0))) { "pass" } else { "fail" }
+    overall_status = if ($runFailures.Count -eq 0 -and (@($allRows | Where-Object { $_.hud_paste_equal -ne $true }).Count -eq 0) -and (@($allRows | Where-Object { $_.offline_final_invoked -eq $true }).Count -eq 0) -and (@($allRows | Where-Object { $_.ai_rewrite_mutation_count -gt 0 }).Count -eq 0) -and (!$FailOnContentRegression -or (@($allRows | Where-Object { $_.status -ne "pass" }).Count -eq 0))) { "pass" } else { "fail" }
     exe = $ExePath
     exe_last_write_time = $exeInfo.LastWriteTime.ToString("o")
     exe_length = $exeInfo.Length
@@ -494,10 +499,10 @@ $md += "- cases: $($cases.Count)"
 $md += "- variants: $($variantsByKey.Count)"
 $md += "- repeats: $Repeats"
 $md += ""
-$md += "| variant | failed | speech->first avg | speech->first p50 | speech->first p95 | audio->first avg | audio->first p95 | proc lag avg | proc lag p95 | proc rtf | proc avg | proc p95 | offline avg | punct avg | partial avg | final extra max |"
-$md += "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+$md += "| variant | failed | speech->first avg | speech->first p50 | speech->first p95 | audio->first avg | audio->first p95 | proc lag avg | proc lag p95 | proc rtf | proc avg | proc p95 | final commit avg | HUD=paste | offline final calls | AI mutations | punct avg | partial avg | final extra max |"
+$md += "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
 foreach ($row in ($variantSummaries | Sort-Object failed_cases, first_partial_after_speech_avg_ms, processing_rtf_avg)) {
-    $md += "| $($row.variant_id) | $($row.failed_cases)/$($row.cases) | $($row.first_partial_after_speech_avg_ms) | $($row.first_partial_after_speech_p50_ms) | $($row.first_partial_after_speech_p95_ms) | $($row.first_partial_avg_ms) | $($row.first_partial_p95_ms) | $($row.first_partial_processing_lag_avg_ms) | $($row.first_partial_processing_lag_p95_ms) | $($row.processing_rtf_avg) | $($row.processing_wall_avg_ms) | $($row.processing_wall_p95_ms) | $($row.offline_final_avg_ms) | $($row.punctuation_avg_ms) | $($row.partial_updates_avg) | $($row.final_extra_chars_max) |"
+    $md += "| $($row.variant_id) | $($row.failed_cases)/$($row.cases) | $($row.first_partial_after_speech_avg_ms) | $($row.first_partial_after_speech_p50_ms) | $($row.first_partial_after_speech_p95_ms) | $($row.first_partial_avg_ms) | $($row.first_partial_p95_ms) | $($row.first_partial_processing_lag_avg_ms) | $($row.first_partial_processing_lag_p95_ms) | $($row.processing_rtf_avg) | $($row.processing_wall_avg_ms) | $($row.processing_wall_p95_ms) | $($row.final_commit_avg_ms) | $($row.hud_paste_equal_all) | $($row.offline_final_invoked_count) | $($row.ai_rewrite_mutation_count_sum) | $($row.punctuation_avg_ms) | $($row.partial_updates_avg) | $($row.final_extra_chars_max) |"
 }
 $md += ""
 $md += "Notes:"

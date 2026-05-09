@@ -113,7 +113,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("transcribe-streaming-wav") {
-        let runtime = build_runtime(&bootstrap, true)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let wav_path = args.get(2).ok_or_else(|| {
             anyhow!("usage: ainput-desktop transcribe-streaming-wav <path-to-wav>")
         })?;
@@ -182,7 +182,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("probe-streaming-live") {
-        let runtime = build_runtime(&bootstrap, true)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let seconds = args
             .get(2)
             .and_then(|value| value.parse::<u64>().ok())
@@ -194,7 +194,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("replay-streaming-wav") {
-        let runtime = build_runtime(&bootstrap, true)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let wav_path = args.get(2).ok_or_else(|| {
             anyhow!("usage: ainput-desktop replay-streaming-wav <path-to-wav> [expected-text]")
         })?;
@@ -216,7 +216,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("replay-streaming-manifest") {
-        let runtime = build_runtime(&bootstrap, true)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let manifest_path = args.get(2).ok_or_else(|| {
             anyhow!("usage: ainput-desktop replay-streaming-manifest <manifest.json>")
         })?;
@@ -238,7 +238,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("run-streaming-live-e2e-synthetic") {
-        let runtime = build_runtime(&bootstrap, true)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let manifest_path = args
             .get(2)
             .map(PathBuf::from)
@@ -254,7 +254,7 @@ fn try_main() -> Result<()> {
     }
 
     if args.get(1).map(String::as_str) == Some("run-streaming-live-e2e-wav") {
-        let runtime = build_runtime(&bootstrap, true)?;
+        let runtime = build_runtime(&bootstrap, false)?;
         let manifest_path = args
             .get(2)
             .map(PathBuf::from)
@@ -406,10 +406,7 @@ fn append_acceptance_command_event(
 }
 
 fn run_desktop_app(bootstrap: ainput_shell::Bootstrap) -> Result<()> {
-    let runtime = build_runtime(
-        &bootstrap,
-        bootstrap.config.voice.mode == ainput_shell::VoiceMode::Streaming,
-    )?;
+    let runtime = build_runtime(&bootstrap, false)?;
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -969,7 +966,7 @@ impl DesktopApp {
         };
 
         if let Some(tray_icon) = &self.tray_icon {
-            let tooltip = format!("ainput\n{rendered_status}");
+            let tooltip = format!("ainput {}\n{rendered_status}", env!("CARGO_PKG_VERSION"));
             let _ = tray_icon.set_tooltip(Some(tooltip));
         }
 
@@ -1141,6 +1138,17 @@ impl DesktopApp {
             overlay.hide();
         }
         self.set_tray_status(&format!("状态：错误 - {}", shorten(message, 18)));
+    }
+
+    fn handle_recoverable_worker_error(&mut self, message: &str) {
+        self.mode = AppMode::Idle;
+        self.set_tray_visual_state(TrayVisualState::Idle, 0);
+        self.clear_streaming_status_overlay();
+        if let Some(overlay) = &mut self.overlay {
+            overlay.set_level(0.0);
+            overlay.hide();
+        }
+        self.set_tray_status(&format!("状态：录音不可用 - {}", shorten(message, 16)));
     }
 
     fn voice_mode_label(mode: ainput_shell::VoiceMode) -> &'static str {
@@ -1459,6 +1467,12 @@ impl DesktopApp {
 
         let tray_menu = Menu::new();
         let status_item = MenuItem::with_id("status", self.idle_status_text(), false, None);
+        let version_item = MenuItem::with_id(
+            "version",
+            format!("当前版本：{}", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        );
         let voice_mode_fast_item = CheckMenuItem::with_id(
             "voice_mode_fast",
             Self::voice_mode_label(ainput_shell::VoiceMode::Fast),
@@ -1767,6 +1781,7 @@ impl DesktopApp {
         let mode_separator = PredefinedMenuItem::separator();
         let hud_separator = PredefinedMenuItem::separator();
         let _ = tray_menu.append(&status_item);
+        let _ = tray_menu.append(&version_item);
         let _ = tray_menu.append(&separator);
         let _ = tray_menu.append(&voice_mode_fast_item);
         let _ = tray_menu.append(&voice_mode_streaming_item);
@@ -1782,7 +1797,11 @@ impl DesktopApp {
         let _ = tray_menu.append(&exit_item);
 
         let tray_icon = TrayIconBuilder::new()
-            .with_tooltip(format!("ainput\n{}", self.idle_status_text()))
+            .with_tooltip(format!(
+                "ainput {}\n{}",
+                env!("CARGO_PKG_VERSION"),
+                self.idle_status_text()
+            ))
             .with_icon(app_status_icon(&self.runtime, TrayVisualState::Idle, 0))
             .with_menu(Box::new(tray_menu))
             .build()
@@ -2160,7 +2179,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 0);
                     self.set_tray_status(self.streaming_status_text());
-                    self.clear_streaming_status_overlay();
+                    self.show_streaming_status_overlay("", true, false);
                 }
                 WorkerEvent::StreamingPartial {
                     raw_text,
@@ -2215,6 +2234,9 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     } else {
                         self.clear_streaming_status_overlay();
                     }
+                }
+                WorkerEvent::RecoverableError(message) => {
+                    self.handle_recoverable_worker_error(&message);
                 }
                 WorkerEvent::Error(message) => {
                     self.handle_worker_error(&message);

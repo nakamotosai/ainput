@@ -86,6 +86,7 @@ pub(crate) enum WorkerEvent {
     },
     StreamingClipboardFallback(String),
     StreamingFinal(String),
+    RecoverableError(String),
     Error(String),
     Unavailable(String),
 }
@@ -245,6 +246,11 @@ pub(crate) struct StreamingLiveProbeReport {
     final_online_raw_text: String,
     final_offline_raw_text: String,
     final_prepared_candidate: String,
+    hud_truth_text: String,
+    pasted_text: String,
+    hud_paste_equal: bool,
+    offline_final_invoked: bool,
+    ai_rewrite_mutation_count: usize,
     final_text: String,
     commit_source: StreamingCommitSource,
     raw_capture_wav: String,
@@ -441,9 +447,9 @@ pub(crate) fn push_to_talk_worker(
                             }
                             Err(error) => {
                                 tracing::error!(error = %error, "failed to start microphone recording");
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("启动录音失败：{error}"),
-                                )));
+                                let _ = proxy.send_event(AppEvent::Worker(
+                                    WorkerEvent::RecoverableError(format!("启动录音失败：{error}")),
+                                ));
                             }
                         }
                     }
@@ -687,16 +693,7 @@ pub(crate) fn streaming_push_to_talk_worker(
         },
         Some,
     );
-    let final_repair_recognizer = build_streaming_final_recognizer(&runtime).map_or_else(
-        |error| {
-            tracing::warn!(
-                error = %error,
-                "streaming offline final repair unavailable; final text will use streaming ASR only"
-            );
-            None
-        },
-        Some,
-    );
+    tracing::info!("streaming offline final repair disabled for HUD truth single-chain v19");
     let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(WorkerKind::Streaming)));
 
     let mut standby_recording: Option<ainput_audio::ActiveRecording> = None;
@@ -717,15 +714,16 @@ pub(crate) fn streaming_push_to_talk_worker(
             match command {
                 WorkerCommand::HotkeyPressed => {
                     if active_session.is_none() {
-                        if let Err(error) = ensure_streaming_recording_ready(&mut standby_recording)
+                        if let Err(error) =
+                            ensure_streaming_recording_ready(&runtime, &mut standby_recording)
                         {
                             tracing::error!(
                                 error = %error,
                                 "failed to start streaming microphone recording"
                             );
-                            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                format!("启动流式录音失败：{error}"),
-                            )));
+                            let _ = proxy.send_event(AppEvent::Worker(
+                                WorkerEvent::RecoverableError(format!("启动流式录音失败：{error}")),
+                            ));
                             continue;
                         }
 
@@ -747,11 +745,17 @@ pub(crate) fn streaming_push_to_talk_worker(
                             let _ =
                                 proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingStarted));
                             tracing::info!(
-                                sample_rate_hz = recording.sample_rate_hz(),
+                                input_sample_rate_hz = recording.sample_rate_hz(),
+                                input_channels = recording.channels(),
+                                asr_sample_rate_hz = runtime.config.asr.sample_rate_hz,
+                                asr_channels = 1,
+                                direct_asr_format = recording.sample_rate_hz()
+                                    == runtime.config.asr.sample_rate_hz as i32
+                                    && recording.channels() == 1,
                                 current_cursor,
                                 start_cursor,
                                 preroll_ms,
-                                "streaming push-to-talk recording started"
+                                "streaming push-to-talk recording started with v19 ASR-facing mono stream"
                             );
                         }
                     }
@@ -842,7 +846,6 @@ pub(crate) fn streaming_push_to_talk_worker(
                         cancel_streaming_ai_rewrite(&mut session, "hotkey_release");
                         let prepared_commit = prepare_final_streaming_commit(
                             &recognizer,
-                            final_repair_recognizer.as_ref(),
                             punctuator.as_ref(),
                             &mut session,
                             sample_rate_hz,
@@ -941,6 +944,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                             )));
                             continue;
                         }
+                        let hud_paste_equal = hud_commit_text == commit_text;
                         let hud_final_flush_elapsed_ms =
                             hud_final_flush_started_at.elapsed().as_millis();
 
@@ -955,6 +959,9 @@ pub(crate) fn streaming_push_to_talk_worker(
                             selected_commit_source = prepared_commit.commit_source.as_str(),
                             commit_text = %commit_text,
                             hud_commit_text = %hud_commit_text,
+                            hud_paste_equal,
+                            offline_final_invoked = false,
+                            ai_rewrite_mutation_count = session.post_hud_flush_mutation_count,
                             hud_ack_elapsed_ms = hud_ack.elapsed_ms,
                             hud_ack_visible = hud_ack.visible,
                             final_decode_steps = prepared_commit.final_decode_steps,
@@ -1043,6 +1050,9 @@ pub(crate) fn streaming_push_to_talk_worker(
                             ?delivery,
                             text = %hud_commit_text,
                             commit_text = %commit_text,
+                            hud_paste_equal,
+                            offline_final_invoked = false,
+                            ai_rewrite_mutation_count = session.post_hud_flush_mutation_count,
                             hud_ack_elapsed_ms = hud_ack.elapsed_ms,
                             hud_ack_visible = hud_ack.visible,
                             session_id = %commit_envelope.session_id,
@@ -1128,52 +1138,10 @@ pub(crate) fn streaming_push_to_talk_worker(
                         "streaming live preview decode failed"
                     );
                 }
-                let soft_flushed = if let Some(update) = maybe_soft_flush_streaming_tail_core(
-                    &runtime,
-                    &recognizer,
-                    punctuator.as_ref(),
-                    session,
-                    runtime.config.voice.streaming.rewrite_enabled,
+                tracing::trace!(
                     audio_duration_ms,
-                ) {
-                    tracing::debug!(
-                        samples = session.captured_samples.len(),
-                        audio_duration_ms,
-                        decode_steps = session.total_decode_steps,
-                        total_chunks_fed = session.total_chunks_fed,
-                        selected_preview_source = update.source,
-                        stable_chars = update.stable_chars,
-                        frozen_chars = update.frozen_chars,
-                        volatile_chars = update.volatile_chars,
-                        revision = update.revision,
-                        raw_text = %update.raw_text,
-                        prepared_text = %update.display_text,
-                        "streaming HUD soft flush updated"
-                    );
-                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
-                        raw_text: update.raw_text,
-                        prepared_text: update.display_text,
-                    }));
-                    true
-                } else {
-                    false
-                };
-
-                if !soft_flushed
-                    && let Some(committed_text) = maybe_rollover_streaming_segment_core(
-                        &runtime,
-                        &recognizer,
-                        punctuator.as_ref(),
-                        session,
-                        runtime.config.voice.streaming.rewrite_enabled,
-                        audio_duration_ms,
-                    )
-                {
-                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
-                        raw_text: committed_text.clone(),
-                        prepared_text: committed_text,
-                    }));
-                }
+                    "v19 keeps one continuous streaming recognizer chain; pause soft-flush and endpoint rollover are bypassed"
+                );
             }
 
             let level = normalize_audio_level(recording.current_level());
@@ -1196,7 +1164,10 @@ pub(crate) fn probe_streaming_live_session(
     seconds: u64,
 ) -> Result<StreamingLiveProbeReport> {
     let punctuator = build_streaming_punctuator(runtime).ok();
-    let recording = ainput_audio::ActiveRecording::start_default_input()?;
+    let recording = ainput_audio::ActiveRecording::start_default_input_for_asr(
+        runtime.config.asr.sample_rate_hz as i32,
+        1,
+    )?;
     let mut session = StreamingSession::new(
         recording.sample_rate_hz(),
         recognizer.create_stream(),
@@ -1229,13 +1200,9 @@ pub(crate) fn probe_streaming_live_session(
                 runtime.config.voice.streaming.rewrite_enabled,
                 total_audio_duration_ms,
             )?;
-            let _ = maybe_rollover_streaming_segment_core(
-                runtime,
-                recognizer,
-                punctuator.as_ref(),
-                &mut session,
-                runtime.config.voice.streaming.rewrite_enabled,
+            tracing::trace!(
                 total_audio_duration_ms,
+                "v19 live probe bypassed endpoint rollover to keep HUD truth on one streaming chain"
             );
         }
 
@@ -1252,10 +1219,8 @@ pub(crate) fn probe_streaming_live_session(
     );
 
     let activity = analyze_audio_activity(&session.captured_samples);
-    let offline_final_recognizer = build_streaming_final_recognizer(runtime).ok();
     let prepared_commit = prepare_final_streaming_commit(
         recognizer,
-        offline_final_recognizer.as_ref(),
         punctuator.as_ref(),
         &mut session,
         sample_rate_hz,
@@ -1289,6 +1254,11 @@ pub(crate) fn probe_streaming_live_session(
         final_online_raw_text: prepared_commit.final_online_raw_text,
         final_offline_raw_text: prepared_commit.final_offline_raw_text,
         final_prepared_candidate: prepared_commit.prepared_final_candidate,
+        hud_truth_text: final_text.clone(),
+        pasted_text: final_text.clone(),
+        hud_paste_equal: true,
+        offline_final_invoked: false,
+        ai_rewrite_mutation_count: session.post_hud_flush_mutation_count,
         final_text,
         commit_source: prepared_commit.commit_source,
         raw_capture_wav: raw_capture.wav_path.display().to_string(),
@@ -1308,7 +1278,6 @@ pub(crate) fn replay_streaming_wav(
     shortfall_tolerance_chars: usize,
 ) -> Result<StreamingReplayReport> {
     let punctuator = build_streaming_punctuator(runtime).ok();
-    let offline_final_recognizer = build_streaming_final_recognizer(runtime).ok();
     let (input_sample_rate_hz, input_samples) = read_wav_samples(wav_path)?;
     let mut session = StreamingCoreSession::new(
         input_sample_rate_hz,
@@ -1396,64 +1365,10 @@ pub(crate) fn replay_streaming_wav(
             });
         }
 
-        let soft_flushed = if let Some(update) = maybe_soft_flush_streaming_tail_core(
-            runtime,
-            recognizer,
-            punctuator.as_ref(),
-            &mut session,
-            runtime.config.voice.streaming.rewrite_enabled,
+        tracing::trace!(
             total_audio_duration_ms,
-        ) {
-            let processing_elapsed_ms = processing_started_at.elapsed().as_millis();
-            partial_timeline.push(StreamingReplayPartialEntry {
-                offset_ms: total_audio_duration_ms,
-                processing_elapsed_ms,
-                processing_realtime_factor: streaming_replay_realtime_factor(
-                    processing_elapsed_ms,
-                    total_audio_duration_ms,
-                ),
-                raw_text: update.raw_text,
-                content_chars: content_chars_without_sentence_punctuation(&update.display_text),
-                prepared_text: update.display_text,
-                source: update.source.to_string(),
-                stable_chars: update.stable_chars,
-                frozen_chars: update.frozen_chars,
-                volatile_chars: update.volatile_chars,
-                rejected_prefix_rewrite: update.rejected_prefix_rewrite,
-            });
-            true
-        } else {
-            false
-        };
-
-        if !soft_flushed
-            && let Some(committed_text) = maybe_rollover_streaming_segment_core(
-                runtime,
-                recognizer,
-                punctuator.as_ref(),
-                &mut session,
-                runtime.config.voice.streaming.rewrite_enabled,
-                total_audio_duration_ms,
-            )
-        {
-            let processing_elapsed_ms = processing_started_at.elapsed().as_millis();
-            partial_timeline.push(StreamingReplayPartialEntry {
-                offset_ms: total_audio_duration_ms,
-                processing_elapsed_ms,
-                processing_realtime_factor: streaming_replay_realtime_factor(
-                    processing_elapsed_ms,
-                    total_audio_duration_ms,
-                ),
-                raw_text: committed_text.clone(),
-                content_chars: content_chars_without_sentence_punctuation(&committed_text),
-                prepared_text: committed_text,
-                source: "endpoint_rollover".to_string(),
-                stable_chars: session.last_display_text.chars().count(),
-                frozen_chars: session.state.committed_prefix.chars().count(),
-                volatile_chars: session.state.current_tail().chars().count(),
-                rejected_prefix_rewrite: false,
-            });
-        }
+            "v19 replay bypassed pause soft-flush and endpoint rollover to keep one streaming chain"
+        );
     }
 
     let _ = feed_streaming_pending_chunks(
@@ -1469,7 +1384,6 @@ pub(crate) fn replay_streaming_wav(
         estimate_speech_start_ms(&session.captured_samples, session.sample_rate_hz);
     let prepared_commit = prepare_final_streaming_commit(
         recognizer,
-        offline_final_recognizer.as_ref(),
         punctuator.as_ref(),
         &mut session,
         runner_sample_rate_hz,
@@ -1637,6 +1551,11 @@ pub(crate) fn replay_streaming_wav(
         final_online_raw_text: prepared_commit.final_online_raw_text,
         final_offline_raw_text: prepared_commit.final_offline_raw_text,
         final_prepared_candidate: prepared_commit.prepared_final_candidate,
+        hud_truth_text: final_text.clone(),
+        pasted_text: final_text.clone(),
+        hud_paste_equal: true,
+        offline_final_invoked: false,
+        ai_rewrite_mutation_count: session.post_hud_flush_mutation_count,
         final_text,
         final_visible_chars,
         commit_source: prepared_commit.commit_source.as_str().to_string(),
@@ -1902,13 +1821,21 @@ fn effective_streaming_punctuation_num_threads(runtime: &AppRuntime) -> i32 {
 }
 
 fn ensure_streaming_recording_ready(
+    runtime: &AppRuntime,
     standby_recording: &mut Option<ainput_audio::ActiveRecording>,
 ) -> Result<()> {
     if standby_recording.is_none() {
-        let recording = ainput_audio::ActiveRecording::start_default_input()?;
+        let target_sample_rate_hz = runtime.config.asr.sample_rate_hz as i32;
+        let recording =
+            ainput_audio::ActiveRecording::start_default_input_for_asr(target_sample_rate_hz, 1)?;
         tracing::info!(
-            sample_rate_hz = recording.sample_rate_hz(),
-            "streaming microphone armed on hotkey press"
+            input_sample_rate_hz = recording.sample_rate_hz(),
+            input_channels = recording.channels(),
+            asr_sample_rate_hz = target_sample_rate_hz,
+            asr_channels = 1,
+            direct_asr_format =
+                recording.sample_rate_hz() == target_sample_rate_hz && recording.channels() == 1,
+            "streaming microphone armed on hotkey press for v19"
         );
         *standby_recording = Some(recording);
     }
@@ -2326,7 +2253,6 @@ struct StreamingAiRewriteDisplayUpdate {
 
 fn prepare_final_streaming_commit(
     recognizer: &ainput_asr::StreamingZipformerRecognizer,
-    offline_final_recognizer: Option<&ainput_asr::SenseVoiceRecognizer>,
     punctuator: Option<&ainput_asr::OfflinePunctuationRestorer>,
     session: &mut StreamingCoreSession,
     sample_rate_hz: i32,
@@ -2348,44 +2274,67 @@ fn prepare_final_streaming_commit(
         .get_result(&session.stream)
         .map(|result| result.text.trim().to_string())
         .unwrap_or_default();
-    let offline_final = transcribe_streaming_offline_final(
-        offline_final_recognizer,
-        session.sample_rate_hz,
-        &session.captured_samples,
-    );
-    let offline_final_elapsed_ms = offline_final.elapsed_ms;
-    let offline_final_timed_out = offline_final_elapsed_ms > STREAMING_OFFLINE_FINAL_HARD_MS;
-    let final_offline_raw_text = if offline_final_timed_out {
-        tracing::warn!(
-            offline_final_elapsed_ms,
-            hard_ms = STREAMING_OFFLINE_FINAL_HARD_MS,
-            scope = offline_final.scope.as_str(),
-            "streaming offline final repair exceeded hard budget; ignoring repair text"
-        );
-        String::new()
-    } else {
-        offline_final.text
-    };
+
+    let final_offline_raw_text = String::new();
+    let offline_final_elapsed_ms = 0;
+    let offline_final_timed_out = false;
     let display_text_before_final = effective_streaming_display_text(session);
-    let (selected_final_raw_text, selected_final_raw_source) = select_streaming_final_raw_text(
-        &final_online_raw_text,
-        &final_offline_raw_text,
-        offline_final.scope,
-        &display_text_before_final,
-    );
     let punctuation_started_at = Instant::now();
     let (prepared_final_candidate, prepared_candidate_source) =
-        prepare_streaming_output_text(&selected_final_raw_text, rewrite_enabled, punctuator);
+        prepare_streaming_output_text(&final_online_raw_text, rewrite_enabled, punctuator);
     let punctuation_elapsed_ms = punctuation_started_at.elapsed().as_millis();
-    let candidate_source = match selected_final_raw_source {
-        StreamingCommitSource::OfflineFinal => StreamingCommitSource::OfflineFinal,
-        _ => prepared_candidate_source,
+
+    let (candidate_display_text, rejected_prefix_rewrite) = if prepared_final_candidate
+        .trim()
+        .is_empty()
+    {
+        (display_text_before_final.clone(), false)
+    } else {
+        let delta = session
+            .state
+            .finalize_from_streaming(&prepared_final_candidate);
+        if delta.rejected_prefix_rewrite {
+            tracing::warn!(
+                final_online_raw_text = %short_log_text(&final_online_raw_text, 120),
+                prepared_final_candidate = %short_log_text(&prepared_final_candidate, 120),
+                display_text_before_final = %short_log_text(&display_text_before_final, 120),
+                "streaming final ASR candidate rejected by HUD truth state; keeping current HUD text"
+            );
+            (display_text_before_final.clone(), true)
+        } else {
+            let hud_truth_text = session.state.full_text().trim().to_string();
+            session.last_raw_partial = final_online_raw_text.clone();
+            session.last_display_text = hud_truth_text.clone();
+            session.last_fast_preview_text = hud_truth_text.clone();
+            (hud_truth_text, false)
+        }
     };
-    let resolved_commit = resolve_final_streaming_commit(
-        session,
-        &display_text_before_final,
-        &prepared_final_candidate,
-        candidate_source,
+
+    let selected_commit_text = if candidate_display_text.trim().is_empty() {
+        display_text_before_final.trim()
+    } else {
+        candidate_display_text.trim()
+    };
+    let final_text = finalize_streaming_commit_text(selected_commit_text);
+    let display_text_trimmed = display_text_before_final.trim();
+    let commit_source = if rejected_prefix_rewrite || final_text == display_text_trimmed {
+        StreamingCommitSource::StreamingState
+    } else if final_text != selected_commit_text {
+        StreamingCommitSource::StreamingTailRepair
+    } else {
+        prepared_candidate_source
+    };
+    let _ = session.state.freeze_with_committed_text(&final_text);
+
+    tracing::info!(
+        final_online_raw_text = %short_log_text(&final_online_raw_text, 120),
+        display_text_before_final = %short_log_text(&display_text_before_final, 120),
+        candidate_display_text = %short_log_text(&candidate_display_text, 120),
+        final_text = %short_log_text(&final_text, 120),
+        final_decode_steps,
+        online_final_elapsed_ms,
+        offline_final_invoked = false,
+        "streaming HUD truth final prepared without offline final"
     );
 
     PreparedStreamingCommit {
@@ -2393,16 +2342,16 @@ fn prepare_final_streaming_commit(
         final_offline_raw_text,
         prepared_final_candidate,
         display_text_before_final,
-        candidate_display_text: resolved_commit.candidate_display_text,
-        final_text: resolved_commit.final_text,
-        commit_source: resolved_commit.commit_source,
+        candidate_display_text,
+        final_text,
+        commit_source,
         final_decode_steps,
         final_decode_elapsed_ms,
         online_final_elapsed_ms,
         offline_final_elapsed_ms,
         offline_final_timed_out,
         punctuation_elapsed_ms,
-        rejected_prefix_rewrite: resolved_commit.rejected_prefix_rewrite,
+        rejected_prefix_rewrite,
     }
 }
 
@@ -2800,6 +2749,22 @@ fn resolve_final_streaming_commit(
 
     let (candidate_display_text, rejected_prefix_rewrite) = if candidate_trimmed.is_empty() {
         (String::new(), false)
+    } else if matches!(candidate_source, StreamingCommitSource::OfflineFinal)
+        && !display_trimmed.is_empty()
+        && !candidate_trimmed.starts_with(&display_trimmed)
+        && let Some((repaired, overlap_chars)) = repair_final_candidate_tail_overlap(
+            &display_trimmed,
+            &format!("{display_trimmed}{candidate_trimmed}"),
+        )
+    {
+        tracing::info!(
+            overlap_chars,
+            display_text = %short_log_text(&display_trimmed, 120),
+            offline_tail = %short_log_text(candidate_trimmed, 120),
+            repaired_text = %short_log_text(&repaired, 120),
+            "streaming final commit repaired offline tail before state merge"
+        );
+        (repaired, false)
     } else {
         let mut candidate_state = session.state.clone();
         let candidate_delta = candidate_state.finalize_from_streaming(candidate_trimmed);
@@ -2836,7 +2801,7 @@ fn resolve_final_streaming_commit(
 
 fn finalize_streaming_commit_text(text: &str) -> String {
     let normalized = ainput_rewrite::normalize_transcription(text);
-    apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
+    apply_streaming_punctuation_cleanup(&normalized)
 }
 
 fn update_streaming_partial_state(
@@ -2908,8 +2873,10 @@ fn update_streaming_partial_state(
         return Ok(None);
     }
     if preview_source != "held_display" {
-        selected_preview_text =
-            maybe_apply_streaming_ai_rewrite(runtime, session, &selected_preview_text)?;
+        tracing::debug!(
+            preview_source,
+            "streaming AI rewrite quarantined for HUD truth single-chain v19; ASR HUD text remains the truth source"
+        );
     }
 
     let selected_raw_text = if preview_source == "held_display" {
@@ -3998,7 +3965,12 @@ fn repair_final_candidate_tail_overlap(
         appended_tail,
         STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MAX_CHARS,
         1,
-    );
+    )
+    .max(longest_edit_suffix_prefix_overlap_chars(
+        display,
+        appended_tail,
+        1,
+    ));
     if overlap_chars < STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MIN_CHARS {
         return None;
     }
@@ -4163,6 +4135,58 @@ fn longest_fuzzy_suffix_prefix_overlap_chars(
     0
 }
 
+fn longest_edit_suffix_prefix_overlap_chars(prefix: &str, suffix: &str, max_edits: usize) -> usize {
+    let prefix_chars = prefix.chars().collect::<Vec<_>>();
+    let suffix_chars = suffix.chars().collect::<Vec<_>>();
+    let max_overlap = prefix_chars
+        .len()
+        .min(STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MAX_CHARS.max(1));
+    for overlap in (STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MIN_CHARS..=max_overlap).rev() {
+        let min_suffix_len = overlap;
+        let max_suffix_len = overlap
+            .saturating_add(max_edits)
+            .min(suffix_chars.len())
+            .min(STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MAX_CHARS.saturating_add(max_edits));
+        for suffix_len in (min_suffix_len..=max_suffix_len).rev() {
+            if suffix_len < STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MIN_CHARS {
+                continue;
+            }
+            let prefix_start = prefix_chars.len() - overlap;
+            if edit_distance_with_limit(
+                &prefix_chars[prefix_start..],
+                &suffix_chars[..suffix_len],
+                max_edits,
+            ) <= max_edits
+            {
+                return overlap;
+            }
+        }
+    }
+    0
+}
+fn edit_distance_with_limit(left: &[char], right: &[char], limit: usize) -> usize {
+    if left.len().abs_diff(right.len()) > limit {
+        return limit.saturating_add(1);
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0usize; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        let mut row_min = current[0];
+        for (right_index, right_char) in right.iter().enumerate() {
+            let substitution_cost = usize::from(left_char != right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution_cost);
+            row_min = row_min.min(current[right_index + 1]);
+        }
+        if row_min > limit {
+            return limit.saturating_add(1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
 fn longest_common_subsequence_chars(left: &str, right: &str) -> usize {
     let left_chars = left.chars().collect::<Vec<_>>();
     let right_chars = right.chars().collect::<Vec<_>>();
@@ -4220,7 +4244,7 @@ fn prepare_streaming_pause_boundary_text(
 ) -> String {
     let normalized = ainput_rewrite::normalize_streaming_preview(text);
     let _ = (rewrite_enabled, punctuator);
-    apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
+    apply_streaming_punctuation_cleanup(&normalized)
 }
 
 fn ensure_terminal_sentence_boundary(text: &str) -> String {
@@ -4839,13 +4863,9 @@ fn prepare_streaming_preview_text(
 ) -> String {
     let normalized = ainput_rewrite::normalize_streaming_preview(current_partial);
     if rewrite_enabled {
-        apply_streaming_semantic_commas(&apply_streaming_punctuation_content_safe(
-            &normalized,
-            punctuator,
-            false,
-        ))
+        apply_streaming_punctuation_content_safe(&normalized, punctuator, false)
     } else {
-        apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
+        apply_streaming_punctuation_cleanup(&normalized)
     }
 }
 
@@ -4860,13 +4880,9 @@ fn prepare_streaming_output_text(
 
     let normalized = ainput_rewrite::normalize_transcription(final_text);
     let prepared = if rewrite_enabled {
-        apply_streaming_semantic_commas(&apply_streaming_punctuation_content_safe(
-            &normalized,
-            punctuator,
-            true,
-        ))
+        apply_streaming_punctuation_content_safe(&normalized, punctuator, true)
     } else {
-        apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&normalized))
+        apply_streaming_punctuation_cleanup(&normalized)
     };
     let source = if prepared != final_text {
         StreamingCommitSource::StreamingTailRepair
@@ -4910,6 +4926,8 @@ fn apply_streaming_punctuation(
 
     let punctuated_latest = ainput_rewrite::normalize_transcription(&punctuated_latest);
     let punctuated_latest = dedupe_streaming_punctuation(&punctuated_latest);
+    let punctuated_latest =
+        sanitize_streaming_generated_punctuation(target_text, &punctuated_latest, finalize);
     let punctuated_latest = if finalize
         || should_keep_streaming_preview_terminal_punctuation(target_text, &punctuated_latest)
     {
@@ -4918,10 +4936,7 @@ fn apply_streaming_punctuation(
         strip_trailing_terminal_sentence_punctuation(&punctuated_latest)
     };
 
-    apply_streaming_semantic_commas(&dedupe_streaming_punctuation(&format!(
-        "{}{}",
-        frozen_prefix, punctuated_latest
-    )))
+    apply_streaming_punctuation_cleanup(&format!("{}{}", frozen_prefix, punctuated_latest))
 }
 
 fn apply_streaming_punctuation_content_safe(
@@ -4947,7 +4962,7 @@ fn apply_streaming_punctuation_content_safe(
         );
         normalized.to_string()
     } else {
-        punctuated
+        apply_streaming_punctuation_cleanup(&punctuated)
     }
 }
 
@@ -4980,86 +4995,168 @@ fn dedupe_streaming_punctuation(text: &str) -> String {
     result.trim().to_string()
 }
 
-fn apply_streaming_semantic_commas(text: &str) -> String {
-    let mut current = text.trim().to_string();
-    for marker in ["另外", "然后", "而且", "但是", "不过", "所以", "现在"] {
-        current = insert_comma_after_leading_marker(&current, marker, 4);
-    }
-    for marker in [
-        "但是",
-        "不过",
-        "而且",
-        "然后",
-        "还是",
-        "尤其是",
-        "或者",
-        "比如",
-    ] {
-        current = insert_comma_before_marker(&current, marker, 6);
-    }
-    apply_streaming_semantic_tail_repairs(&current)
+fn apply_streaming_punctuation_cleanup(text: &str) -> String {
+    dedupe_streaming_punctuation(text)
 }
 
-fn apply_streaming_semantic_tail_repairs(text: &str) -> String {
-    let mut current = text.trim().to_string();
-    for (from, to) in [
-        ("显示出来两个应该是", "显示出来两个字。应该是"),
-        ("出现文明明", "出现文字。明明"),
-    ] {
-        current = current.replace(from, to);
-    }
-    current
-}
-
-fn insert_comma_after_leading_marker(text: &str, marker: &str, min_tail_chars: usize) -> String {
-    let Some(rest) = text.strip_prefix(marker) else {
-        return text.to_string();
-    };
-    if rest.is_empty() {
-        return text.to_string();
-    }
-    if rest.chars().next().is_some_and(is_sentence_punctuation) {
-        return text.to_string();
-    }
-    if rest.chars().filter(|ch| !ch.is_whitespace()).count() < min_tail_chars {
-        return text.to_string();
-    }
-    format!("{marker}，{}", rest.trim_start())
-}
-
-fn insert_comma_before_marker(text: &str, marker: &str, min_prefix_chars: usize) -> String {
-    if text.is_empty() || marker.is_empty() {
-        return text.to_string();
+fn sanitize_streaming_generated_punctuation(
+    source_text: &str,
+    punctuated_text: &str,
+    finalize: bool,
+) -> String {
+    let source = source_text.trim();
+    let punctuated = punctuated_text.trim();
+    if source.is_empty() || punctuated.is_empty() {
+        return String::new();
     }
 
-    let mut output = String::with_capacity(text.len() + 8);
-    let mut cursor = 0usize;
-    while let Some(relative_index) = text[cursor..].find(marker) {
-        let index = cursor + relative_index;
-        output.push_str(&text[cursor..index]);
-        if should_insert_streaming_comma_before(text, index, min_prefix_chars) {
-            output.push('，');
+    let source_content = content_text_without_sentence_punctuation(source);
+    if source_content != content_text_without_sentence_punctuation(punctuated) {
+        tracing::debug!(
+            source = %short_log_text(source, 120),
+            punctuated = %short_log_text(punctuated, 120),
+            "streaming punctuation rejected because content alignment changed"
+        );
+        return apply_streaming_punctuation_cleanup(source);
+    }
+
+    let source_marks = punctuation_marks_by_content_index(source);
+    let total_content_chars = source_content.chars().count();
+    let mut content_index = 0usize;
+    let mut last_boundary_content_index = 0usize;
+    let mut result = String::with_capacity(punctuated.len());
+
+    for ch in punctuated.chars() {
+        if is_sentence_punctuation(ch) {
+            if source_has_punctuation_mark(&source_marks, content_index, ch) {
+                let mark = normalize_explicit_source_punctuation(ch);
+                result.push(mark);
+                last_boundary_content_index = content_index;
+                continue;
+            }
+
+            if let Some(mark) = safe_generated_streaming_punctuation(
+                ch,
+                content_index,
+                last_boundary_content_index,
+                total_content_chars,
+                finalize,
+            ) {
+                result.push(mark);
+                last_boundary_content_index = content_index;
+            }
+            continue;
         }
-        output.push_str(marker);
-        cursor = index + marker.len();
+
+        result.push(ch);
+        if !ch.is_whitespace() {
+            content_index = content_index.saturating_add(1);
+        }
     }
-    output.push_str(&text[cursor..]);
-    output
+
+    apply_streaming_punctuation_cleanup(&result)
 }
 
-fn should_insert_streaming_comma_before(
-    text: &str,
-    marker_index: usize,
-    min_prefix_chars: usize,
+fn punctuation_marks_by_content_index(text: &str) -> Vec<(usize, char)> {
+    let mut marks = Vec::new();
+    let mut content_index = 0usize;
+    for ch in text.chars() {
+        if is_sentence_punctuation(ch) {
+            marks.push((content_index, normalize_explicit_source_punctuation(ch)));
+        } else if !ch.is_whitespace() {
+            content_index = content_index.saturating_add(1);
+        }
+    }
+    marks
+}
+
+fn source_has_punctuation_mark(
+    source_marks: &[(usize, char)],
+    content_index: usize,
+    ch: char,
 ) -> bool {
-    let prefix = text[..marker_index].trim_end();
-    if prefix.chars().count() < min_prefix_chars {
+    let normalized = normalize_explicit_source_punctuation(ch);
+    source_marks
+        .iter()
+        .any(|(index, mark)| *index == content_index && *mark == normalized)
+}
+
+fn normalize_explicit_source_punctuation(ch: char) -> char {
+    match ch {
+        ',' | '，' => '，',
+        '.' | '。' | '．' => '。',
+        '!' | '！' => '！',
+        '?' | '？' => '？',
+        ';' | '；' => '；',
+        ':' | '：' => '：',
+        '、' | '・' => '、',
+        _ => ch,
+    }
+}
+
+fn safe_generated_streaming_punctuation(
+    ch: char,
+    content_index: usize,
+    last_boundary_content_index: usize,
+    total_content_chars: usize,
+    finalize: bool,
+) -> Option<char> {
+    let terminal = content_index >= total_content_chars;
+    match normalize_explicit_source_punctuation(ch) {
+        '，' | '、' => can_accept_generated_internal_boundary(
+            content_index,
+            last_boundary_content_index,
+            total_content_chars,
+            4,
+            4,
+        )
+        .then_some('，'),
+        '。' => {
+            if terminal {
+                finalize.then_some('。')
+            } else {
+                can_accept_generated_internal_boundary(
+                    content_index,
+                    last_boundary_content_index,
+                    total_content_chars,
+                    8,
+                    6,
+                )
+                .then_some('。')
+            }
+        }
+        '？' | '！' => {
+            if terminal && finalize {
+                Some('。')
+            } else {
+                None
+            }
+        }
+        '；' | '：' => can_accept_generated_internal_boundary(
+            content_index,
+            last_boundary_content_index,
+            total_content_chars,
+            6,
+            6,
+        )
+        .then_some('，'),
+        _ => None,
+    }
+}
+
+fn can_accept_generated_internal_boundary(
+    content_index: usize,
+    last_boundary_content_index: usize,
+    total_content_chars: usize,
+    min_left_chars: usize,
+    min_right_chars: usize,
+) -> bool {
+    if content_index == 0 || content_index >= total_content_chars {
         return false;
     }
-    prefix
-        .chars()
-        .next_back()
-        .is_some_and(|ch| !is_sentence_punctuation(ch))
+    let left_span = content_index.saturating_sub(last_boundary_content_index);
+    let right_span = total_content_chars.saturating_sub(content_index);
+    left_span >= min_left_chars && right_span >= min_right_chars
 }
 
 fn flush_punctuation_run(result: &mut String, punctuation_run: &mut Vec<char>) {
@@ -5122,49 +5219,10 @@ fn should_keep_streaming_preview_terminal_punctuation(
         return false;
     }
 
-    match terminal {
-        '？' => has_semantic_question_cue(source),
-        '。' => has_semantic_statement_completion_cue(source),
-        '！' => has_semantic_exclamation_cue(source),
-        _ => false,
-    }
-}
-
-fn has_semantic_question_cue(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.ends_with('吗')
-        || trimmed.ends_with('么')
-        || trimmed.contains("是不是")
-        || trimmed.contains("对不对")
-        || trimmed.contains("能不能")
-        || trimmed.contains("可不可以")
-        || trimmed.contains("要不要")
-}
-
-fn has_semantic_statement_completion_cue(text: &str) -> bool {
-    let trimmed = text.trim();
-    [
-        "完了",
-        "好了",
-        "结束了",
-        "完成了",
-        "可以了",
-        "没问题了",
-        "清楚了",
-        "明白了",
-        "正常了",
-        "成功了",
-        "失败了",
-        "就这样",
-        "到这里",
-    ]
-    .iter()
-    .any(|ending| trimmed.ends_with(ending))
-}
-
-fn has_semantic_exclamation_cue(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.ends_with('啊') || trimmed.ends_with('呀') || trimmed.ends_with('啦')
+    let source_content_chars = content_chars_without_sentence_punctuation(source);
+    punctuation_marks_by_content_index(source)
+        .iter()
+        .any(|(index, mark)| *index == source_content_chars && *mark == terminal)
 }
 
 fn strip_trailing_terminal_sentence_punctuation(text: &str) -> String {
@@ -5181,7 +5239,7 @@ mod tests {
         AudioActivity, STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS, STREAMING_OFFLINE_FINAL_HARD_MS,
         STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT, StreamingCommitSource,
         StreamingOfflineFinalScope, StreamingResampler, analyze_recent_audio_activity,
-        append_with_suffix_prefix_overlap, apply_streaming_semantic_commas,
+        append_with_suffix_prefix_overlap, apply_streaming_punctuation_cleanup,
         build_streaming_ai_rewrite_candidate, current_ai_rewrite_tail,
         dedupe_streaming_punctuation, effective_ai_rewrite_min_visible_chars,
         ensure_terminal_sentence_boundary, estimate_speech_start_ms,
@@ -5190,7 +5248,8 @@ mod tests {
         merge_streaming_offline_tail_repair, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
         resolve_streaming_rollover_commit_text, sanitize_ai_rewrite_output,
-        save_streaming_raw_capture, select_streaming_commit_text, select_streaming_final_raw_text,
+        sanitize_streaming_generated_punctuation, save_streaming_raw_capture,
+        select_streaming_commit_text, select_streaming_final_raw_text,
         select_streaming_preview_text, should_drop_low_signal_result,
         should_drop_streaming_preview_result, should_skip_streaming_preview,
         streaming_final_quality_failures, streaming_offline_final_sample_start,
@@ -5231,28 +5290,52 @@ mod tests {
     }
 
     #[test]
-    fn streaming_semantic_commas_handles_leading_discourse_marker() {
+    fn streaming_cleanup_does_not_insert_leading_marker_commas() {
         assert_eq!(
-            apply_streaming_semantic_commas("另外这个加标点符号的逻辑"),
-            "另外，这个加标点符号的逻辑"
+            apply_streaming_punctuation_cleanup("另外这个加标点符号的逻辑"),
+            "另外这个加标点符号的逻辑"
         );
     }
 
     #[test]
-    fn streaming_semantic_commas_handles_mid_sentence_markers() {
+    fn streaming_cleanup_does_not_insert_mid_sentence_marker_commas() {
         assert_eq!(
-            apply_streaming_semantic_commas("最后一个字的问题还是可能会漏字尤其是语气词"),
-            "最后一个字的问题，还是可能会漏字，尤其是语气词"
+            apply_streaming_punctuation_cleanup("最后一个字的问题还是可能会漏字尤其是语气词"),
+            "最后一个字的问题还是可能会漏字尤其是语气词"
         );
     }
 
     #[test]
-    fn streaming_semantic_tail_repairs_restore_obvious_missing_classifier_chars() {
+    fn streaming_cleanup_does_not_insert_project_specific_sentence_boundaries() {
         assert_eq!(
-            apply_streaming_semantic_commas(
+            apply_streaming_punctuation_cleanup(
                 "然后，不管我说多少个字，它永远只能显示出来两个应该是我不断的说话之后，它能不断地出现文明明这个 HUD 上面已经把正确的文案显示出来了"
             ),
-            "然后，不管我说多少个字，它永远只能显示出来两个字。应该是我不断的说话之后，它能不断地出现文字。明明这个 HUD 上面已经把正确的文案显示出来了"
+            "然后，不管我说多少个字，它永远只能显示出来两个应该是我不断的说话之后，它能不断地出现文明明这个 HUD 上面已经把正确的文案显示出来了"
+        );
+    }
+
+    #[test]
+    fn streaming_punctuation_sanitizer_downgrades_unanchored_question_marks() {
+        assert_eq!(
+            sanitize_streaming_generated_punctuation("这个怎么回事啊", "这个怎么？回事啊？", true),
+            "这个怎么回事啊。"
+        );
+    }
+
+    #[test]
+    fn streaming_punctuation_sanitizer_strips_unanchored_preview_question_marks() {
+        assert_eq!(
+            sanitize_streaming_generated_punctuation("这个怎么回事啊", "这个怎么？回事啊？", false),
+            "这个怎么回事啊"
+        );
+    }
+
+    #[test]
+    fn streaming_punctuation_sanitizer_keeps_source_anchored_question_marks() {
+        assert_eq!(
+            sanitize_streaming_generated_punctuation("这个功能可用吗？", "这个功能可用吗？", true),
+            "这个功能可用吗？"
         );
     }
 
@@ -5452,6 +5535,20 @@ mod tests {
     }
 
     #[test]
+    fn final_commit_repairs_user_failed_inserted_tail_overlap() {
+        let selected = select_streaming_commit_text(
+            "\u{7136}\u{540e}\u{ff0c}\u{4f60}\u{5b9e}\u{6d4b}\u{7684}\u{65f6}\u{5019}\u{4e5f}\u{6211}\u{521a}\u{624d}\u{5931}\u{8d25}\u{6848}\u{4f8b}\u{6765}\u{5b9e}",
+            "\u{7136}\u{540e}\u{ff0c}\u{4f60}\u{5b9e}\u{6d4b}\u{7684}\u{65f6}\u{5019}\u{4e5f}\u{6211}\u{521a}\u{624d}\u{5931}\u{8d25}\u{6848}\u{4f8b}\u{6765}\u{5b9e}\u{5931}\u{8d25}\u{7684}\u{6848}\u{4f8b}\u{6765}\u{5b9e}\u{6d4b}\u{3002}",
+            StreamingCommitSource::OfflineFinal,
+        );
+        assert_eq!(selected.source, StreamingCommitSource::OfflineFinal);
+        assert_eq!(
+            selected.text,
+            "\u{7136}\u{540e}\u{ff0c}\u{4f60}\u{5b9e}\u{6d4b}\u{7684}\u{65f6}\u{5019}\u{4e5f}\u{6211}\u{521a}\u{624d}\u{5931}\u{8d25}\u{7684}\u{6848}\u{4f8b}\u{6765}\u{5b9e}\u{6d4b}\u{3002}"
+        );
+        assert!(!selected.text.contains("\u{6848}\u{4f8b}\u{6765}\u{5b9e}\u{5931}\u{8d25}\u{7684}\u{6848}\u{4f8b}\u{6765}\u{5b9e}"));
+    }
+    #[test]
     fn offline_final_raw_text_repairs_streaming_tail_drop() {
         let (selected, source) = select_streaming_final_raw_text(
             "一共花了两天时",
@@ -5529,7 +5626,7 @@ mod tests {
     fn output_text_repairs_observed_i_and_punctuation_artifacts() {
         let (prepared, source) =
             prepare_streaming_output_text("强治就是灾难的标点，符号都不I 。", false, None);
-        assert_eq!(prepared, "简直就是灾难，标点符号都不对。");
+        assert_eq!(prepared, "简直就是灾难的标点符号都不对。");
         assert_eq!(source, StreamingCommitSource::StreamingTailRepair);
     }
 
@@ -5541,7 +5638,7 @@ mod tests {
         );
         assert_eq!(
             finalize_streaming_commit_text("强距就是灾难的标点，符号都不对I 。"),
-            "简直就是灾难，标点符号都不对。"
+            "简直就是灾难的标点符号都不对。"
         );
     }
 

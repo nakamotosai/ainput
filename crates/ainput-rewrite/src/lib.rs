@@ -4,17 +4,6 @@ const DUPLICATE_PHRASES: &[&str] = &[
 const STREAMING_FILLER_PREFIXES: &[&str] = &["嗯", "呃", "额", "啊"];
 const STREAMING_SEGMENT_MIN_CHARS: usize = 6;
 const STREAMING_SEGMENT_HARD_LIMIT: usize = 28;
-const COMMON_CN_COMMA_BEFORE_MARKERS: &[(&str, usize)] = &[
-    ("但是", 4),
-    ("不过", 4),
-    ("只是", 4),
-    ("所以", 4),
-    ("因此", 4),
-    ("而且", 4),
-    ("并且", 4),
-    ("然后", 6),
-    ("现在", 4),
-];
 const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
     ("hud", "HUD"),
     ("hot", "HUD"),
@@ -39,7 +28,6 @@ const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
     ("强治", "简直"),
     ("强距", "简直"),
     ("标点，符号", "标点符号"),
-    ("简直就是灾难的标点符号", "简直就是灾难，标点符号"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,18 +562,8 @@ fn find_segment_boundary(chars: &[char], start: usize, hard_end: usize) -> Optio
 }
 
 fn finalize_streaming_segment(text: &str, is_final: bool) -> String {
-    let mut current = normalize_streaming_preview(text);
-    if current.is_empty() {
-        return current;
-    }
-
-    if has_terminal_punctuation(&current) {
-        return current;
-    }
-
-    let punctuation = infer_streaming_terminal_punctuation(&current, is_final);
-    current.push(punctuation);
-    current
+    let _ = is_final;
+    normalize_streaming_preview(text)
 }
 
 fn rewrite_latest_sentence_with_mode(text: &str, is_final: bool) -> LatestSentenceRewrite {
@@ -599,106 +577,14 @@ fn rewrite_latest_sentence_with_mode(text: &str, is_final: bool) -> LatestSenten
         };
     }
 
-    let mut rewritten_sentence = normalize_streaming_preview(&original_sentence);
-    rewritten_sentence = apply_common_cn_comma_boundaries(&rewritten_sentence);
-    if !rewritten_sentence.is_empty() && !has_terminal_punctuation(&rewritten_sentence) {
-        rewritten_sentence.push(infer_streaming_terminal_punctuation(
-            &rewritten_sentence,
-            is_final,
-        ));
-    }
+    let _ = is_final;
+    let rewritten_sentence = normalize_streaming_preview(&original_sentence);
 
     LatestSentenceRewrite {
         frozen_prefix,
         original_sentence,
         rewritten_sentence,
     }
-}
-
-fn infer_streaming_terminal_punctuation(text: &str, is_final: bool) -> char {
-    let trimmed = text.trim();
-    if trimmed.ends_with('吗')
-        || trimmed.ends_with('么')
-        || trimmed.contains("是不是")
-        || trimmed.contains("对不对")
-        || trimmed.contains("要不要")
-    {
-        '？'
-    } else if trimmed.ends_with('吧')
-        || trimmed.ends_with('呀')
-        || trimmed.ends_with('啊')
-        || trimmed.ends_with('啦')
-    {
-        if is_final { '。' } else { '，' }
-    } else if is_final {
-        '。'
-    } else {
-        '，'
-    }
-}
-
-fn apply_common_cn_comma_boundaries(text: &str) -> String {
-    let mut current = text.to_string();
-    for (marker, min_prefix_chars) in COMMON_CN_COMMA_BEFORE_MARKERS {
-        current = insert_boundary_before_marker(&current, marker, '，', *min_prefix_chars);
-    }
-    cleanup_punctuation_spacing(&current)
-}
-
-fn insert_boundary_before_marker(
-    text: &str,
-    marker: &str,
-    boundary: char,
-    min_prefix_chars: usize,
-) -> String {
-    if text.is_empty() || marker.is_empty() {
-        return text.to_string();
-    }
-
-    let mut output = String::with_capacity(text.len() + 8);
-    let mut cursor = 0usize;
-
-    while let Some(relative_index) = text[cursor..].find(marker) {
-        let index = cursor + relative_index;
-        output.push_str(&text[cursor..index]);
-        if should_insert_boundary_before(text, index, min_prefix_chars) {
-            output.push(boundary);
-        }
-        output.push_str(marker);
-        cursor = index + marker.len();
-    }
-
-    output.push_str(&text[cursor..]);
-    output
-}
-
-fn should_insert_boundary_before(text: &str, index: usize, min_prefix_chars: usize) -> bool {
-    let prefix = text[..index].trim_end();
-    if prefix.is_empty() {
-        return false;
-    }
-    if prefix.chars().count() < min_prefix_chars {
-        return false;
-    }
-
-    let previous = match prefix.chars().last() {
-        Some(previous) => previous,
-        None => return false,
-    };
-
-    !matches!(
-        previous,
-        '，' | '。' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';'
-    )
-}
-
-fn has_terminal_punctuation(text: &str) -> bool {
-    text.chars().last().is_some_and(|ch| {
-        matches!(
-            ch,
-            '，' | '。' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';'
-        )
-    })
 }
 
 fn split_latest_sentence(text: &str) -> (String, String) {
@@ -856,21 +742,21 @@ mod tests {
     }
 
     #[test]
-    fn streaming_rewrite_splits_and_punctuates() {
+    fn streaming_rewrite_splits_without_forced_punctuation() {
         assert_eq!(
             rewrite_streaming_text("嗯 帮我看一下这个pr 然后告诉我有没有风险"),
             vec![
-                "帮我看一下这个pr，".to_string(),
-                "然后告诉我有没有风险。".to_string()
+                "帮我看一下这个pr".to_string(),
+                "然后告诉我有没有风险".to_string()
             ]
         );
     }
 
     #[test]
-    fn streaming_rewrite_keeps_questions() {
+    fn streaming_rewrite_does_not_infer_question_marks() {
         assert_eq!(
             rewrite_streaming_text("这个功能现在是不是已经可用了"),
-            vec!["这个功能现在是不是已经可用了？".to_string()]
+            vec!["这个功能现在是不是已经可用了".to_string()]
         );
     }
 
@@ -878,19 +764,16 @@ mod tests {
     fn rewrite_latest_sentence_keeps_prefix_untouched() {
         let rewritten = rewrite_latest_sentence("第一句已经稳定。嗯 第二句有点乱");
         assert_eq!(rewritten.frozen_prefix, "第一句已经稳定。");
-        assert_eq!(rewritten.rewritten_sentence, "第二句有点乱。");
-        assert_eq!(rewritten.combined_text(), "第一句已经稳定。第二句有点乱。");
+        assert_eq!(rewritten.rewritten_sentence, "第二句有点乱");
+        assert_eq!(rewritten.combined_text(), "第一句已经稳定。第二句有点乱");
     }
 
     #[test]
     fn rewrite_latest_sentence_preview_does_not_rewrite_prefix() {
         let rewritten = rewrite_latest_sentence_preview("第一句已经稳定。呃 第二句先是错字");
         assert_eq!(rewritten.frozen_prefix, "第一句已经稳定。");
-        assert_eq!(rewritten.rewritten_sentence, "第二句先是错字，");
-        assert_eq!(
-            rewritten.combined_text(),
-            "第一句已经稳定。第二句先是错字，"
-        );
+        assert_eq!(rewritten.rewritten_sentence, "第二句先是错字");
+        assert_eq!(rewritten.combined_text(), "第一句已经稳定。第二句先是错字");
     }
 
     #[test]
@@ -901,7 +784,7 @@ mod tests {
         );
         assert_eq!(
             normalize_transcription("强治就是灾难的标点，符号都不I 。"),
-            "简直就是灾难，标点符号都不对。"
+            "简直就是灾难的标点符号都不对。"
         );
         assert_eq!(
             normalize_transcription("很奇怪还是会漏字和重复I 。"),
@@ -917,25 +800,25 @@ mod tests {
         );
         assert_eq!(
             rewritten.combined_text(),
-            "然后不管我说多少个字他永远只能显示出来两个字应该是我不断地说话之后他能不断地出现文字明明这个哈上面已经把正确的文案显示出来了，但是他有时候上评还是慢。"
+            "然后不管我说多少个字他永远只能显示出来两个字应该是我不断地说话之后他能不断地出现文字明明这个哈上面已经把正确的文案显示出来了但是他有时候上评还是慢"
         );
     }
 
     #[test]
-    fn rewrite_latest_sentence_inserts_generic_comma_before_connectors() {
+    fn rewrite_latest_sentence_does_not_insert_generic_comma_before_connectors() {
         let rewritten = rewrite_latest_sentence("我想试一下这个功能然后再告诉你结果");
         assert_eq!(
             rewritten.combined_text(),
-            "我想试一下这个功能，然后再告诉你结果。"
+            "我想试一下这个功能然后再告诉你结果"
         );
     }
 
     #[test]
-    fn rewrite_latest_sentence_inserts_generic_comma_before_now_clause() {
+    fn rewrite_latest_sentence_does_not_insert_generic_comma_before_now_clause() {
         let rewritten = rewrite_latest_sentence("我的名字叫老蔡现在这个土字不够丝滑");
         assert_eq!(
             rewritten.combined_text(),
-            "我的名字叫老蔡，现在这个吐字不够丝滑。"
+            "我的名字叫老蔡现在这个吐字不够丝滑"
         );
     }
 }
