@@ -5,6 +5,35 @@
 
 ---
 
+## Round 33：preview.58 Qwen partial 策略旁路
+
+- [x] 确认 preview.57 live 日志仍然每段话只有 1 条 `Qwen sidecar partial updated`
+- [x] 将 Qwen partial 从旧 `StreamingState` 稳定策略里拆出来
+- [x] Qwen partial 只做 normalize / 标点清理 / trim / 去空 / 去重复后直接更新 HUD
+- [x] 增加 `qwen_partial_updates_bypass_old_stability_policy` 回归测试
+- [x] `cargo fmt --check` 通过
+- [x] `cargo test -p ainput-desktop` 通过：107 passed
+- [x] 打包 `dist\ainput-1.0.0-preview.58`
+- [x] Windows 交互桌面运行 preview.58
+- [x] 真实语音日志出现多条 `Qwen sidecar partial updated`，`partial_updates` 持续递增
+
+## Round 32：preview.57 HUD partial 直接上屏
+
+- [x] 复放用户刚才 raw wav，确认 Qwen 从 1s 起已持续返回递增 partial
+- [x] 定位慢感根因：HUD microstream 逐字追赶导致显示落后于模型返回
+- [x] 将 `StreamingPartial` 改为直接刷新 HUD 当前文本
+- [x] 将 Qwen partial 更新日志提升到 info，并记录 `partial_updates`
+
+完成判定：
+
+- [ ] `cargo fmt --check` 通过
+- [ ] `cargo test -p ainput-desktop` 通过
+- [x] 打包 `dist\ainput-1.0.0-preview.57`
+- [x] Windows 交互桌面运行 preview.57
+- [x] 真实语音日志证明 preview.57 只修掉 HUD 逐字追赶，仍被旧稳定策略挡住后续 Qwen partial
+
+---
+
 ## Round 31：preview.56 Qwen sidecar 低延迟与截断修复
 
 - [x] 调低 Qwen sidecar 内部流式参数：`chunk_size_sec=0.5`、`unfixed_chunk_num=1`、`unfixed_token_num=2`

@@ -36,3 +36,14 @@
 - [x] Package `1.0.0-preview.56` into a new dist directory and zip.
 - [x] Launch preview.56 in the Windows interactive session.
 - [x] Verify process version, sidecar health, GPU residency, and runtime `chunk_ms=500` log.
+
+## Phase 6: Preview 58 HUD Responsiveness Closeout
+
+- [x] Verify direct Qwen replay returns growing partial text every roughly 500ms.
+- [x] Verify preview.57 live logs still accept only one Qwen partial per utterance.
+- [x] Bypass the old sherpa-oriented `StreamingState` stability policy for Qwen partial HUD updates.
+- [x] Keep Qwen final paste text sourced from `finish.text`, preserving the preview.56 truncation fix.
+- [x] Add a regression test proving growing Qwen partials are accepted and exact duplicates are skipped.
+- [x] Package `1.0.0-preview.58` into a new dist directory and zip.
+- [x] Launch preview.58 in the Windows interactive session.
+- [x] Verify live logs show multiple accepted Qwen partials before release.

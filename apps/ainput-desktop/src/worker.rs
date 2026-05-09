@@ -181,7 +181,6 @@ struct QwenSidecarSession {
     captured_samples: Vec<f32>,
     ingested_input_samples: usize,
     resampler: StreamingResampler,
-    state: StreamingState,
     last_raw_partial: String,
     last_display_text: String,
     total_chunks_fed: usize,
@@ -404,7 +403,6 @@ impl QwenSidecarSession {
             captured_samples: Vec::new(),
             ingested_input_samples: 0,
             resampler: StreamingResampler::new(input_sample_rate_hz, sidecar.sample_rate_hz),
-            state: StreamingState::default(),
             last_raw_partial: String::new(),
             last_display_text: String::new(),
             total_chunks_fed: 0,
@@ -1077,6 +1075,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                             release_tail_timeout_fallback = release_drain.timeout_fallback,
                             streamed_samples,
                             total_chunks_fed = session.total_chunks_fed,
+                            partial_updates = session.partial_updates,
                             "streaming push-to-talk recording captured"
                         );
 
@@ -1325,6 +1324,7 @@ pub(crate) fn streaming_push_to_talk_worker(
                             total_decode_steps = session.total_decode_steps,
                             output_elapsed_ms,
                             release_to_commit_elapsed_ms,
+                            partial_updates = session.partial_updates,
                             pipeline_elapsed_ms,
                             realtime_factor = format_args!("{realtime_factor:.3}"),
                             "streaming transcription delivered"
@@ -1946,7 +1946,7 @@ fn emit_qwen_response_if_changed(
     }
     if let Some(update) = apply_qwen_sidecar_partial_update(session, &response.text, "qwen_partial")
     {
-        tracing::debug!(
+        tracing::info!(
             session_id = %session.session_id,
             sidecar_audio_ms = response.audio_ms,
             sidecar_elapsed_ms = response.elapsed_ms,
@@ -1954,6 +1954,7 @@ fn emit_qwen_response_if_changed(
             raw_text = %short_log_text(&update.raw_text, 120),
             prepared_text = %short_log_text(&update.display_text, 120),
             revision = update.revision,
+            partial_updates = session.partial_updates,
             "Qwen sidecar partial updated"
         );
         if let Some(proxy) = proxy {
@@ -1977,33 +1978,42 @@ fn apply_qwen_sidecar_partial_update(
     let normalized = ainput_rewrite::normalize_streaming_preview(raw_text);
     let prepared = apply_streaming_punctuation_cleanup(&normalized);
     let prepared = prepared.trim();
-    if prepared.is_empty()
-        || (session.last_raw_partial == raw_text && session.last_display_text == prepared)
-    {
+    if prepared.is_empty() {
+        tracing::debug!(
+            session_id = %session.session_id,
+            source,
+            "skip empty Qwen sidecar partial"
+        );
         return None;
     }
-    let update = session
-        .state
-        .apply_online_partial_with_policy(prepared, StreamingStabilityPolicy::default())?;
-    if update.rejected_prefix_rewrite && session.last_display_text == update.display_text {
+    if session.last_display_text == prepared {
+        tracing::trace!(
+            session_id = %session.session_id,
+            source,
+            prepared_text = %short_log_text(prepared, 120),
+            "skip duplicate Qwen sidecar partial"
+        );
         return None;
     }
+
     session.last_raw_partial = raw_text.to_string();
-    session.last_display_text = update.display_text.clone();
-    if session.first_partial_at.is_none() && !update.display_text.trim().is_empty() {
+    session.last_display_text = prepared.to_string();
+    if session.first_partial_at.is_none() {
         session.first_partial_at = Some(Instant::now());
     }
     session.partial_updates += 1;
+    let revision = session.partial_updates as u64;
+    let visible_chars = visible_text_char_count(prepared);
     Some(PreparedStreamingPartial {
         raw_text: raw_text.to_string(),
         online_prepared_text: prepared.to_string(),
-        display_text: update.display_text,
+        display_text: prepared.to_string(),
         source,
-        stable_chars: update.stable_chars,
-        frozen_chars: update.frozen_chars,
-        volatile_chars: update.volatile_chars,
-        revision: update.revision,
-        rejected_prefix_rewrite: update.rejected_prefix_rewrite,
+        stable_chars: visible_chars,
+        frozen_chars: visible_chars,
+        volatile_chars: 0,
+        revision,
+        rejected_prefix_rewrite: false,
     })
 }
 
@@ -6093,14 +6103,15 @@ fn strip_trailing_terminal_sentence_punctuation(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioActivity, STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS, STREAMING_OFFLINE_FINAL_HARD_MS,
+        AudioActivity, QwenSidecarSession, QwenStartResponse,
+        STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS, STREAMING_OFFLINE_FINAL_HARD_MS,
         STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT, StreamingCommitSource,
         StreamingOfflineFinalScope, StreamingResampler, analyze_recent_audio_activity,
-        append_with_suffix_prefix_overlap, apply_streaming_punctuation_cleanup,
-        build_streaming_ai_rewrite_candidate, current_ai_rewrite_tail,
-        dedupe_streaming_punctuation, effective_ai_rewrite_min_visible_chars,
-        ensure_terminal_sentence_boundary, estimate_speech_start_ms,
-        finalize_streaming_commit_text, is_ai_rewrite_outcome_current,
+        append_with_suffix_prefix_overlap, apply_qwen_sidecar_partial_update,
+        apply_streaming_punctuation_cleanup, build_streaming_ai_rewrite_candidate,
+        current_ai_rewrite_tail, dedupe_streaming_punctuation,
+        effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
+        estimate_speech_start_ms, finalize_streaming_commit_text, is_ai_rewrite_outcome_current,
         merge_ai_rewrite_tail_into_current_display, merge_rolled_over_prefix,
         merge_streaming_offline_tail_repair, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
@@ -6127,6 +6138,36 @@ mod tests {
             prepare_streaming_preview_text("嗯， 帮我看一下 这个功能", false, None),
             "帮我看一下 这个功能"
         );
+    }
+
+    #[test]
+    fn qwen_partial_updates_bypass_old_stability_policy() {
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        );
+
+        let first = apply_qwen_sidecar_partial_update(&mut session, "我感觉他找", "qwen_partial")
+            .expect("first qwen partial should be accepted");
+        assert_eq!(first.display_text, "我感觉他找");
+        assert_eq!(session.partial_updates, 1);
+
+        let second =
+            apply_qwen_sidecar_partial_update(&mut session, "我感觉他早就识", "qwen_partial")
+                .expect("growing qwen partial should not be filtered by StreamingState");
+        assert_eq!(second.display_text, "我感觉他早就识");
+        assert_eq!(session.partial_updates, 2);
+
+        assert!(
+            apply_qwen_sidecar_partial_update(&mut session, "我感觉他早就识", "qwen_partial")
+                .is_none(),
+            "exact duplicate qwen partial should still be skipped"
+        );
+        assert_eq!(session.partial_updates, 2);
     }
 
     #[test]

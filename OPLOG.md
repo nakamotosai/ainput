@@ -1,5 +1,23 @@
 # ainput OPLOG
 
+## 2026-05-10 打包 1.0.0-preview.58：Qwen partial 绕开旧稳定策略
+
+- 根因确认：preview.57 已经取消 HUD 逐字 microstream，但 live 日志仍然每段话只出现 1 条 `Qwen sidecar partial updated`；Qwen raw replay 证明 sidecar 每 500ms 都在返回递增文本。
+- 修复：Qwen partial 不再走 `StreamingState::apply_online_partial_with_policy()`，避免旧 sherpa-oriented 稳定策略把后续递增文本过滤掉。
+- 新规则：Qwen partial 只做 `normalize_streaming_preview`、标点清理、trim、去空、去重复，然后直接作为 HUD truth 上屏。
+- 保持 V19 架构：没有 offline final、没有 HUD/offline merge、没有 release hidden correction；release 只负责 drain tail、finish sidecar、用最终 HUD 文本提交。
+
+## 2026-05-10 打包 1.0.0-preview.57：HUD partial 直接上屏
+
+- 根因确认：Qwen sidecar 早已在 1s 后开始返回 partial，之后约每 500ms 返回递增文本；慢感来自 HUD microstream 每 14ms 只推进 1 个字符。
+- `StreamingPartial` 现在直接刷新 HUD 当前文本，不再走逐字追赶动画。
+- Qwen partial 更新日志从 debug 提升到 info，并记录 `partial_updates`，方便之后直接判断“模型已返回 / HUD 是否更新”。
+- 保持 preview.56 的 final 截断修复和 Qwen 低延迟参数。
+
+验证：
+- 用用户刚才长句 raw wav 分块复放，Qwen 第 2 个 chunk / 1000ms 音频即返回文本，后续每个 500ms chunk 都返回递增文本。
+- 待打包后用真实 Ctrl 语音确认 HUD 不再等到松手才一次性追上。
+
 ## 2026-05-10 打包 1.0.0-preview.56：Qwen sidecar 低延迟参数与 final 截断修复
 
 - 将 Qwen sidecar 的启动环境调到 `QWEN3_CHUNK_SIZE_SEC=0.5`、`QWEN3_UNFIXED_CHUNK_NUM=1`、`QWEN3_UNFIXED_TOKEN_NUM=2`。

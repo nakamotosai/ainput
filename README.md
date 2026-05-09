@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.56`
+当前预览版本：`1.0.0-preview.58`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -11,12 +11,12 @@
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
 - `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
-- `1.0.0-preview.56` 当前流式主模型是本机 Windows GPU / WSL2 sidecar 上的原版 `Qwen/Qwen3-ASR-0.6B`；`sherpa` 仍保留为配置回退。
+- `1.0.0-preview.58` 当前流式主模型是本机 Windows GPU / WSL2 sidecar 上的原版 `Qwen/Qwen3-ASR-0.6B`；`sherpa` 仍保留为配置回退。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
 - 流式模式不再在松手后跑 offline final，不再做 HUD 文本和 offline 尾巴合并，也不再做 release-time final correction。
 - HUD 文本是最终真相源；最终上屏文本必须等于 drain 完成后的 HUD truth snapshot。
 - AI rewrite 不属于 V19：本版流式主链路会绕开/隔离已有改写代码，改写能力移到 Roadmap / Future Work。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.56\` 与 `dist\ainput-1.0.0-preview.56.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.58\` 与 `dist\ainput-1.0.0-preview.58.zip`。
 
 它不做系统级 IME。当前默认热路径由本地 ASR/HUD 单链路负责；AI rewrite 暂不参与 V19 语音提交链路。当前重点是把四条前台主链路做稳：
 
@@ -61,6 +61,8 @@
   - 应用层短停顿 endpointing 仍保留为配置项，但默认关闭；流式默认在一次按住说话内保持同一条滚动状态
   - Qwen sidecar 默认流式块时长为 `500ms`，sidecar 内部 `chunk_size_sec=0.5` / `unfixed_chunk_num=1` / `unfixed_token_num=2`
   - `preview.56` 的最终提交直接来自 Qwen final text 清理结果，不再用可能滞后的 HUD state 截断最终上屏文本
+  - `preview.57` 的 HUD partial 直接显示当前识别文本，不再使用逐字 microstream 追赶，避免模型已返回但 HUD 迟迟不上屏
+  - `preview.58` 的 Qwen partial 绕开旧 sherpa 稳定策略；Qwen 每次返回的递增文本只做规范化/标点清理/去重后立即推到 HUD
   - 流式模式的标点主链来自官方 `ct-transformer` 标点模型；模型缺失时只降级为无标点，不再让整个流式功能启动失败
   - V19 流式提交链路禁用 AI rewrite 写入；已有改写代码不能改 HUD truth 或最终上屏文本
   - HUD 默认停靠在屏幕正下方、任务栏上方
