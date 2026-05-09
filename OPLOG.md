@@ -1,5 +1,38 @@
 # ainput OPLOG
 
+## 2026-05-10 打包 1.0.0-preview.56：Qwen sidecar 低延迟参数与 final 截断修复
+
+- 将 Qwen sidecar 的启动环境调到 `QWEN3_CHUNK_SIZE_SEC=0.5`、`QWEN3_UNFIXED_CHUNK_NUM=1`、`QWEN3_UNFIXED_TOKEN_NUM=2`。
+- 同步更新 WSL sidecar 脚本默认值：`/home/sai/ainput-qwen3-asr/qwen3_asr_sidecar.py`。
+- 修复 preview.55 的最终提交截断：final paste 直接来自 Qwen `finish.text` 的 normalize / cleanup 结果，不再用可能滞后的 HUD state。
+- 保持 V19 约束：无 offline final、无 HUD/offline merge、无 release hidden correction，AI rewrite 仍不参与语音提交链路。
+- 打包产物：`dist\ainput-1.0.0-preview.56\` 与 `dist\ainput-1.0.0-preview.56.zip`。
+- 已启动到 Windows 交互桌面，当前进程路径为 `dist\ainput-1.0.0-preview.56\ainput-desktop.exe`。
+
+验证：
+- `cargo fmt --check` 通过。
+- `cargo test -p ainput-desktop` 通过，106 passed。
+- zip 内确认包含 `ainput-desktop.exe`。
+- 运行进程 FileVersion / ProductVersion 均为 `1.0.0-preview.56`。
+- Qwen sidecar `/health` 返回 `ok=true`、`model=Qwen/Qwen3-ASR-0.6B`。
+- 运行日志确认 worker 为 `chunk_ms=500`，WSL 启动命令包含 `QWEN3_CHUNK_SIZE_SEC=0.5`。
+
+## 2026-05-10 打包 1.0.0-preview.55：切到本机 GPU Qwen3-ASR sidecar
+
+- 默认流式后端切到 `qwen3_sidecar`，通过 WSL2 使用本机 RTX 2080 Ti 跑原版 `Qwen/Qwen3-ASR-0.6B`。
+- 保留 `sherpa` 作为显式配置回退：`[voice.streaming].backend = "sherpa"`，同时回退 `chunk_ms = 60`。
+- WSL sidecar 环境固定在 `/home/sai/ainput-qwen3-asr`，模型和 venv 不落到 C 盘。
+- 自动启动方式改为 spawn 一个前台 WSL `uvicorn qwen3_asr_sidecar:app` 子进程，避免 `nohup ... &` 在 SSH/WSL 场景下不留驻。
+- 继续保持 V19 HUD truth：无 offline final、无 HUD/offline 合并、无 release hidden correction；最终上屏等于 HUD ack 文本。
+- 打包产物：`dist\ainput-1.0.0-preview.55\` 与 `dist\ainput-1.0.0-preview.55.zip`。
+
+验证：
+- `cargo fmt --check` 通过。
+- `cargo test -p ainput-desktop` 通过，106 passed。
+- Qwen sidecar `/health` 返回 `ok=true`、`model=Qwen/Qwen3-ASR-0.6B`。
+- 5 条近期失败 wav 的 HTTP sidecar 回归通过，结果写入 `tmp/qwen3-asr-0.6b-sidecar-http-eval.json`。
+- 已停止 `preview.54`，并启动 `dist\ainput-1.0.0-preview.55\ainput-desktop.exe`，PID `95688`。
+
 ## 2026-04-16 打包 1.0.13 便携版
 
 - 将 workspace 版本从 `1.0.12` 提升到 `1.0.13`

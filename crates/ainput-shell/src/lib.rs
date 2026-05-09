@@ -63,6 +63,11 @@ pub enum VoiceMode {
 pub struct StreamingVoiceConfig {
     pub enabled: bool,
     pub model_dir: String,
+    pub backend: String,
+    pub sidecar_url: String,
+    pub sidecar_auto_start: bool,
+    pub sidecar_wsl_distro: String,
+    pub sidecar_wsl_workdir: String,
     pub panel_enabled: bool,
     pub rewrite_enabled: bool,
     pub punctuation_model_dir: String,
@@ -259,6 +264,11 @@ impl Default for StreamingVoiceConfig {
         Self {
             enabled: true,
             model_dir: "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en".to_string(),
+            backend: "sherpa".to_string(),
+            sidecar_url: "http://127.0.0.1:8765".to_string(),
+            sidecar_auto_start: true,
+            sidecar_wsl_distro: "Ubuntu".to_string(),
+            sidecar_wsl_workdir: "/home/sai/ainput-qwen3-asr".to_string(),
             panel_enabled: true,
             rewrite_enabled: true,
             punctuation_model_dir:

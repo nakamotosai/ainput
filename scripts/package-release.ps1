@@ -582,7 +582,7 @@ Sync-MainConfigSectionKeys `
     -ConfigPath (Join-Path $packageDir "config\ainput.toml") `
     -CanonicalConfigPath (Join-Path $repoRoot "config\ainput.toml") `
     -SectionName "voice.streaming" `
-    -Keys @("model_dir", "rewrite_enabled", "punctuation_model_dir", "punctuation_num_threads", "chunk_ms") `
+    -Keys @("backend", "model_dir", "sidecar_url", "sidecar_auto_start", "sidecar_wsl_distro", "sidecar_wsl_workdir", "rewrite_enabled", "punctuation_model_dir", "punctuation_num_threads", "chunk_ms") `
     -ForcedValues @{
         model_dir = ('model_dir = "models/' + $streamingModelName + '"')
         punctuation_model_dir = ('punctuation_model_dir = "models/punctuation/' + $streamingPunctuationModelName + '"')

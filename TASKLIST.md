@@ -5,6 +5,47 @@
 
 ---
 
+## Round 31：preview.56 Qwen sidecar 低延迟与截断修复
+
+- [x] 调低 Qwen sidecar 内部流式参数：`chunk_size_sec=0.5`、`unfixed_chunk_num=1`、`unfixed_token_num=2`
+- [x] 修复 final 上屏截断：最终提交直接取 Qwen `finish.text` 清理结果
+- [x] 同步 WSL live sidecar 脚本到 `/home/sai/ainput-qwen3-asr/qwen3_asr_sidecar.py`
+- [x] 打包 preview：`dist\ainput-1.0.0-preview.56`
+- [x] 启动到用户交互桌面：`preview.56`
+
+完成判定：
+
+- [x] `cargo fmt --check` 通过
+- [x] `cargo test -p ainput-desktop` 通过，106 passed
+- [x] zip 内包含 `ainput-desktop.exe`
+- [x] Windows 运行进程路径和版本号均为 `preview.56`
+- [x] Qwen sidecar `/health` 通过，模型为 `Qwen/Qwen3-ASR-0.6B`
+- [x] 日志确认 `chunk_ms=500`，WSL 命令包含 `QWEN3_CHUNK_SIZE_SEC=0.5`
+
+---
+
+
+## Round 30：preview.55 本机 GPU Qwen3-ASR sidecar
+
+- [x] 新增 Spec：`specs/streaming-qwen3-sidecar-preview55/`
+- [x] WSL 环境固定在 `/home/sai/ainput-qwen3-asr`，使用原版 `Qwen/Qwen3-ASR-0.6B`
+- [x] 默认流式后端切到 `qwen3_sidecar`，保留 `sherpa` 配置回退
+- [x] 自动启动 sidecar 改为持久在线 WSL 子进程：`uvicorn qwen3_asr_sidecar:app`
+- [x] 保持 V19 HUD truth：不恢复 offline final / merge / hidden correction
+- [x] AI rewrite 继续禁用在语音链路中，留在 roadmap
+- [x] 打包 preview：`dist\ainput-1.0.0-preview.55`
+- [x] 最新版本启动到用户交互桌面：`preview.55` PID `95688`
+
+完成判定：
+
+- [x] `cargo fmt --check` 通过
+- [x] `cargo test -p ainput-desktop` 通过，106 passed
+- [x] Qwen sidecar `/health` 通过，模型为 `Qwen/Qwen3-ASR-0.6B`
+- [x] 5 条近期失败 wav 的 HTTP sidecar 回归通过
+- [x] 包内 `config\ainput.toml` 确认 `backend = "qwen3_sidecar"`、`chunk_ms = 500`、AI rewrite disabled
+
+---
+
 ## Round 29：流式 AI HUD 尾巴改写 v16
 
 - [x] 新增 Spec：`specs/streaming-ai-rewrite-v16/`
