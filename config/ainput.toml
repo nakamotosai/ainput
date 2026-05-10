@@ -76,8 +76,8 @@ sidecar_url = "http://127.0.0.1:8765"
 sidecar_auto_start = true
 
 # sidecar 空闲多久后自动退出并释放显存（毫秒）
-# 默认 5 分钟；下次按热键时会自动重新拉起
-sidecar_idle_unload_ms = 300000
+# Preview.69 默认 1 小时；下次按热键时会自动重新拉起
+sidecar_idle_unload_ms = 3600000
 
 # Qwen3-ASR sidecar 的 WSL 位置；模型和 venv 保持在 WSL Linux 磁盘，避免占满 C 盘
 sidecar_wsl_distro = "Ubuntu"
@@ -98,6 +98,22 @@ punctuation_num_threads = 1
 # 流式音频块时长（毫秒）。
 # Preview.68 进一步收紧到 120ms，优先让首个 partial 和松手收尾更跟手。
 chunk_ms = 120
+
+[voice.streaming.qwen3]
+# Qwen3-ASR context；只作用于 qwen3_sidecar 流式后端。
+context = """这是 Windows 语音输入法的实时转写场景。用户主要说中文，但经常中英文混杂，包含模型名、版本号、路径、快捷键、代码词、参数名和聊天软件输入内容。请输出用户最可能真正想输入的文字，可以把明显口语化、重复、同音错字、近音错字整理成正式、通顺、无错字的表达，但不能改变原意或添加新信息。不要因为短暂停顿就强行结束句子；不要机械插入逗号、句号或问号；只有语气和语义都明确时才保留合适标点。不要重复已经识别过的内容。中文按中文输出，英文、数字、路径、参数名、快捷键和专有名词尽量原样保留。不要解释。"""
+
+# Qwen3-ASR 官方流式参数。
+chunk_size_sec = 0.18
+unfixed_chunk_num = 4
+unfixed_token_num = 5
+
+# vLLM / Qwen3-ASR 启动参数。
+max_new_tokens = 64
+enforce_eager = false
+gpu_memory_utilization = 0.50
+max_model_len = 2048
+dtype = "float16"
 
 [voice.streaming.endpoint]
 # 是否启用按住期间的停顿收尾。开启后只刷新 HUD 和稳定前缀，不会提前上屏。
@@ -177,7 +193,7 @@ require_hud_flush_before_commit = true
 # 是否启用实验性 AI 尾巴改写。
 # 按住 Ctrl 时可逐步改写 HUD 当前尾巴；松开后立即停止参与本轮提交。
 # 只允许改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
-enabled = false
+enabled = true
 
 # 可选：OpenAI 兼容改写服务地址。
 # 默认走 vps-jp 上的 cliproxyapi 8317。

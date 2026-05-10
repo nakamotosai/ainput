@@ -877,3 +877,26 @@ Verification:
 - cargo test -p ainput-desktop passed: 106/106.
 - scripts\readme_closeout_guard.py passed.
 - Packaged exe file version is 1.0.0-preview.54 and the Windows interactive process is running from preview.54.
+
+## 2026-05-10 preview.69 Qwen streaming normalization and fast commit
+
+Result:
+- Bumped package to `1.0.0-preview.69`.
+- Added `[voice.streaming.qwen3]` config for Qwen context and streaming/vLLM parameters.
+- Set Qwen defaults to `chunk_size_sec=0.18`, `unfixed_chunk_num=4`, `unfixed_token_num=5`, `max_new_tokens=64`, `enforce_eager=false`.
+- Changed Qwen sidecar idle unload to `3600000ms`.
+- Updated Qwen context for Chinese/English mixed realtime dictation, formal normalization, no forced punctuation on short pauses, and no repeated recognized content.
+- Changed AI rewrite prompt into formal normalization: oral/rough ASR tail can be rewritten into correct, formal, natural language without changing intent.
+- Kept Qwen forced terminal punctuation call as a commented restore point instead of deleting it.
+- Kept non-streaming / fast SenseVoice punctuation path independent from Qwen streaming.
+- Changed WSL auto-start to detach through `powershell.exe Start-Process wsl.exe`, while WSL runs `.venv/bin/python -m uvicorn qwen3_asr_sidecar:app`.
+
+Verification:
+- `cargo fmt --all` passed.
+- `cargo test -p ainput-shell` passed: 6/6.
+- `cargo test -p ainput-desktop` passed: 113/113.
+- `python -m py_compile C:\Users\sai\ainput\tmp\qwen3_asr_sidecar.py` passed.
+- `scripts\package-release.ps1 -Version 1.0.0-preview.69` produced `dist\ainput-1.0.0-preview.69` and zip.
+- Windows interactive scheduled-task launch kept `ainput-desktop.exe` running from preview.69.
+- WSL `pgrep -af uvicorn` showed `/home/sai/ainput-qwen3-asr/.venv/bin/python -m uvicorn qwen3_asr_sidecar:app --host 127.0.0.1 --port 8765`.
+- `/health` returned `idle_unload_ms=3600000`, `requested_enforce_eager=false`, `effective_enforce_eager=false`, `enforce_eager_fallback=true`.

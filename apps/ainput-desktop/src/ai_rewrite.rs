@@ -470,7 +470,7 @@ struct OllamaChatMessage {
 
 fn build_system_prompt(max_output_chars: usize) -> String {
     format!(
-        "你是中文语音输入法 HUD 的实时 AI 改写器。你的输入来自语音识别，当前尾巴里经常有同音错字、近音错字、漏字、专有名词误识别和中英混说误识别。\n你的任务是输出用户最可能真正想输入的最终尾巴。\n硬规则：\n1. 只改写“当前尾巴”，绝不能重复“冻结前缀”。\n2. 优先修正语音识别错词，而不是机械照抄原字面。\n3. 可以按语义修正常见同音错字、近音错字、专有名词，例如：浏览七->浏览器，已识别->已实现，口待克斯->Codex。\n4. 保留用户真实说出的中英文混合、产品名、代码名和 API 名称。\n5. 不确定时返回原文，不要凭空扩写。\n6. 只输出 JSON，不要解释，不要 Markdown，不要代码块。\n7. JSON 格式必须是 {{\"tail\":\"改写后的当前尾巴\"}}。\n8. tail 长度不要超过 {} 个可见字符。",
+        "你是中文语音输入法 HUD 的实时 AI 正则化改写器。你的输入来自语音识别，当前尾巴里经常有口语化表达、同音错字、近音错字、漏字、重复、专有名词误识别和中英混说误识别。\n你的任务是把“当前尾巴”改写成用户最可能真正想输入的正式、通顺、无错字文本。\n硬规则：\n1. 只改写“当前尾巴”，绝不能重复“冻结前缀”。\n2. 允许把口语化、啰嗦、断裂的说法整理成正儿八经的书面表达。\n3. 优先修正语音识别错词，而不是机械照抄原字面。\n4. 可以按语义修正常见同音错字、近音错字、专有名词，例如：浏览七->浏览器，已识别->已实现，口待克斯->Codex。\n5. 保留用户真实说出的中英文混合、产品名、代码名、API 名称、版本号和参数名。\n6. 不确定时尽量小改，不要凭空扩写、改变原意或添加新事实。\n7. 只输出 JSON，不要解释，不要 Markdown，不要代码块。\n8. JSON 格式必须是 {{\"tail\":\"改写后的当前尾巴\"}}。\n9. tail 长度不要超过 {} 个可见字符。",
         max_output_chars
     )
 }
@@ -495,7 +495,7 @@ fn build_user_prompt(request: &AiRewriteRequest, max_context_chars: usize) -> St
     };
 
     format!(
-        "下面是一次实时语音输入改写请求。\n请结合应用场景、窗口标题、光标附近文本和冻结前文，纠正“当前尾巴”里的语音识别错误。\n当前应用: {}\n窗口标题: {}\n光标环境: {}\n选中文本: {}\n光标前文本: {}\n光标后文本: {}\n冻结前缀(只做参考，绝不能输出):\n{}\n当前尾巴(只改这里):\n{}\n\n请只返回 JSON：{{\"tail\":\"纠正后的当前尾巴\"}}。",
+        "下面是一次实时语音输入正则化改写请求。\n请结合应用场景、窗口标题、光标附近文本和冻结前文，把“当前尾巴”整理成正式、通顺、无错字的最终输入文本。\n当前应用: {}\n窗口标题: {}\n光标环境: {}\n选中文本: {}\n光标前文本: {}\n光标后文本: {}\n冻结前缀(只做参考，绝不能输出):\n{}\n当前尾巴(只改这里):\n{}\n\n请只返回 JSON：{{\"tail\":\"改写后的当前尾巴\"}}。",
         process_name,
         window_title,
         describe_output_context_kind(request.context.kind),
@@ -622,8 +622,8 @@ fn short_log_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiRewriteRequest, OutputContextKind, OutputContextSnapshot, build_user_prompt,
-        normalize_model_output, openai_reasoning_effort, take_last_chars,
+        AiRewriteRequest, OutputContextKind, OutputContextSnapshot, build_system_prompt,
+        build_user_prompt, normalize_model_output, openai_reasoning_effort, take_last_chars,
     };
 
     #[test]
@@ -659,7 +659,16 @@ mod tests {
         assert!(prompt.contains("选中文本: 旧文本"));
         assert!(prompt.contains("第一句已经稳定。"));
         assert!(prompt.contains("第二句先是错字"));
-        assert!(prompt.contains("{\"tail\":\"纠正后的当前尾巴\"}"));
+        assert!(prompt.contains("{\"tail\":\"改写后的当前尾巴\"}"));
+        assert!(prompt.contains("正式、通顺、无错字"));
+    }
+
+    #[test]
+    fn system_prompt_requires_formal_normalized_rewrite() {
+        let prompt = build_system_prompt(64);
+        assert!(prompt.contains("正则化改写器"));
+        assert!(prompt.contains("正儿八经的书面表达"));
+        assert!(prompt.contains("不是机械照抄原字面"));
     }
 
     #[test]

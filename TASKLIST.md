@@ -1061,3 +1061,35 @@
 
 - [x] 进入截图态后，用户可立即感知屏幕变暗
 - [x] 拖选时只有选区保持原亮度，外部区域持续变暗
+
+### 9.11 preview.69 Qwen 流式参数与显存释放
+
+- [x] `unfixed_token_num` 改为 `5`
+- [x] `unfixed_chunk_num` 改为 `4`
+- [x] `max_new_tokens` 改为 `64`
+- [x] 默认请求 `enforce_eager = false`
+- [x] 保留 `enforce_eager=false` 失败时的 runtime fallback
+- [x] sidecar 空闲释放显存时间改为 1 小时
+- [x] `/health` 暴露 requested/effective enforce eager 和 idle unload
+
+完成判定：
+
+- [x] Windows 真实启动后 `/health` 返回 `idle_unload_ms=3600000`
+- [x] Windows 真实启动后 `/health` 返回 `requested_enforce_eager=false`
+- [x] Windows 真实启动后 `/health` 返回 `effective_enforce_eager=false`
+
+### 9.12 preview.69 正则化改写与流式/非流式边界
+
+- [x] AI rewrite prompt 改为“正则化改写器”
+- [x] 允许把口语化、啰嗦、断裂语音整理成正式、通顺、无错字文本
+- [x] Qwen 流式路径不再强行补句末 `。` / `？`
+- [x] 旧 Qwen 句末补标点调用以注释形式保留，方便以后恢复
+- [x] 非流式 / fast SenseVoice 与 Qwen 流式路径保持独立，非流式继续保留手动标点需求
+- [x] preview.69 SPEC/PLAN 已更新为当前真实架构
+
+完成判定：
+
+- [x] `cargo test -p ainput-desktop` 通过 113/113
+- [x] `qwen_fast_release_commits_current_hud_without_terminal_punctuation` 覆盖 Qwen 松手快提交流程
+- [x] `qwen_finalize_does_not_force_sentence_boundary` 覆盖 Qwen 不强制句末标点
+- [x] `system_prompt_requires_formal_normalized_rewrite` 覆盖正则化改写 prompt

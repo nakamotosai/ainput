@@ -865,6 +865,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 打包正式版
 
+## 当前交接：preview.69 Qwen 流式收口
+
+当前可测版本：
+
+- `dist\ainput-1.0.0-preview.69\`
+- `dist\ainput-1.0.0-preview.69.zip`
+
+preview.69 的流式默认后端是 `qwen3_sidecar`，通过 WSL2 使用原版 `Qwen/Qwen3-ASR-0.6B`。本轮冻结的 Qwen 参数是：
+
+- `chunk_size_sec = 0.18`
+- `unfixed_chunk_num = 4`
+- `unfixed_token_num = 5`
+- `max_new_tokens = 64`
+- `enforce_eager = false`
+- `sidecar_idle_unload_ms = 3600000`
+
+本轮架构边界：
+
+- Qwen 流式路径以 HUD 当前文本为最终真相源，松开热键时优先快速提交 HUD 快照。
+- Qwen 流式路径不再本地强行补 `。` / `？` / 逗号；旧句末补标点调用保留为注释，方便以后恢复。
+- AI rewrite 是 HUD 文本层的正则化改写，目标是把口语化、错字、重复和断裂表达改写成正式、通顺、无错字的最终输入文本。
+- 非流式 / fast SenseVoice 路径与 Qwen 流式路径保持独立，继续保留需要的手动标点逻辑。
+- WSL sidecar 由 Windows 侧 `powershell.exe Start-Process wsl.exe` 拉起，WSL 内运行 `.venv/bin/python -m uvicorn qwen3_asr_sidecar:app`，日志在 `/home/sai/ainput-qwen3-asr/qwen3_asr_sidecar.log`。
+
+preview.69 验证记录：
+
+- `cargo fmt --all`
+- `cargo test -p ainput-shell`：6/6 passed
+- `cargo test -p ainput-desktop`：113/113 passed
+- `python -m py_compile tmp\qwen3_asr_sidecar.py`
+- `scripts\package-release.ps1 -Version 1.0.0-preview.69`
+- Windows 交互会话计划任务启动后，`ainput-desktop.exe` 保持运行，WSL `pgrep -af uvicorn` 能看到 Qwen sidecar。
+- `/health` 返回 `idle_unload_ms=3600000`、`requested_enforce_eager=false`、`effective_enforce_eager=false`、`enforce_eager_fallback=true`。
+
 构建正式版：
 
 ```powershell

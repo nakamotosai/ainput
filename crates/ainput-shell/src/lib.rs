@@ -74,12 +74,27 @@ pub struct StreamingVoiceConfig {
     pub punctuation_model_dir: String,
     pub punctuation_num_threads: i32,
     pub chunk_ms: u32,
+    pub qwen3: StreamingQwen3Config,
     pub endpoint: StreamingEndpointConfig,
     pub stability: StreamingStabilityConfig,
     pub finalize: StreamingFinalizeConfig,
     pub performance: StreamingPerformanceConfig,
     pub commit: StreamingCommitConfig,
     pub ai_rewrite: StreamingAiRewriteConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingQwen3Config {
+    pub context: String,
+    pub chunk_size_sec: f64,
+    pub unfixed_chunk_num: i32,
+    pub unfixed_token_num: i32,
+    pub max_new_tokens: u32,
+    pub enforce_eager: bool,
+    pub gpu_memory_utilization: f64,
+    pub max_model_len: u32,
+    pub dtype: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,7 +283,7 @@ impl Default for StreamingVoiceConfig {
             backend: "sherpa".to_string(),
             sidecar_url: "http://127.0.0.1:8765".to_string(),
             sidecar_auto_start: true,
-            sidecar_idle_unload_ms: 300_000,
+            sidecar_idle_unload_ms: 3_600_000,
             sidecar_wsl_distro: "Ubuntu".to_string(),
             sidecar_wsl_workdir: "/home/sai/ainput-qwen3-asr".to_string(),
             panel_enabled: true,
@@ -278,12 +293,29 @@ impl Default for StreamingVoiceConfig {
                     .to_string(),
             punctuation_num_threads: 1,
             chunk_ms: 120,
+            qwen3: StreamingQwen3Config::default(),
             endpoint: StreamingEndpointConfig::default(),
             stability: StreamingStabilityConfig::default(),
             finalize: StreamingFinalizeConfig::default(),
             performance: StreamingPerformanceConfig::default(),
             commit: StreamingCommitConfig::default(),
             ai_rewrite: StreamingAiRewriteConfig::default(),
+        }
+    }
+}
+
+impl Default for StreamingQwen3Config {
+    fn default() -> Self {
+        Self {
+            context: "这是 Windows 语音输入法的实时转写场景。用户主要说中文，但经常中英文混杂，包含模型名、版本号、路径、快捷键、代码词、参数名和聊天软件输入内容。请输出用户最可能真正想输入的文字，可以把明显口语化、重复、同音错字、近音错字整理成正式、通顺、无错字的表达，但不能改变原意或添加新信息。不要因为短暂停顿就强行结束句子；不要机械插入逗号、句号或问号；只有语气和语义都明确时才保留合适标点。不要重复已经识别过的内容。中文按中文输出，英文、数字、路径、参数名、快捷键和专有名词尽量原样保留。不要解释。".to_string(),
+            chunk_size_sec: 0.18,
+            unfixed_chunk_num: 4,
+            unfixed_token_num: 5,
+            max_new_tokens: 64,
+            enforce_eager: false,
+            gpu_memory_utilization: 0.50,
+            max_model_len: 2048,
+            dtype: "float16".to_string(),
         }
     }
 }
@@ -965,6 +997,22 @@ punctuation_num_threads = {streaming_punctuation_num_threads}
 # 数值越小，HUD 更新会更勤；数值越大，吞吐更稳但刷新会更慢。
 chunk_ms = {streaming_chunk_ms}
 
+[voice.streaming.qwen3]
+# Qwen3-ASR system context；只作用于 qwen3_sidecar 流式后端。
+context = """{streaming_qwen3_context}"""
+
+# Qwen3-ASR 官方流式参数。
+chunk_size_sec = {streaming_qwen3_chunk_size_sec}
+unfixed_chunk_num = {streaming_qwen3_unfixed_chunk_num}
+unfixed_token_num = {streaming_qwen3_unfixed_token_num}
+
+# vLLM / Qwen3-ASR 启动参数。
+max_new_tokens = {streaming_qwen3_max_new_tokens}
+enforce_eager = {streaming_qwen3_enforce_eager}
+gpu_memory_utilization = {streaming_qwen3_gpu_memory_utilization}
+max_model_len = {streaming_qwen3_max_model_len}
+dtype = "{streaming_qwen3_dtype}"
+
 [voice.streaming.endpoint]
 # 是否启用应用层分段；启用后不再主要依赖 ASR 内置 10 秒静音端点。
 enabled = {streaming_endpoint_enabled}
@@ -1172,6 +1220,28 @@ file_name = "{log_file_name}"
         streaming_punctuation_model_dir = config.voice.streaming.punctuation_model_dir,
         streaming_punctuation_num_threads = config.voice.streaming.punctuation_num_threads,
         streaming_chunk_ms = config.voice.streaming.chunk_ms,
+        streaming_qwen3_context = config
+            .voice
+            .streaming
+            .qwen3
+            .context
+            .replace('\\', "\\\\")
+            .replace("\"\"\"", "\\\"\\\"\\\""),
+        streaming_qwen3_chunk_size_sec = config.voice.streaming.qwen3.chunk_size_sec,
+        streaming_qwen3_unfixed_chunk_num = config.voice.streaming.qwen3.unfixed_chunk_num,
+        streaming_qwen3_unfixed_token_num = config.voice.streaming.qwen3.unfixed_token_num,
+        streaming_qwen3_max_new_tokens = config.voice.streaming.qwen3.max_new_tokens,
+        streaming_qwen3_enforce_eager = config.voice.streaming.qwen3.enforce_eager,
+        streaming_qwen3_gpu_memory_utilization =
+            config.voice.streaming.qwen3.gpu_memory_utilization,
+        streaming_qwen3_max_model_len = config.voice.streaming.qwen3.max_model_len,
+        streaming_qwen3_dtype = config
+            .voice
+            .streaming
+            .qwen3
+            .dtype
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
         streaming_endpoint_enabled = config.voice.streaming.endpoint.enabled,
         streaming_endpoint_pause_ms = config.voice.streaming.endpoint.pause_ms,
         streaming_endpoint_soft_flush_ms = config.voice.streaming.endpoint.soft_flush_ms,
@@ -1618,10 +1688,15 @@ text_color = "#111111"
     fn render_config_file_contains_streaming_ai_rewrite_section() {
         let rendered = render_config_file(&AppConfig::default());
         assert!(rendered.contains("[voice.streaming.endpoint]"));
-        assert!(rendered.contains("pause_ms = 720"));
-        assert!(rendered.contains("soft_flush_ms = 360"));
+        assert!(rendered.contains("pause_ms = 560"));
+        assert!(rendered.contains("soft_flush_ms = 240"));
         assert!(rendered.contains("[voice.streaming.stability]"));
         assert!(rendered.contains("min_agreement = 2"));
+        assert!(rendered.contains("[voice.streaming.qwen3]"));
+        assert!(rendered.contains("unfixed_chunk_num = 4"));
+        assert!(rendered.contains("unfixed_token_num = 5"));
+        assert!(rendered.contains("max_new_tokens = 64"));
+        assert!(rendered.contains("enforce_eager = false"));
         assert!(rendered.contains("[voice.streaming.ai_rewrite]"));
         assert!(rendered.contains(
             "endpoint_url = \"http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions\""
