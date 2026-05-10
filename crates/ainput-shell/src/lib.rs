@@ -66,6 +66,7 @@ pub struct StreamingVoiceConfig {
     pub backend: String,
     pub sidecar_url: String,
     pub sidecar_auto_start: bool,
+    pub sidecar_idle_unload_ms: u64,
     pub sidecar_wsl_distro: String,
     pub sidecar_wsl_workdir: String,
     pub panel_enabled: bool,
@@ -267,6 +268,7 @@ impl Default for StreamingVoiceConfig {
             backend: "sherpa".to_string(),
             sidecar_url: "http://127.0.0.1:8765".to_string(),
             sidecar_auto_start: true,
+            sidecar_idle_unload_ms: 300_000,
             sidecar_wsl_distro: "Ubuntu".to_string(),
             sidecar_wsl_workdir: "/home/sai/ainput-qwen3-asr".to_string(),
             panel_enabled: true,
@@ -275,7 +277,7 @@ impl Default for StreamingVoiceConfig {
                 "models/punctuation/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
                     .to_string(),
             punctuation_num_threads: 1,
-            chunk_ms: 60,
+            chunk_ms: 120,
             endpoint: StreamingEndpointConfig::default(),
             stability: StreamingStabilityConfig::default(),
             finalize: StreamingFinalizeConfig::default(),
@@ -306,11 +308,11 @@ impl Default for StreamingEndpointConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            pause_ms: 720,
-            soft_flush_ms: 360,
+            pause_ms: 560,
+            soft_flush_ms: 240,
             min_segment_ms: 900,
             max_segment_ms: 16_000,
-            tail_padding_ms: 480,
+            tail_padding_ms: 320,
             preroll_ms: 180,
         }
     }
@@ -328,9 +330,9 @@ impl Default for StreamingStabilityConfig {
 impl Default for StreamingFinalizeConfig {
     fn default() -> Self {
         Self {
-            release_drain_min_ms: 160,
-            release_drain_idle_settle_ms: 160,
-            release_drain_max_ms: 500,
+            release_drain_min_ms: 80,
+            release_drain_idle_settle_ms: 80,
+            release_drain_max_ms: 220,
             final_decode_timeout_ms: 900,
             release_to_commit_hard_ms: 1200,
             allow_display_fallback_on_timeout: true,

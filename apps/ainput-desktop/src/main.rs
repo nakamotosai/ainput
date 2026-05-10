@@ -756,6 +756,52 @@ enum TrayVisualState {
     Error,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VoiceModelPhase {
+    Cold,
+    Loading,
+    Ready,
+    Failed,
+}
+
+struct VoiceModelLifecycle {
+    phase: VoiceModelPhase,
+    last_error: Option<String>,
+    loading_started_at: Option<Instant>,
+    expected_unload_at: Option<Instant>,
+}
+
+impl Default for VoiceModelLifecycle {
+    fn default() -> Self {
+        Self {
+            phase: VoiceModelPhase::Cold,
+            last_error: None,
+            loading_started_at: None,
+            expected_unload_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelLoadSource {
+    Startup,
+    ModeSwitch,
+    Hotkey,
+}
+
+struct ActiveModelLoadNotice {
+    kind: WorkerKind,
+    source: ModelLoadSource,
+    started_at: Instant,
+    loading_message: String,
+    ready_message: String,
+}
+
+struct PendingModelReadyNotice {
+    show_at: Instant,
+    message: String,
+}
+
 struct DesktopApp {
     runtime: AppRuntime,
     proxy: EventLoopProxy<AppEvent>,
@@ -763,8 +809,10 @@ struct DesktopApp {
     overlay_tick_started: bool,
     fast_worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     streaming_worker_tx: Option<mpsc::Sender<WorkerCommand>>,
-    fast_worker_ready: bool,
-    streaming_worker_ready: bool,
+    fast_model: VoiceModelLifecycle,
+    streaming_model: VoiceModelLifecycle,
+    active_model_load_notice: Option<ActiveModelLoadNotice>,
+    pending_model_ready_notice: Option<PendingModelReadyNotice>,
     hotkey_monitor: Option<hotkey::GlobalHotkeyMonitor>,
     automation_service: Option<AutomationService>,
     recording_service: Option<RecordingService>,
@@ -817,8 +865,10 @@ impl DesktopApp {
             overlay_tick_started: false,
             fast_worker_tx: None,
             streaming_worker_tx: None,
-            fast_worker_ready: false,
-            streaming_worker_ready: false,
+            fast_model: VoiceModelLifecycle::default(),
+            streaming_model: VoiceModelLifecycle::default(),
+            active_model_load_notice: None,
+            pending_model_ready_notice: None,
             hotkey_monitor: None,
             automation_service: None,
             recording_service: None,
@@ -871,7 +921,6 @@ impl DesktopApp {
         let shutdown = self.shutdown.clone();
         let (worker_tx, worker_rx) = mpsc::channel();
         self.fast_worker_tx = Some(worker_tx);
-        self.fast_worker_ready = false;
         if self.mode == AppMode::Idle {
             self.refresh_idle_tray_surface();
         }
@@ -904,7 +953,6 @@ impl DesktopApp {
         let shutdown = self.shutdown.clone();
         let (worker_tx, worker_rx) = mpsc::channel();
         self.streaming_worker_tx = Some(worker_tx);
-        self.streaming_worker_ready = false;
         if self.mode == AppMode::Idle {
             self.refresh_idle_tray_surface();
         }
@@ -997,48 +1045,282 @@ impl DesktopApp {
         }
     }
 
-    fn fast_worker_loading(&self) -> bool {
-        self.fast_worker_tx.is_some() && !self.fast_worker_ready
+    fn current_voice_worker_kind(&self) -> WorkerKind {
+        match self.runtime.config.voice.mode {
+            ainput_shell::VoiceMode::Fast => WorkerKind::Fast,
+            ainput_shell::VoiceMode::Streaming => WorkerKind::Streaming,
+        }
     }
 
-    fn streaming_worker_loading(&self) -> bool {
-        self.streaming_worker_tx.is_some() && !self.streaming_worker_ready
+    fn is_qwen_streaming_backend(&self) -> bool {
+        let backend = self.runtime.config.voice.streaming.backend.trim();
+        backend.eq_ignore_ascii_case("qwen3_sidecar") || backend.eq_ignore_ascii_case("qwen")
+    }
+
+    fn voice_model_label(&self, kind: WorkerKind) -> &'static str {
+        match kind {
+            WorkerKind::Fast => "极速 ASR",
+            WorkerKind::Streaming => {
+                if self.is_qwen_streaming_backend() {
+                    "Qwen ASR"
+                } else {
+                    "流式 ASR"
+                }
+            }
+        }
+    }
+
+    fn voice_model(&self, kind: WorkerKind) -> &VoiceModelLifecycle {
+        match kind {
+            WorkerKind::Fast => &self.fast_model,
+            WorkerKind::Streaming => &self.streaming_model,
+        }
+    }
+
+    fn voice_model_mut(&mut self, kind: WorkerKind) -> &mut VoiceModelLifecycle {
+        match kind {
+            WorkerKind::Fast => &mut self.fast_model,
+            WorkerKind::Streaming => &mut self.streaming_model,
+        }
+    }
+
+    fn voice_model_phase(&self, kind: WorkerKind) -> VoiceModelPhase {
+        self.voice_model(kind).phase
+    }
+
+    fn current_voice_model_loading(&self) -> bool {
+        self.voice_model_phase(self.current_voice_worker_kind()) == VoiceModelPhase::Loading
     }
 
     fn has_loading_voice_workers(&self) -> bool {
-        self.fast_worker_loading() || self.streaming_worker_loading()
+        self.fast_model.phase == VoiceModelPhase::Loading
+            || self.streaming_model.phase == VoiceModelPhase::Loading
     }
 
-    fn loading_status_text(&self) -> Option<String> {
-        let mut pending = Vec::new();
-        if self.fast_worker_loading() {
-            pending.push("极速语音模型");
+    fn begin_voice_model_loading(&mut self, kind: WorkerKind, source: ModelLoadSource) {
+        if self.voice_model_phase(kind) == VoiceModelPhase::Loading {
+            return;
         }
-        if self.streaming_worker_loading() {
-            pending.push("流式语音模型");
+
+        let now = Instant::now();
+        let model_label = self.voice_model_label(kind).to_string();
+        {
+            let model = self.voice_model_mut(kind);
+            model.phase = VoiceModelPhase::Loading;
+            model.last_error = None;
+            model.loading_started_at = Some(now);
+            model.expected_unload_at = None;
         }
-        if pending.is_empty() {
-            None
+
+        self.pending_model_ready_notice = None;
+        self.active_model_load_notice = Some(ActiveModelLoadNotice {
+            kind,
+            source,
+            started_at: now,
+            loading_message: format!("{model_label} 加载中"),
+            ready_message: format!("{model_label} 加载完毕"),
+        });
+
+        if kind == self.current_voice_worker_kind() {
+            self.tray_loading_last_frame_at = now;
+            self.set_tray_visual_state(TrayVisualState::Loading, 0);
+            self.set_tray_status(&format!("状态：{}加载中", model_label));
+            self.show_streaming_status_overlay(&format!("{model_label} 加载中"), true, false);
+        }
+    }
+
+    fn note_streaming_model_activity(&mut self) {
+        if !self.is_qwen_streaming_backend() {
+            return;
+        }
+        if self.streaming_model.phase != VoiceModelPhase::Ready {
+            return;
+        }
+        self.streaming_model.expected_unload_at = Some(
+            Instant::now()
+                + Duration::from_millis(self.runtime.config.voice.streaming.sidecar_idle_unload_ms),
+        );
+    }
+
+    fn maybe_mark_streaming_model_cold_from_idle_timer(&mut self) {
+        if self.mode != AppMode::Idle || !self.is_qwen_streaming_backend() {
+            return;
+        }
+        if self.streaming_model.phase != VoiceModelPhase::Ready {
+            return;
+        }
+        let Some(deadline) = self.streaming_model.expected_unload_at else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.streaming_model.phase = VoiceModelPhase::Cold;
+        self.streaming_model.expected_unload_at = None;
+        self.streaming_model.loading_started_at = None;
+        if self.runtime.config.voice.mode == ainput_shell::VoiceMode::Streaming {
+            self.refresh_idle_tray_surface();
+        }
+    }
+
+    fn maybe_show_pending_model_ready_notice(&mut self) {
+        let Some(pending) = self.pending_model_ready_notice.as_ref() else {
+            return;
+        };
+        if Instant::now() < pending.show_at {
+            return;
+        }
+        if self.mode != AppMode::Idle {
+            self.pending_model_ready_notice = None;
+            return;
+        }
+        let message = pending.message.clone();
+        self.pending_model_ready_notice = None;
+        self.show_streaming_status_overlay(&message, false, false);
+    }
+
+    fn mark_voice_model_ready(&mut self, kind: WorkerKind) {
+        let now = Instant::now();
+        let expected_unload_at =
+            if kind == WorkerKind::Streaming && self.is_qwen_streaming_backend() {
+                Some(
+                    now + Duration::from_millis(
+                        self.runtime.config.voice.streaming.sidecar_idle_unload_ms,
+                    ),
+                )
+            } else {
+                None
+            };
+        {
+            let model = self.voice_model_mut(kind);
+            model.phase = VoiceModelPhase::Ready;
+            model.last_error = None;
+            model.loading_started_at = None;
+            model.expected_unload_at = expected_unload_at;
+        }
+
+        let ready_message = if let Some(notice) = self.active_model_load_notice.take() {
+            if notice.kind == kind {
+                let min_hold = match notice.source {
+                    ModelLoadSource::Startup | ModelLoadSource::ModeSwitch => {
+                        Duration::from_secs(3)
+                    }
+                    ModelLoadSource::Hotkey => Duration::ZERO,
+                };
+                if notice.source == ModelLoadSource::Hotkey && self.mode == AppMode::Voice {
+                    None
+                } else if now < notice.started_at + min_hold {
+                    self.pending_model_ready_notice = Some(PendingModelReadyNotice {
+                        show_at: notice.started_at + min_hold,
+                        message: notice.ready_message.clone(),
+                    });
+                    None
+                } else {
+                    Some(notice.ready_message)
+                }
+            } else {
+                self.active_model_load_notice = Some(notice);
+                None
+            }
         } else {
-            Some(format!("状态：正在加载{}...", pending.join("、")))
+            None
+        };
+
+        if kind == WorkerKind::Streaming {
+            self.note_streaming_model_activity();
+        }
+        if self.mode == AppMode::Idle {
+            self.refresh_idle_tray_surface();
+        }
+        if let Some(message) = ready_message
+            && self.mode == AppMode::Idle
+        {
+            self.show_streaming_status_overlay(&message, false, false);
+        }
+    }
+
+    fn mark_voice_model_failed(&mut self, kind: WorkerKind, message: &str) {
+        {
+            let model = self.voice_model_mut(kind);
+            model.phase = VoiceModelPhase::Failed;
+            model.last_error = Some(message.to_string());
+            model.loading_started_at = None;
+            model.expected_unload_at = None;
+        }
+
+        if self
+            .active_model_load_notice
+            .as_ref()
+            .is_some_and(|notice| notice.kind == kind)
+        {
+            self.active_model_load_notice = None;
+        }
+        self.pending_model_ready_notice = None;
+
+        if kind == self.current_voice_worker_kind() {
+            let model_label = self.voice_model_label(kind);
+            self.mode = AppMode::Idle;
+            self.set_tray_visual_state(TrayVisualState::Error, 0);
+            self.show_streaming_status_overlay(&format!("{model_label} 加载失败"), false, false);
+            if let Some(overlay) = &mut self.overlay {
+                overlay.set_level(0.0);
+                overlay.hide();
+            }
+            self.set_tray_status(&format!(
+                "状态：{}加载失败 - {}",
+                model_label,
+                shorten(message, 16)
+            ));
         }
     }
 
     fn refresh_idle_tray_surface(&mut self) {
-        if let Some(status) = self.loading_status_text() {
-            if self.tray_visual_state != TrayVisualState::Loading {
-                self.tray_loading_last_frame_at = Instant::now();
+        self.maybe_mark_streaming_model_cold_from_idle_timer();
+        let kind = self.current_voice_worker_kind();
+        let model_label = self.voice_model_label(kind).to_string();
+        match self.voice_model_phase(kind) {
+            VoiceModelPhase::Loading => {
+                if self.tray_visual_state != TrayVisualState::Loading {
+                    self.tray_loading_last_frame_at = Instant::now();
+                }
+                self.set_tray_visual_state(TrayVisualState::Loading, 0);
+                self.set_tray_status(&format!("状态：{}加载中", model_label));
             }
-            self.set_tray_visual_state(TrayVisualState::Loading, 0);
-            self.set_tray_status(&status);
-        } else {
-            self.set_tray_visual_state(TrayVisualState::Idle, 0);
-            self.set_tray_status(&self.idle_status_text());
+            VoiceModelPhase::Ready => {
+                self.set_tray_visual_state(TrayVisualState::Idle, 0);
+                self.set_tray_status(&format!(
+                    "状态：待机中（{}，{}已加载）",
+                    Self::voice_mode_label(self.runtime.config.voice.mode),
+                    model_label
+                ));
+            }
+            VoiceModelPhase::Cold => {
+                self.set_tray_visual_state(TrayVisualState::Idle, 0);
+                self.set_tray_status(&format!(
+                    "状态：待机中（{}，{}未加载）",
+                    Self::voice_mode_label(self.runtime.config.voice.mode),
+                    model_label
+                ));
+            }
+            VoiceModelPhase::Failed => {
+                let error = self
+                    .voice_model(kind)
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("未知错误")
+                    .to_string();
+                self.set_tray_visual_state(TrayVisualState::Error, 0);
+                self.set_tray_status(&format!(
+                    "状态：{}加载失败 - {}",
+                    model_label,
+                    shorten(&error, 16)
+                ));
+            }
         }
     }
 
     fn animate_loading_tray_if_needed(&mut self) {
-        if self.mode != AppMode::Idle || !self.has_loading_voice_workers() {
+        if !self.current_voice_model_loading() {
             return;
         }
         if self.tray_loading_last_frame_at.elapsed() < TRAY_LOADING_FRAME_INTERVAL {
@@ -1055,14 +1337,7 @@ impl DesktopApp {
     }
 
     fn handle_voice_worker_ready(&mut self, kind: WorkerKind) {
-        match kind {
-            WorkerKind::Fast => self.fast_worker_ready = true,
-            WorkerKind::Streaming => self.streaming_worker_ready = true,
-        }
-
-        if self.mode == AppMode::Idle {
-            self.refresh_idle_tray_surface();
-        }
+        self.mark_voice_model_ready(kind);
     }
 
     fn try_send_fast_worker_command(&self, command: WorkerCommand) -> bool {
@@ -1119,18 +1394,23 @@ impl DesktopApp {
 
     fn handle_fast_worker_unavailable(&mut self, message: &str) {
         self.fast_worker_tx = None;
-        self.fast_worker_ready = false;
+        self.fast_model.phase = VoiceModelPhase::Cold;
+        self.fast_model.loading_started_at = None;
         self.handle_worker_error(message);
     }
 
     fn handle_streaming_worker_unavailable(&mut self, message: &str) {
         self.streaming_worker_tx = None;
-        self.streaming_worker_ready = false;
+        self.streaming_model.phase = VoiceModelPhase::Cold;
+        self.streaming_model.loading_started_at = None;
+        self.streaming_model.expected_unload_at = None;
         self.handle_worker_error(message);
     }
 
     fn handle_worker_error(&mut self, message: &str) {
         self.mode = AppMode::Idle;
+        self.active_model_load_notice = None;
+        self.pending_model_ready_notice = None;
         self.set_tray_visual_state(TrayVisualState::Error, 0);
         self.clear_streaming_status_overlay();
         if let Some(overlay) = &mut self.overlay {
@@ -1142,6 +1422,8 @@ impl DesktopApp {
 
     fn handle_recoverable_worker_error(&mut self, message: &str) {
         self.mode = AppMode::Idle;
+        self.active_model_load_notice = None;
+        self.pending_model_ready_notice = None;
         self.set_tray_visual_state(TrayVisualState::Idle, 0);
         self.clear_streaming_status_overlay();
         if let Some(overlay) = &mut self.overlay {
@@ -1160,8 +1442,9 @@ impl DesktopApp {
 
     fn idle_status_text(&self) -> String {
         format!(
-            "状态：待机中（{}）",
-            Self::voice_mode_label(self.runtime.config.voice.mode)
+            "状态：待机中（{}，{}未加载）",
+            Self::voice_mode_label(self.runtime.config.voice.mode),
+            self.voice_model_label(self.current_voice_worker_kind())
         )
     }
 
@@ -1183,19 +1466,6 @@ impl DesktopApp {
             return Some(message.to_string());
         }
         None
-    }
-
-    fn startup_ready_message(&self) -> String {
-        match self.runtime.config.voice.mode {
-            ainput_shell::VoiceMode::Fast => format!(
-                "ainput 已启动，按 {} 开始语音输入",
-                self.current_voice_hotkey_binding()
-            ),
-            ainput_shell::VoiceMode::Streaming => format!(
-                "ainput 已启动，按住 {} 说话",
-                self.current_voice_hotkey_binding()
-            ),
-        }
     }
 
     fn sync_voice_mode_menu(&self) {
@@ -1255,16 +1525,29 @@ impl DesktopApp {
             return Err(error);
         }
 
-        self.refresh_idle_tray_surface();
         self.sync_voice_hotkey_hint();
-        self.prewarm_current_voice_worker();
+        self.prewarm_current_voice_worker(ModelLoadSource::ModeSwitch);
         Ok(())
     }
 
-    fn prewarm_current_voice_worker(&mut self) {
+    fn prewarm_current_voice_worker(&mut self, source: ModelLoadSource) {
         match self.runtime.config.voice.mode {
-            ainput_shell::VoiceMode::Fast => self.start_fast_worker_once(),
-            ainput_shell::VoiceMode::Streaming => self.start_streaming_worker_once(),
+            ainput_shell::VoiceMode::Fast => {
+                if self.fast_model.phase != VoiceModelPhase::Ready {
+                    self.begin_voice_model_loading(WorkerKind::Fast, source);
+                    self.start_fast_worker_once();
+                } else if self.mode == AppMode::Idle {
+                    self.refresh_idle_tray_surface();
+                }
+            }
+            ainput_shell::VoiceMode::Streaming => {
+                if self.streaming_model.phase != VoiceModelPhase::Ready {
+                    self.begin_voice_model_loading(WorkerKind::Streaming, source);
+                    let _ = self.send_streaming_worker_command(WorkerCommand::PreloadModel);
+                } else if self.mode == AppMode::Idle {
+                    self.refresh_idle_tray_surface();
+                }
+            }
         }
     }
 
@@ -2068,7 +2351,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
         }
 
         self.start_overlay_tick_once();
-        self.prewarm_current_voice_worker();
+        self.prewarm_current_voice_worker(ModelLoadSource::Startup);
         if self.hotkey_monitor.is_none() {
             tracing::info!(
                 voice_hotkey = %self.current_voice_hotkey_binding(),
@@ -2113,9 +2396,6 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 ));
             }
         }
-
-        let startup_message = self.startup_ready_message();
-        self.show_streaming_status_overlay(&startup_message, false, false);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
@@ -2124,7 +2404,12 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                 WorkerEvent::Ready(kind) => {
                     self.handle_voice_worker_ready(kind);
                 }
+                WorkerEvent::ModelLoadFailed { kind, message } => {
+                    self.mark_voice_model_failed(kind, &message);
+                }
                 WorkerEvent::RecordingStarted => {
+                    self.active_model_load_notice = None;
+                    self.pending_model_ready_notice = None;
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 0);
                     self.set_tray_status("状态：正在录音");
@@ -2176,6 +2461,9 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     ));
                 }
                 WorkerEvent::StreamingStarted => {
+                    self.active_model_load_notice = None;
+                    self.pending_model_ready_notice = None;
+                    self.note_streaming_model_activity();
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 0);
                     self.set_tray_status(self.streaming_status_text());
@@ -2185,15 +2473,17 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     raw_text,
                     prepared_text,
                 } => {
+                    self.note_streaming_model_activity();
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 0);
                     self.set_tray_status("状态：流式实时识别中");
                     let _ = raw_text;
                     if let Some(message) = Self::streaming_partial_message(&prepared_text) {
-                        self.show_streaming_status_overlay(&message, true, true);
+                        self.show_streaming_status_overlay(&message, true, false);
                     }
                 }
                 WorkerEvent::StreamingFlushing => {
+                    self.note_streaming_model_activity();
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 1);
                     self.set_tray_status("状态：流式语音识别收尾中");
@@ -2202,6 +2492,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     final_text,
                     response_tx,
                 } => {
+                    self.note_streaming_model_activity();
                     self.mode = AppMode::Voice;
                     self.set_tray_visual_state(TrayVisualState::Voice, 1);
                     self.set_tray_status("状态：HUD 最终文本确认中");
@@ -2216,6 +2507,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     let _ = response_tx.send(ack);
                 }
                 WorkerEvent::StreamingClipboardFallback(text) => {
+                    self.note_streaming_model_activity();
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：流式整理结果已复制到剪贴板");
@@ -2226,6 +2518,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                     }
                 }
                 WorkerEvent::StreamingFinal(text) => {
+                    self.note_streaming_model_activity();
                     self.mode = AppMode::Idle;
                     self.set_tray_visual_state(TrayVisualState::Idle, 0);
                     self.set_tray_status("状态：流式整理结果已完成");
@@ -2251,6 +2544,12 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                         match self.runtime.config.voice.mode {
                             ainput_shell::VoiceMode::Fast => {
                                 self.mode = AppMode::Voice;
+                                if self.fast_model.phase != VoiceModelPhase::Ready {
+                                    self.begin_voice_model_loading(
+                                        WorkerKind::Fast,
+                                        ModelLoadSource::Hotkey,
+                                    );
+                                }
                                 let _ = self.send_fast_worker_command(WorkerCommand::HotkeyPressed);
                             }
                             ainput_shell::VoiceMode::Streaming => {
@@ -2260,9 +2559,16 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                                     return;
                                 }
                                 self.mode = AppMode::Voice;
-                                self.set_tray_visual_state(TrayVisualState::Voice, 0);
-                                self.set_tray_status(self.streaming_status_text());
-                                self.clear_streaming_status_overlay();
+                                if self.streaming_model.phase == VoiceModelPhase::Ready {
+                                    self.set_tray_visual_state(TrayVisualState::Voice, 0);
+                                    self.set_tray_status(self.streaming_status_text());
+                                    self.show_streaming_status_overlay("", true, false);
+                                } else {
+                                    self.begin_voice_model_loading(
+                                        WorkerKind::Streaming,
+                                        ModelLoadSource::Hotkey,
+                                    );
+                                }
                                 let _ = self
                                     .send_streaming_worker_command(WorkerCommand::HotkeyPressed);
                             }
@@ -2416,6 +2722,8 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
             AppEvent::RecordingUpdated => self.handle_recording_update(),
             AppEvent::OverlayTick => {
                 self.reload_hud_overlay_if_changed();
+                self.maybe_mark_streaming_model_cold_from_idle_timer();
+                self.maybe_show_pending_model_ready_notice();
                 self.animate_loading_tray_if_needed();
                 if self.mode == AppMode::Automation
                     && let Some(service) = &self.automation_service
@@ -2483,13 +2791,7 @@ impl DesktopApp {
             .unwrap_or(false)
         {
             match self.set_voice_mode(ainput_shell::VoiceMode::Fast) {
-                Ok(()) => {
-                    if self.has_loading_voice_workers() {
-                        self.refresh_idle_tray_surface();
-                    } else {
-                        self.set_tray_status("状态：已切换到极速语音识别");
-                    }
-                }
+                Ok(()) => self.refresh_idle_tray_surface(),
                 Err(error) => self.set_tray_status(&format!(
                     "状态：切换语音模式失败 - {}",
                     shorten(&error.to_string(), 16)
@@ -2505,13 +2807,7 @@ impl DesktopApp {
             .unwrap_or(false)
         {
             match self.set_voice_mode(ainput_shell::VoiceMode::Streaming) {
-                Ok(()) => {
-                    if self.has_loading_voice_workers() {
-                        self.refresh_idle_tray_surface();
-                    } else {
-                        self.set_tray_status("状态：已切换到流式语音识别");
-                    }
-                }
+                Ok(()) => self.refresh_idle_tray_surface(),
                 Err(error) => self.set_tray_status(&format!(
                     "状态：切换语音模式失败 - {}",
                     shorten(&error.to_string(), 16)

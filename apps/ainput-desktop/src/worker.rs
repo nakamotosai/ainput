@@ -33,17 +33,18 @@ use crate::streaming_state::{
 use crate::{AppEvent, AppRuntime, hotkey};
 
 const VOICE_OUTPUT_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
-const STREAMING_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(120);
+const STREAMING_PASTE_STABILIZE_DELAY: Duration = Duration::from_millis(20);
+const QWEN_PRELOAD_WARM_CHUNK_MS: usize = 180;
 const STREAMING_DEFAULT_TAIL_PADDING_MS: u64 = 720;
-const STREAMING_RELEASE_MAX_WAIT_MS: u64 = 500;
+const STREAMING_RELEASE_MAX_WAIT_MS: u64 = 300;
 const STREAMING_RELEASE_HARD_WAIT_MS: u64 = 650;
-const STREAMING_RELEASE_MIN_WAIT_MS: u64 = 160;
-const STREAMING_RELEASE_IDLE_SETTLE_MS: u64 = 160;
+const STREAMING_RELEASE_MIN_WAIT_MS: u64 = 120;
+const STREAMING_RELEASE_IDLE_SETTLE_MS: u64 = 120;
 const STREAMING_RELEASE_POLL_INTERVAL_MS: u64 = 8;
-const STREAMING_IDLE_FINALIZE_TAIL_PADDING_MS: u64 = 480;
-const STREAMING_HUD_SOFT_FLUSH_MS: u64 = 360;
+const STREAMING_IDLE_FINALIZE_TAIL_PADDING_MS: u64 = 320;
+const STREAMING_HUD_SOFT_FLUSH_MS: u64 = 240;
 const STREAMING_HUD_SOFT_FLUSH_MIN_VISIBLE_CHARS: usize = 4;
-const STREAMING_HUD_SOFT_FLUSH_TAIL_PADDING_MS: u64 = 240;
+const STREAMING_HUD_SOFT_FLUSH_TAIL_PADDING_MS: u64 = 180;
 const STREAMING_HUD_FINAL_ACK_TIMEOUT_MS: u64 = 650;
 const STREAMING_PREVIEW_SHORTFALL_TOLERANCE_CHARS: usize = 3;
 const STREAMING_FINAL_SHORTFALL_TOLERANCE_CHARS: usize = 3;
@@ -60,7 +61,7 @@ const STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS: u64 = 6_000;
 const STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS: u64 = 3_200;
 const STREAMING_PUNCTUATION_TARGET_MS: u128 = 120;
 const STREAMING_PUNCTUATION_HARD_MS: u128 = 220;
-const STREAMING_RELEASE_TO_COMMIT_TARGET_MS: u128 = 900;
+const STREAMING_RELEASE_TO_COMMIT_TARGET_MS: u128 = 720;
 const STREAMING_RELEASE_TO_COMMIT_HARD_MS: u128 = 1200;
 const STREAMING_RAW_CAPTURE_LIMIT: usize = 20;
 const AUDIO_ACTIVITY_FRAME_SAMPLES: usize = 320;
@@ -77,6 +78,10 @@ const QWEN_SIDECAR_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub(crate) enum WorkerEvent {
     Ready(WorkerKind),
+    ModelLoadFailed {
+        kind: WorkerKind,
+        message: String,
+    },
     RecordingStarted,
     Meter(f32),
     RecordingStopped,
@@ -116,6 +121,7 @@ pub(crate) enum WorkerKind {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WorkerCommand {
+    PreloadModel,
     HotkeyPressed,
     HotkeyReleased,
 }
@@ -192,6 +198,20 @@ struct QwenSidecarSession {
     sample_cursor: usize,
 }
 
+struct PendingQwenSessionStart {
+    rx: mpsc::Receiver<Result<(QwenStartResponse, bool), String>>,
+    hold_active: bool,
+}
+
+struct PendingQwenModelPreload {
+    rx: mpsc::Receiver<Result<(), String>>,
+    start_session_after_ready: bool,
+}
+
+fn qwen_session_has_partial_truth(session: &QwenSidecarSession) -> bool {
+    session.partial_updates > 0 || !session.last_display_text.trim().is_empty()
+}
+
 struct QwenSidecarClient {
     http: Client,
     base_url: String,
@@ -258,6 +278,8 @@ struct QwenHealthResponse {
     model: Option<String>,
     sessions: Option<usize>,
     sample_rate_hz: Option<i32>,
+    idle_unload_ms: Option<u64>,
+    idle_for_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,9 +449,8 @@ impl QwenSidecarClient {
         if base_url.is_empty() {
             bail!("voice.streaming.sidecar_url is empty");
         }
-        let client = Self { http, base_url };
-        client.ensure_ready(config)?;
-        Ok(client)
+        let _ = config;
+        Ok(Self { http, base_url })
     }
 
     fn health(&self) -> Result<QwenHealthResponse> {
@@ -455,6 +476,8 @@ impl QwenSidecarClient {
                     model = %health.model.as_deref().unwrap_or("unknown"),
                     sessions = health.sessions.unwrap_or_default(),
                     sample_rate_hz = health.sample_rate_hz.unwrap_or_default(),
+                    idle_unload_ms = health.idle_unload_ms.unwrap_or_default(),
+                    idle_for_ms = health.idle_for_ms.unwrap_or_default(),
                     sidecar_url = %self.base_url,
                     "Qwen3-ASR sidecar is ready"
                 );
@@ -480,6 +503,8 @@ impl QwenSidecarClient {
                         model = %health.model.as_deref().unwrap_or("unknown"),
                         sessions = health.sessions.unwrap_or_default(),
                         sample_rate_hz = health.sample_rate_hz.unwrap_or_default(),
+                        idle_unload_ms = health.idle_unload_ms.unwrap_or_default(),
+                        idle_for_ms = health.idle_for_ms.unwrap_or_default(),
                         "Qwen3-ASR sidecar became ready after auto-start"
                     );
                     return Ok(());
@@ -500,6 +525,58 @@ impl QwenSidecarClient {
             .context("Qwen3-ASR sidecar session create returned error")?
             .json::<QwenStartResponse>()
             .context("decode Qwen3-ASR sidecar session create")
+    }
+
+    fn start_session_with_recovery(
+        &self,
+        config: &ainput_shell::StreamingVoiceConfig,
+    ) -> Result<(QwenStartResponse, bool)> {
+        match self.start_session() {
+            Ok(session) => Ok((session, false)),
+            Err(first_error) => {
+                tracing::warn!(
+                    error = %first_error,
+                    sidecar_url = %self.base_url,
+                    "Qwen3-ASR sidecar session create failed; ensuring sidecar is ready and retrying"
+                );
+                self.ensure_ready(config)?;
+                let session = self
+                    .start_session()
+                    .context("retry Qwen3-ASR sidecar session create after sidecar restart")?;
+                Ok((session, true))
+            }
+        }
+    }
+
+    fn preload_model_with_warm_session(
+        &self,
+        config: &ainput_shell::StreamingVoiceConfig,
+    ) -> Result<()> {
+        self.ensure_ready(config)?;
+        let sample_rate_hz = self
+            .health()
+            .ok()
+            .and_then(|health| health.sample_rate_hz)
+            .unwrap_or(16_000)
+            .max(8_000) as usize;
+        let warm_session = self
+            .start_session()
+            .context("create Qwen3-ASR warm preload session")?;
+        let warm_chunk_samples =
+            ((sample_rate_hz * QWEN_PRELOAD_WARM_CHUNK_MS) / 1000).max(sample_rate_hz / 20);
+        let warm_chunk = vec![0.0f32; warm_chunk_samples];
+        let _ = self
+            .send_chunk(&warm_session.session_id, &warm_chunk)
+            .context("send Qwen3-ASR warm preload chunk")?;
+        self.finish_session(&warm_session.session_id)
+            .context("finish Qwen3-ASR warm preload session")?;
+        tracing::info!(
+            sample_rate_hz,
+            warm_chunk_samples,
+            warm_chunk_ms = QWEN_PRELOAD_WARM_CHUNK_MS,
+            "Qwen3-ASR preload warm chunk completed"
+        );
+        Ok(())
     }
 
     fn send_chunk(&self, session_id: &str, samples: &[f32]) -> Result<QwenChunkResponse> {
@@ -542,7 +619,8 @@ fn start_qwen_sidecar_via_wsl(config: &ainput_shell::StreamingVoiceConfig) -> Re
         bail!("voice.streaming.sidecar_wsl_workdir is empty");
     }
     let script = format!(
-        "cd {workdir} && exec env HF_HOME={workdir}/hf-cache VLLM_CACHE_ROOT={workdir}/vllm-cache VLLM_ATTENTION_BACKEND=TRITON_ATTN QWEN3_MAX_MODEL_LEN=2048 QWEN3_GPU_UTIL=0.50 QWEN3_DTYPE=float16 QWEN3_ENFORCE_EAGER=1 QWEN3_CHUNK_SIZE_SEC=0.5 QWEN3_UNFIXED_CHUNK_NUM=1 QWEN3_UNFIXED_TOKEN_NUM=2 .venv/bin/python -m uvicorn qwen3_asr_sidecar:app --host 127.0.0.1 --port 8765 > {workdir}/qwen3_asr_sidecar.log 2>&1 < /dev/null"
+        "cd {workdir} && exec env HF_HOME={workdir}/hf-cache VLLM_CACHE_ROOT={workdir}/vllm-cache VLLM_ATTENTION_BACKEND=TRITON_ATTN QWEN3_MAX_MODEL_LEN=2048 QWEN3_GPU_UTIL=0.50 QWEN3_DTYPE=float16 QWEN3_ENFORCE_EAGER=1 QWEN3_CHUNK_SIZE_SEC=0.18 QWEN3_UNFIXED_CHUNK_NUM=1 QWEN3_UNFIXED_TOKEN_NUM=2 QWEN3_IDLE_UNLOAD_MS={} .venv/bin/python -m uvicorn qwen3_asr_sidecar:app --host 127.0.0.1 --port 8765 > {workdir}/qwen3_asr_sidecar.log 2>&1 < /dev/null",
+        config.sidecar_idle_unload_ms
     );
     let distro = if config.sidecar_wsl_distro.trim().is_empty() {
         "Ubuntu"
@@ -557,6 +635,38 @@ fn start_qwen_sidecar_via_wsl(config: &ainput_shell::StreamingVoiceConfig) -> Re
         .spawn()
         .with_context(|| format!("start Qwen3-ASR sidecar via WSL distro {distro}"))?;
     Ok(())
+}
+
+fn spawn_qwen_sidecar_session_start(
+    config: ainput_shell::StreamingVoiceConfig,
+) -> mpsc::Receiver<Result<(QwenStartResponse, bool), String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = match QwenSidecarClient::create(&config) {
+            Ok(client) => client
+                .start_session_with_recovery(&config)
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn spawn_qwen_sidecar_model_preload(
+    config: ainput_shell::StreamingVoiceConfig,
+) -> mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = match QwenSidecarClient::create(&config) {
+            Ok(client) => client
+                .preload_model_with_warm_session(&config)
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 #[derive(Debug, Clone)]
@@ -648,9 +758,10 @@ pub(crate) fn push_to_talk_worker(
     let recognizer = match build_recognizer(&runtime) {
         Ok(recognizer) => recognizer,
         Err(error) => {
-            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(format!(
-                "初始化识别器失败：{error}"
-            ))));
+            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
+                kind: WorkerKind::Fast,
+                message: format!("初始化识别器失败：{error}"),
+            }));
             return;
         }
     };
@@ -667,6 +778,7 @@ pub(crate) fn push_to_talk_worker(
     while !shutdown.load(Ordering::Relaxed) {
         if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(8)) {
             match command {
+                WorkerCommand::PreloadModel => {}
                 WorkerCommand::HotkeyPressed => {
                     if active_recording.is_none() {
                         match ainput_audio::ActiveRecording::start_default_input() {
@@ -927,9 +1039,10 @@ pub(crate) fn streaming_push_to_talk_worker(
     let recognizer = match build_streaming_recognizer(&runtime) {
         Ok(recognizer) => recognizer,
         Err(error) => {
-            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(format!(
-                "初始化流式识别器失败：{error}"
-            ))));
+            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
+                kind: WorkerKind::Streaming,
+                message: format!("初始化流式识别器失败：{error}"),
+            }));
             return;
         }
     };
@@ -962,6 +1075,7 @@ pub(crate) fn streaming_push_to_talk_worker(
     while !shutdown.load(Ordering::Relaxed) {
         if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(8)) {
             match command {
+                WorkerCommand::PreloadModel => {}
                 WorkerCommand::HotkeyPressed => {
                     if active_session.is_none() {
                         if let Err(error) =
@@ -1079,7 +1193,11 @@ pub(crate) fn streaming_push_to_talk_worker(
                             "streaming push-to-talk recording captured"
                         );
 
-                        if session.captured_samples.is_empty() || should_skip_as_silence(&activity)
+                        let had_partial_truth_before_finish = session.partial_updates > 0
+                            || !session.last_display_text.trim().is_empty();
+                        if session.captured_samples.is_empty()
+                            || (should_skip_as_silence(&activity)
+                                && !had_partial_truth_before_finish)
                         {
                             tracing::info!(
                                 audio_duration_ms = captured_audio_duration_ms,
@@ -1411,9 +1529,10 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
     let sidecar = match QwenSidecarClient::create(&runtime.config.voice.streaming) {
         Ok(client) => client,
         Err(error) => {
-            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(format!(
-                "failed to initialize Qwen3-ASR sidecar: {error}"
-            ))));
+            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
+                kind: WorkerKind::Streaming,
+                message: format!("failed to initialize Qwen3-ASR sidecar: {error}"),
+            }));
             return;
         }
     };
@@ -1422,68 +1541,85 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
         chunk_ms = runtime.config.voice.streaming.chunk_ms,
         "ainput Qwen3-ASR sidecar streaming worker loop started"
     );
-    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(WorkerKind::Streaming)));
-
+    let mut sidecar_model_ready = false;
     let mut standby_recording: Option<ainput_audio::ActiveRecording> = None;
     let mut active_session: Option<QwenSidecarSession> = None;
+    let mut pending_model_preload: Option<PendingQwenModelPreload> = None;
+    let mut pending_session_start: Option<PendingQwenSessionStart> = None;
 
     while !shutdown.load(Ordering::Relaxed) {
         if let Ok(command) = worker_rx.recv_timeout(Duration::from_millis(8)) {
             match command {
+                WorkerCommand::PreloadModel => {
+                    if !sidecar_model_ready
+                        && active_session.is_none()
+                        && pending_session_start.is_none()
+                        && pending_model_preload.is_none()
+                    {
+                        tracing::info!(
+                            sidecar_url = %runtime.config.voice.streaming.sidecar_url,
+                            "starting async Qwen sidecar model preload"
+                        );
+                        pending_model_preload = Some(PendingQwenModelPreload {
+                            rx: spawn_qwen_sidecar_model_preload(
+                                runtime.config.voice.streaming.clone(),
+                            ),
+                            start_session_after_ready: false,
+                        });
+                    }
+                }
                 WorkerCommand::HotkeyPressed => {
                     if active_session.is_none() {
-                        if let Err(error) =
-                            ensure_streaming_recording_ready(&runtime, &mut standby_recording)
-                        {
-                            tracing::error!(error = %error, "failed to start Qwen streaming microphone recording");
-                            let _ =
-                                proxy.send_event(AppEvent::Worker(WorkerEvent::RecoverableError(
-                                    format!("failed to start Qwen streaming recording: {error}"),
-                                )));
-                            continue;
+                        if sidecar_model_ready && pending_session_start.is_none() {
+                            tracing::info!(
+                                sidecar_url = %runtime.config.voice.streaming.sidecar_url,
+                                "starting async Qwen sidecar session bootstrap"
+                            );
+                            pending_session_start = Some(PendingQwenSessionStart {
+                                rx: spawn_qwen_sidecar_session_start(
+                                    runtime.config.voice.streaming.clone(),
+                                ),
+                                hold_active: true,
+                            });
+                        } else if let Some(pending) = &mut pending_session_start {
+                            pending.hold_active = true;
+                        } else if let Some(pending) = &mut pending_model_preload {
+                            pending.start_session_after_ready = true;
+                        } else {
+                            tracing::info!(
+                                sidecar_url = %runtime.config.voice.streaming.sidecar_url,
+                                "starting async Qwen sidecar preload before first session bootstrap"
+                            );
+                            pending_model_preload = Some(PendingQwenModelPreload {
+                                rx: spawn_qwen_sidecar_model_preload(
+                                    runtime.config.voice.streaming.clone(),
+                                ),
+                                start_session_after_ready: true,
+                            });
                         }
-                        let Some(recording) = standby_recording.as_ref() else {
-                            continue;
-                        };
-                        let sidecar_session = match sidecar.start_session() {
-                            Ok(session) => session,
-                            Err(error) => {
-                                tracing::error!(error = %error, "failed to create Qwen sidecar session");
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("failed to create Qwen streaming session: {error}"),
-                                )));
-                                continue;
-                            }
-                        };
-                        let current_cursor = recording.sample_count();
-                        let preroll_ms =
-                            streaming_endpoint_preroll_ms(&runtime.config.voice.streaming.endpoint);
-                        let preroll_samples =
-                            sample_count_for_ms(recording.sample_rate_hz(), preroll_ms);
-                        let start_cursor = current_cursor.saturating_sub(preroll_samples);
-                        let session = QwenSidecarSession::new(
-                            recording.sample_rate_hz(),
-                            sidecar_session,
-                            start_cursor,
-                        );
-                        tracing::info!(
-                            session_id = %session.session_id,
-                            input_sample_rate_hz = recording.sample_rate_hz(),
-                            input_channels = recording.channels(),
-                            asr_sample_rate_hz = session.sample_rate_hz,
-                            asr_channels = 1,
-                            direct_asr_format = recording.sample_rate_hz() == session.sample_rate_hz
-                                && recording.channels() == 1,
-                            current_cursor,
-                            start_cursor,
-                            preroll_ms,
-                            "Qwen sidecar streaming recording started with V19 HUD truth chain"
-                        );
-                        active_session = Some(session);
-                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingStarted));
                     }
                 }
                 WorkerCommand::HotkeyReleased => {
+                    if active_session.is_none() {
+                        if let Some(pending) = &mut pending_session_start {
+                            pending.hold_active = false;
+                            tracing::info!(
+                                "voice hotkey released while Qwen sidecar session bootstrap was still pending"
+                            );
+                            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
+                        } else if let Some(pending) = &mut pending_model_preload {
+                            let had_waiting_hold = pending.start_session_after_ready;
+                            pending.start_session_after_ready = false;
+                            if had_waiting_hold {
+                                tracing::info!(
+                                    "voice hotkey released while Qwen sidecar model preload was still pending"
+                                );
+                                let _ =
+                                    proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(mut session) = active_session.take() {
                         let Some(recording) = standby_recording.take() else {
                             tracing::error!("Qwen streaming recording disappeared before release");
@@ -1505,9 +1641,15 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                             Ok(stats) => stats,
                             Err(error) => {
                                 tracing::error!(error = %error, "failed to finalize Qwen streaming recording");
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("failed to finalize Qwen streaming recording: {error}"),
-                                )));
+                                sidecar_model_ready = false;
+                                let _ = proxy.send_event(AppEvent::Worker(
+                                    WorkerEvent::ModelLoadFailed {
+                                        kind: WorkerKind::Streaming,
+                                        message: format!(
+                                            "failed to finalize Qwen streaming recording: {error}"
+                                        ),
+                                    },
+                                ));
                                 continue;
                             }
                         };
@@ -1525,9 +1667,15 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                             Ok(samples) => samples,
                             Err(error) => {
                                 tracing::error!(error = %error, "failed to feed final Qwen sidecar chunks");
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("failed to drain Qwen streaming tail: {error}"),
-                                )));
+                                sidecar_model_ready = false;
+                                let _ = proxy.send_event(AppEvent::Worker(
+                                    WorkerEvent::ModelLoadFailed {
+                                        kind: WorkerKind::Streaming,
+                                        message: format!(
+                                            "failed to drain Qwen streaming tail: {error}"
+                                        ),
+                                    },
+                                ));
                                 continue;
                             }
                         };
@@ -1556,7 +1704,11 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                             "Qwen sidecar streaming recording captured"
                         );
 
-                        if session.captured_samples.is_empty() || should_skip_as_silence(&activity)
+                        let had_partial_truth_before_finish =
+                            qwen_session_has_partial_truth(&session);
+                        if session.captured_samples.is_empty()
+                            || (should_skip_as_silence(&activity)
+                                && !had_partial_truth_before_finish)
                         {
                             tracing::info!(
                                 audio_duration_ms = captured_audio_duration_ms,
@@ -1570,6 +1722,19 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
                             continue;
                         }
+                        if should_skip_as_silence(&activity) && had_partial_truth_before_finish {
+                            tracing::info!(
+                                session_id = %session.session_id,
+                                partial_updates = session.partial_updates,
+                                last_display_text = %short_log_text(&session.last_display_text, 120),
+                                audio_duration_ms = captured_audio_duration_ms,
+                                peak_abs = format_args!("{:.6}", activity.peak_abs),
+                                rms = format_args!("{:.6}", activity.rms),
+                                active_ratio = format_args!("{:.4}", activity.active_ratio),
+                                sustained_voice_ms = activity.sustained_voice_ms,
+                                "bypass Qwen low-signal silence gate because HUD truth already exists"
+                            );
+                        }
 
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingFlushing));
                         let finish_started_at = Instant::now();
@@ -1577,9 +1742,15 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                             Ok(response) => response,
                             Err(error) => {
                                 tracing::error!(error = %error, "failed to finish Qwen sidecar session");
-                                let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                    format!("failed to finish Qwen streaming recognition: {error}"),
-                                )));
+                                sidecar_model_ready = false;
+                                let _ = proxy.send_event(AppEvent::Worker(
+                                    WorkerEvent::ModelLoadFailed {
+                                        kind: WorkerKind::Streaming,
+                                        message: format!(
+                                            "failed to finish Qwen streaming recognition: {error}"
+                                        ),
+                                    },
+                                ));
                                 continue;
                             }
                         };
@@ -1595,12 +1766,38 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                     prepared_text: update.display_text,
                                 }));
                         }
+                        let had_partial_truth_after_finish =
+                            qwen_session_has_partial_truth(&session);
                         let qwen_final_prepared = apply_streaming_punctuation_cleanup(
                             &ainput_rewrite::normalize_streaming_preview(&finish.text),
                         );
-                        let final_text = ensure_terminal_sentence_boundary(
+                        let mut final_text = ensure_terminal_sentence_boundary(
                             &finalize_streaming_commit_text(qwen_final_prepared.trim()),
                         );
+                        if final_text.is_empty()
+                            || should_drop_low_signal_result(&final_text, &activity)
+                        {
+                            if had_partial_truth_after_finish {
+                                let fallback_text = ensure_terminal_sentence_boundary(
+                                    &finalize_streaming_commit_text(
+                                        session.last_display_text.trim(),
+                                    ),
+                                );
+                                if !fallback_text.is_empty() {
+                                    tracing::info!(
+                                        session_id = %session.session_id,
+                                        qwen_final_raw_text = %finish.text,
+                                        final_text = %final_text,
+                                        fallback_text = %fallback_text,
+                                        sidecar_audio_ms = finish.audio_ms,
+                                        sidecar_elapsed_ms = finish.elapsed_ms,
+                                        sidecar_finished = finish.finished,
+                                        "use existing Qwen HUD truth because final decode was empty or low-signal"
+                                    );
+                                    final_text = fallback_text;
+                                }
+                            }
+                        }
                         if final_text.is_empty()
                             || should_drop_low_signal_result(&final_text, &activity)
                         {
@@ -1772,6 +1969,144 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
             }
         }
 
+        if active_session.is_none() {
+            let preload_result = if let Some(pending) = &mut pending_model_preload {
+                match pending.rx.try_recv() {
+                    Ok(result) => Some((pending.start_session_after_ready, result)),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => Some((
+                        pending.start_session_after_ready,
+                        Err("Qwen sidecar preload thread disconnected".to_string()),
+                    )),
+                }
+            } else {
+                None
+            };
+
+            if let Some((start_session_after_ready, result)) = preload_result {
+                pending_model_preload = None;
+                match result {
+                    Ok(()) => {
+                        sidecar_model_ready = true;
+                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(
+                            WorkerKind::Streaming,
+                        )));
+                        if start_session_after_ready && pending_session_start.is_none() {
+                            tracing::info!(
+                                sidecar_url = %runtime.config.voice.streaming.sidecar_url,
+                                "Qwen sidecar preload finished; starting deferred session bootstrap"
+                            );
+                            pending_session_start = Some(PendingQwenSessionStart {
+                                rx: spawn_qwen_sidecar_session_start(
+                                    runtime.config.voice.streaming.clone(),
+                                ),
+                                hold_active: true,
+                            });
+                        }
+                    }
+                    Err(message) => {
+                        sidecar_model_ready = false;
+                        tracing::error!(
+                            error = %message,
+                            "failed to preload async Qwen sidecar model"
+                        );
+                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
+                            kind: WorkerKind::Streaming,
+                            message,
+                        }));
+                    }
+                }
+            }
+
+            let startup_result = if let Some(pending) = &mut pending_session_start {
+                match pending.rx.try_recv() {
+                    Ok(result) => Some((pending.hold_active, result)),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => Some((
+                        pending.hold_active,
+                        Err("Qwen sidecar bootstrap thread disconnected".to_string()),
+                    )),
+                }
+            } else {
+                None
+            };
+
+            if let Some((hold_active, result)) = startup_result {
+                pending_session_start = None;
+                match result {
+                    Ok((sidecar_session, sidecar_restarted)) => {
+                        sidecar_model_ready = true;
+                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(
+                            WorkerKind::Streaming,
+                        )));
+                        if !hold_active {
+                            tracing::info!(
+                                session_id = %sidecar_session.session_id,
+                                "Qwen sidecar session became ready after key release; closing unused session"
+                            );
+                            let _ = sidecar.finish_session(&sidecar_session.session_id);
+                        } else {
+                            if let Err(error) =
+                                ensure_streaming_recording_ready(&runtime, &mut standby_recording)
+                            {
+                                tracing::error!(error = %error, "failed to start Qwen streaming microphone recording after sidecar became ready");
+                                let _ = proxy.send_event(AppEvent::Worker(
+                                    WorkerEvent::RecoverableError(format!(
+                                        "failed to start Qwen streaming recording: {error}"
+                                    )),
+                                ));
+                                continue;
+                            }
+                            let Some(recording) = standby_recording.as_ref() else {
+                                continue;
+                            };
+                            let current_cursor = recording.sample_count();
+                            let preroll_ms = streaming_endpoint_preroll_ms(
+                                &runtime.config.voice.streaming.endpoint,
+                            );
+                            let preroll_samples =
+                                sample_count_for_ms(recording.sample_rate_hz(), preroll_ms);
+                            let start_cursor = if sidecar_restarted {
+                                0
+                            } else {
+                                current_cursor.saturating_sub(preroll_samples)
+                            };
+                            let session = QwenSidecarSession::new(
+                                recording.sample_rate_hz(),
+                                sidecar_session,
+                                start_cursor,
+                            );
+                            tracing::info!(
+                                session_id = %session.session_id,
+                                input_sample_rate_hz = recording.sample_rate_hz(),
+                                input_channels = recording.channels(),
+                                asr_sample_rate_hz = session.sample_rate_hz,
+                                asr_channels = 1,
+                                direct_asr_format = recording.sample_rate_hz() == session.sample_rate_hz
+                                    && recording.channels() == 1,
+                                sidecar_restarted,
+                                current_cursor,
+                                start_cursor,
+                                preroll_ms,
+                                "Qwen sidecar streaming recording started with V19 HUD truth chain"
+                            );
+                            active_session = Some(session);
+                            let _ =
+                                proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingStarted));
+                        }
+                    }
+                    Err(message) => {
+                        sidecar_model_ready = false;
+                        tracing::error!(error = %message, "failed to bootstrap async Qwen sidecar session");
+                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
+                            kind: WorkerKind::Streaming,
+                            message: format!("failed to create Qwen streaming session: {message}"),
+                        }));
+                    }
+                }
+            }
+        }
+
         if let Some(session) = &mut active_session {
             let Some(recording) = standby_recording.as_ref() else {
                 continue;
@@ -1796,9 +2131,11 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                 }
                 Err(error) => {
                     tracing::error!(error = %error, "Qwen sidecar live preview failed");
-                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(format!(
-                        "Qwen streaming recognition failed: {error}"
-                    ))));
+                    sidecar_model_ready = false;
+                    let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
+                        kind: WorkerKind::Streaming,
+                        message: format!("Qwen streaming recognition failed: {error}"),
+                    }));
                     active_session = None;
                 }
             }
@@ -6115,9 +6452,9 @@ mod tests {
         merge_ai_rewrite_tail_into_current_display, merge_rolled_over_prefix,
         merge_streaming_offline_tail_repair, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
-        resolve_streaming_rollover_commit_text, sanitize_ai_rewrite_output,
-        sanitize_streaming_generated_punctuation, save_streaming_raw_capture,
-        select_streaming_commit_text, select_streaming_final_raw_text,
+        qwen_session_has_partial_truth, resolve_streaming_rollover_commit_text,
+        sanitize_ai_rewrite_output, sanitize_streaming_generated_punctuation,
+        save_streaming_raw_capture, select_streaming_commit_text, select_streaming_final_raw_text,
         select_streaming_preview_text, should_drop_low_signal_result,
         should_drop_streaming_preview_result, should_skip_streaming_preview,
         streaming_final_quality_failures, streaming_offline_final_sample_start,
@@ -6168,6 +6505,36 @@ mod tests {
             "exact duplicate qwen partial should still be skipped"
         );
         assert_eq!(session.partial_updates, 2);
+    }
+
+    #[test]
+    fn qwen_session_partial_truth_detects_existing_partial_updates() {
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        );
+        assert!(!qwen_session_has_partial_truth(&session));
+        let _ = apply_qwen_sidecar_partial_update(&mut session, "现在怎么又不行了", "qwen_partial")
+            .expect("partial should be accepted");
+        assert!(qwen_session_has_partial_truth(&session));
+    }
+
+    #[test]
+    fn qwen_session_partial_truth_detects_existing_display_text() {
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        );
+        session.last_display_text = "我现在又和昨天出问题的时候一样了".to_string();
+        assert!(qwen_session_has_partial_truth(&session));
     }
 
     #[test]

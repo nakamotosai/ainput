@@ -1,5 +1,59 @@
 # ainput OPLOG
 
+## 2026-05-10 打包 1.0.0-preview.68：收紧上屏延迟并清理历史构建产物
+
+- live 证据确认：`preview.67` 的 `hud_final_flush_elapsed_ms` 只有约 `16-18ms`，`output_elapsed_ms` 只有约 `72-98ms`；“HUD 已经完整了但贴上去还慢”的主因不在 Ctrl+V，而在松手后的 release drain + final decode。
+- 修复：本地流式 `chunk_ms` 从 `240` 收紧到 `120`，让 partial cadence 和松手收尾都更勤。
+- 修复：`release_drain_min_ms / release_drain_idle_settle_ms / release_drain_max_ms` 从 `120 / 120 / 300` 收紧到 `80 / 80 / 220`，减少明明说完了还在等尾巴的时间。
+- 修复：`STREAMING_PASTE_STABILIZE_DELAY` 从 `35ms` 收紧到 `20ms`，把最后一小段无意义等待也削掉。
+- 修复：Qwen preload 不再只做 `start_session -> finish_session`，现在会先送一段真实 warm chunk 再 finish，补齐 chunk endpoint 的冷路径预热。
+- 修复：WSL auto-start 的 Qwen sidecar 环境把 `QWEN3_CHUNK_SIZE_SEC` 收紧到 `0.18`，让 sidecar 流式节奏和本地 120ms feed 更接近。
+- 新增：`scripts\prune-artifacts.ps1`，用于保留当前版本和回滚版本，同时清理历史 `dist` zip / 目录、`target*` 目录和旧 installer residue。
+- live 空间调查结论：
+  - `dist`: `84.03GB`
+  - `target`: `44.10GB`
+  - `target-r109` ~ `target-r112b`: 约 `12.89GB`
+  - `models`: `3.62GB`
+  - `tmp`: `1.40GB`
+  - `dist` 里共有 `94` 个包目录、`93` 个 zip，zip 单独就占 `35.41GB`
+- Windows live 运行进程已切到 `dist\ainput-1.0.0-preview.68\ainput-desktop.exe`。
+- `dist\ainput-1.0.0-preview.68\logs\ainput.log` 已确认：
+  - `ainput Qwen3-ASR sidecar streaming worker loop started ... chunk_ms=120`
+  - `starting async Qwen sidecar model preload`
+- 已执行 `scripts\prune-artifacts.ps1` 首轮 live 清理：
+  - 清掉旧 `dist` 目录、旧 zip、全部 `target*`、WiX 残留
+  - 实际回收 `139.03GB`
+  - 清理后顶部目录缩到：`models 3.62GB`、`dist 3.22GB`、`tmp 1.40GB`、`labs 0.62GB`
+- 首轮清理后还发现两类漏网产物：
+  - `dist\ainput-setup-*.exe` 约 `1.35GB`
+  - `tmp\ainput-installer-*` 目录约 `1.28GB`
+- 因此补强 `scripts\prune-artifacts.ps1`：默认再清旧 `ainput-setup-*.exe`，并清 `tmp\ainput-installer-*` 解包残留，避免下次又积回去。
+
+## 2026-05-10 打包 1.0.0-preview.67：启动预加载、切模预加载与托盘版本号
+
+- 根因确认：之前托盘 loading/ready 只挂在 `fast_worker_ready / streaming_worker_ready`，而 Qwen worker 会在线程刚起时就给 `Ready(Streaming)`，这和“模型真 ready”不是一回事。
+- 修复：主线程新增语音模型生命周期 `Cold / Loading / Ready / Failed`，托盘与 HUD 的加载态改为挂钩真实模型 readiness。
+- 修复：启动 `ainput` 时会立刻预加载当前选中的语音模型；当前若是流式 Qwen，就直接发起 sidecar/model preload。
+- 修复：切换 `极速语音识别 / 流式语音识别` 时复用同一套预加载生命周期，不再只改菜单勾选状态。
+- 修复：Qwen worker 新增 `PreloadModel` 命令；只有 sidecar/model 真 ready 后才回推 `Ready(Streaming)`。
+- 修复：若热键在 preload 还没结束时就已经按下，worker 会在 preload 完成后直接衔接 session bootstrap，不再把“线程已起”误当成“模型已就绪”。
+- 保持 V19 架构不变：没有恢复 offline final、没有 HUD/offline merge、没有 release hidden correction。
+- 保持 Qwen 空闲自动卸载：ready 态会按 `sidecar_idle_unload_ms = 300000` 推导 idle deadline，超时后托盘返回未加载态。
+- 托盘右键菜单新增当前版本号显示。
+
+验证：
+
+- `cargo fmt --all` 通过。
+- `cargo check -p ainput-desktop` 通过。
+- 已打包 `dist\ainput-1.0.0-preview.67\` 与 `dist\ainput-1.0.0-preview.67.zip`。
+- 已切换 `run-ainput.bat` 到 `preview.67`。
+- 已停止旧版并启动到 Windows 交互桌面，当前进程路径为 `dist\ainput-1.0.0-preview.67\ainput-desktop.exe`，PID `33716`。
+- `dist\ainput-1.0.0-preview.67\logs\ainput.log` 确认启动即触发：
+  - `ainput Qwen3-ASR sidecar streaming worker loop started ... chunk_ms=240`
+  - `starting async Qwen sidecar model preload`
+  - `Qwen3-ASR sidecar is ready model=Qwen/Qwen3-ASR-0.6B`
+- SSH 会话无法通过 `CopyFromScreen` 直接抓到交互桌面 HUD / 托盘截图，本轮可视面以真实进程路径和包内启动日志替代验收。
+
 ## 2026-05-10 打包 1.0.0-preview.59：HUD 快速微流式与 Qwen3-ASR 归一化防误伤
 
 - 根因确认：preview.58 已经让 Qwen partial 高频进入 HUD，但 `StreamingPartial` 每次直接整段替换文本，视觉上会像一块一块跳出来，而不是连续吐字。

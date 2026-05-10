@@ -75,6 +75,10 @@ sidecar_url = "http://127.0.0.1:8765"
 # sidecar 不在时，是否自动通过 WSL 拉起
 sidecar_auto_start = true
 
+# sidecar 空闲多久后自动退出并释放显存（毫秒）
+# 默认 5 分钟；下次按热键时会自动重新拉起
+sidecar_idle_unload_ms = 300000
+
 # Qwen3-ASR sidecar 的 WSL 位置；模型和 venv 保持在 WSL Linux 磁盘，避免占满 C 盘
 sidecar_wsl_distro = "Ubuntu"
 sidecar_wsl_workdir = "/home/sai/ainput-qwen3-asr"
@@ -92,18 +96,18 @@ punctuation_model_dir = "models/punctuation/sherpa-onnx-punct-ct-transformer-zh-
 punctuation_num_threads = 1
 
 # 流式音频块时长（毫秒）。
-# Qwen 原版流式内部约 2s 出一次稳定文本，500ms 分块减少 HTTP 开销
-chunk_ms = 500
+# Preview.68 进一步收紧到 120ms，优先让首个 partial 和松手收尾更跟手。
+chunk_ms = 120
 
 [voice.streaming.endpoint]
 # 是否启用按住期间的停顿收尾。开启后只刷新 HUD 和稳定前缀，不会提前上屏。
 enabled = true
 
 # 暂停超过多少毫秒后，flush 当前片段尾音并刷新 HUD；停顿本身不代表句末。
-pause_ms = 720
+pause_ms = 560
 
 # 按住期间 HUD 尾部追帧等待。只刷新 HUD，不上屏、不强制句末标点。
-soft_flush_ms = 360
+soft_flush_ms = 240
 
 # 太短的片段不自动滚动，避免一个词就被切开。
 min_segment_ms = 900
@@ -112,7 +116,7 @@ min_segment_ms = 900
 max_segment_ms = 16000
 
 # 停顿尾音 flush 和松开 final decode 前补的静音尾巴长度。
-tail_padding_ms = 480
+tail_padding_ms = 320
 
 # 按下热键时从常驻录音缓冲里回带的开头音频长度。
 preroll_ms = 180
@@ -126,13 +130,13 @@ max_rollback_chars = 8
 
 [voice.streaming.finalize]
 # 松开 Ctrl 后至少等待多少毫秒，让最后的尾音进入录音缓冲。
-release_drain_min_ms = 160
+release_drain_min_ms = 80
 
 # 松开后最近一段持续静音达到多少毫秒，就结束尾音等待。
-release_drain_idle_settle_ms = 160
+release_drain_idle_settle_ms = 80
 
 # 松开后尾音等待常规上限。超过后必须 fallback，不能无限等最后一个字。
-release_drain_max_ms = 500
+release_drain_max_ms = 220
 
 # final decode 预算。超时策略是使用 HUD 当前文本做 fallback。
 final_decode_timeout_ms = 900

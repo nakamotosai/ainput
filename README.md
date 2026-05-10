@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.59`
+当前预览版本：`1.0.0-preview.68`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -11,12 +11,18 @@
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
 - `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
-- `1.0.0-preview.59` 当前流式主模型是本机 Windows GPU / WSL2 sidecar 上的原版 `Qwen/Qwen3-ASR-0.6B`；`sherpa` 仍保留为配置回退。
+- `1.0.0-preview.68` 当前流式主模型是本机 Windows GPU / WSL2 sidecar 上的原版 `Qwen/Qwen3-ASR-0.6B`；`sherpa` 仍保留为配置回退。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
 - 流式模式不再在松手后跑 offline final，不再做 HUD 文本和 offline 尾巴合并，也不再做 release-time final correction。
 - HUD 文本是最终真相源；最终上屏文本必须等于 drain 完成后的 HUD truth snapshot。
+- `preview.68` 在 `preview.67` 的 preload 基础上，额外跑一小段真实 warm chunk，首句冷启动会更接近后续句子。
+- `preview.68` 进一步把本地 `chunk_ms` 收紧到 `120ms`，并把 release drain 等待收短，目标是缩短“松手后 HUD 已经好了但上屏还要等”的体感。
+- `preview.67` 的托盘 loading/ready/error 状态继续挂钩真实模型 readiness，而不是只看 worker 线程是否已启动。
+- `preview.67` 保留 Qwen 空闲自动卸载；默认空闲 `5` 分钟后释放显存，下次使用或下次预加载时再重新拉起。
+- 托盘右键菜单现在会直接显示当前版本号。
 - AI rewrite 不属于 V19：本版流式主链路会绕开/隔离已有改写代码，改写能力移到 Roadmap / Future Work。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.59\` 与 `dist\ainput-1.0.0-preview.59.zip`。
+- 新增 `scripts\prune-artifacts.ps1`，可以清掉历史 `dist` / `target*` 构建垃圾，同时保留当前版本和一个回滚版本。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.68\` 与 `dist\ainput-1.0.0-preview.68.zip`。
 
 它不做系统级 IME。当前默认热路径由本地 ASR/HUD 单链路负责；AI rewrite 暂不参与 V19 语音提交链路。当前重点是把四条前台主链路做稳：
 
@@ -59,12 +65,14 @@
   - 流式模式按住时持续显示流式文字，默认只走本地识别 + 本地轻整理
   - 流式模式会持续喂入在线音频块，HUD truth state 是最终提交的唯一文本来源
   - 应用层短停顿 endpointing 仍保留为配置项，但默认关闭；流式默认在一次按住说话内保持同一条滚动状态
-  - Qwen sidecar 默认流式块时长为 `500ms`，sidecar 内部 `chunk_size_sec=0.5` / `unfixed_chunk_num=1` / `unfixed_token_num=2`
+  - Qwen sidecar 当前本地流式块时长为 `120ms`，WSL sidecar auto-start 环境会用更紧的 `chunk_size_sec=0.18` / `unfixed_chunk_num=1` / `unfixed_token_num=2`
   - `preview.56` 的最终提交直接来自 Qwen final text 清理结果，不再用可能滞后的 HUD state 截断最终上屏文本
   - `preview.57` 的 HUD partial 直接显示当前识别文本，不再使用逐字 microstream 追赶，避免模型已返回但 HUD 迟迟不上屏
   - `preview.58` 的 Qwen partial 绕开旧 sherpa 稳定策略；Qwen 每次返回的递增文本只做规范化/标点清理/去重后立即推到 HUD
   - `preview.59` 的 HUD partial 使用自适应快速微流式显示：短尾逐字流动，长尾每帧最多追 8 字，避免整段跳变也避免重新积压
   - `preview.59` 修复 `Qwen3-ASR` 被误听成 `千万三ASR` / `千问三ASR` 后又被中文数字归一化成 `10000003ASR` 的问题
+  - `preview.67` 启动或切换语音模式时会先进入对应模型的加载态；Qwen worker 只有在 sidecar/model 真 ready 后才会上报 ready
+  - `preview.67` 的 Qwen ready 态会按 `sidecar_idle_unload_ms = 300000` 本地推导空闲卸载 deadline，托盘会在下次 idle 超时后回到“未加载”
   - 流式模式的标点主链来自官方 `ct-transformer` 标点模型；模型缺失时只降级为无标点，不再让整个流式功能启动失败
   - V19 流式提交链路禁用 AI rewrite 写入；已有改写代码不能改 HUD truth 或最终上屏文本
   - HUD 默认停靠在屏幕正下方、任务栏上方
@@ -126,6 +134,8 @@
 
 - `状态`
   - 显示当前待机、录音、识别、截图、错误等状态
+- `当前版本`
+  - 托盘一级菜单直接显示当前 `preview` 版本号
 - `极速语音识别`
   - 一级菜单直接切到离线整段识别模式
 - `流式语音识别`
@@ -193,8 +203,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.0-preview.50\
-dist\ainput-1.0.0-preview.50.zip
+dist\ainput-1.0.0-preview.68\
+dist\ainput-1.0.0-preview.68.zip
 ```
 
 说明：

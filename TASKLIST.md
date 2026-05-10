@@ -5,6 +5,62 @@
 
 ---
 
+## Round 36：preview.68 收紧上屏延迟并清理构建垃圾
+
+- [x] 定位 live 延迟分解：HUD final 之后粘贴本身只需几十毫秒，主要延迟在 release drain + final decode
+- [x] 定位 live 空间分解：`dist` 约 `84GB`，`target*` 约 `57GB`
+- [x] Qwen preload 增加真实 warm chunk
+- [x] Qwen WSL auto-start chunk 环境改得更紧
+- [x] 本地 `chunk_ms` 收紧到 `120ms`
+- [x] `release_drain_*` 收紧
+- [x] `STREAMING_PASTE_STABILIZE_DELAY` 收紧
+- [x] 新增 `scripts\prune-artifacts.ps1`
+
+完成判定：
+
+- [x] `cargo fmt --all` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] 打包 `dist\ainput-1.0.0-preview.68`
+- [x] `run-ainput.bat` 已切到 `preview.68`
+- [x] Windows 交互桌面运行进程路径确认：`dist\ainput-1.0.0-preview.68\ainput-desktop.exe`
+- [x] 包内启动日志确认：`chunk_ms=120`
+- [ ] 包内启动日志确认：出现 preload warm chunk 日志
+- [x] Windows live 目录已清理旧 `dist` / `target*`
+- [x] Windows live 目录前后空间对比已记录
+
+备注：
+
+- [ ] 当前 cold start 只确认到 `attempting WSL auto-start`；首句轻微发卡与 preload detached 启动链仍需继续核实
+
+---
+
+## Round 35：preview.67 启动预加载、切模预加载与托盘版本号
+
+- [x] 将语音模型生命周期从 `worker ready` 拆成 `Cold / Loading / Ready / Failed`
+- [x] 启动时立即预加载当前选中的语音模型
+- [x] 流式 Qwen worker 只有在 sidecar/model 真 ready 后才回推 `Ready(Streaming)`
+- [x] 热键提前按下时，允许 Qwen preload 完成后再衔接 session bootstrap
+- [x] 托盘 loading / ready / failed 状态改为挂钩真实模型 readiness
+- [x] 模式切换路径复用同一套预加载生命周期
+- [x] 保留 Qwen 空闲自动卸载，不改回永久常驻显存
+- [x] 托盘右键菜单新增当前版本号显示
+
+完成判定：
+
+- [x] `cargo fmt --all` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] 打包 `dist\ainput-1.0.0-preview.67`
+- [x] `run-ainput.bat` 已切到 `preview.67`
+- [x] Windows 交互桌面运行进程路径确认：`dist\ainput-1.0.0-preview.67\ainput-desktop.exe`
+- [x] 包内 startup 日志确认：启动即进入 `starting async Qwen sidecar model preload`
+- [x] 包内 startup 日志确认：sidecar/model ready，模型为 `Qwen/Qwen3-ASR-0.6B`
+
+备注：
+
+- [ ] SSH 会话下 `CopyFromScreen` 无法拿到交互桌面句柄，无法在本轮自动截到 HUD / 托盘可视截图；本轮以真实进程路径 + 包内启动日志作为运行态验收证据
+
+---
+
 ## Round 34：preview.59 HUD 视觉流畅度与 10000003 防误伤
 
 - [x] 确认 `10000003ASR` 根因是 `千万三ASR` / `千问三ASR` 被中文数字归一化误处理
