@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.68`
+当前预览版本：`1.0.0-preview.72`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -11,18 +11,20 @@
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
 - `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
-- `1.0.0-preview.68` 当前流式主模型是本机 Windows GPU / WSL2 sidecar 上的原版 `Qwen/Qwen3-ASR-0.6B`；`sherpa` 仍保留为配置回退。
+- `1.0.0-preview.72` 当前流式主模型是本机 Windows GPU / WSL2 sidecar 上的原版 `Qwen/Qwen3-ASR-0.6B`；`sherpa` 仍保留为配置回退。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
 - 流式模式不再在松手后跑 offline final，不再做 HUD 文本和 offline 尾巴合并，也不再做 release-time final correction。
 - HUD 文本是最终真相源；最终上屏文本必须等于 drain 完成后的 HUD truth snapshot。
+- `preview.72` 新增 Qwen context echo guard：如果 sidecar 把配置里的 context/prompt 当识别文本吐出来，必须在进入 HUD truth 之前拦截，不能先闪到 HUD 再清掉。
+- `preview.72` 保持应用层 `voice.streaming.ai_rewrite.enabled = false`；当前只使用 Qwen ASR 自身的文本整理能力，不再叠加 8317 AI rewrite。
 - `preview.68` 在 `preview.67` 的 preload 基础上，额外跑一小段真实 warm chunk，首句冷启动会更接近后续句子。
 - `preview.68` 进一步把本地 `chunk_ms` 收紧到 `120ms`，并把 release drain 等待收短，目标是缩短“松手后 HUD 已经好了但上屏还要等”的体感。
 - `preview.67` 的托盘 loading/ready/error 状态继续挂钩真实模型 readiness，而不是只看 worker 线程是否已启动。
-- `preview.67` 保留 Qwen 空闲自动卸载；默认空闲 `5` 分钟后释放显存，下次使用或下次预加载时再重新拉起。
+- Qwen 空闲自动卸载当前为 `3600000ms`；默认空闲 `1` 小时后释放显存，下次使用或下次预加载时再重新拉起。
 - 托盘右键菜单现在会直接显示当前版本号。
 - AI rewrite 不属于 V19：本版流式主链路会绕开/隔离已有改写代码，改写能力移到 Roadmap / Future Work。
 - 新增 `scripts\prune-artifacts.ps1`，可以清掉历史 `dist` / `target*` 构建垃圾，同时保留当前版本和一个回滚版本。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.68\` 与 `dist\ainput-1.0.0-preview.68.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.72\` 与 `dist\ainput-1.0.0-preview.72.zip`。
 
 它不做系统级 IME。当前默认热路径由本地 ASR/HUD 单链路负责；AI rewrite 暂不参与 V19 语音提交链路。当前重点是把四条前台主链路做稳：
 
@@ -65,14 +67,14 @@
   - 流式模式按住时持续显示流式文字，默认只走本地识别 + 本地轻整理
   - 流式模式会持续喂入在线音频块，HUD truth state 是最终提交的唯一文本来源
   - 应用层短停顿 endpointing 仍保留为配置项，但默认关闭；流式默认在一次按住说话内保持同一条滚动状态
-  - Qwen sidecar 当前本地流式块时长为 `120ms`，WSL sidecar auto-start 环境会用更紧的 `chunk_size_sec=0.18` / `unfixed_chunk_num=1` / `unfixed_token_num=2`
+  - Qwen sidecar 当前本地流式块时长为 `120ms`，WSL sidecar auto-start 环境会用 `chunk_size_sec=0.18` / `unfixed_chunk_num=4` / `unfixed_token_num=5`
   - `preview.56` 的最终提交直接来自 Qwen final text 清理结果，不再用可能滞后的 HUD state 截断最终上屏文本
   - `preview.57` 的 HUD partial 直接显示当前识别文本，不再使用逐字 microstream 追赶，避免模型已返回但 HUD 迟迟不上屏
   - `preview.58` 的 Qwen partial 绕开旧 sherpa 稳定策略；Qwen 每次返回的递增文本只做规范化/标点清理/去重后立即推到 HUD
   - `preview.59` 的 HUD partial 使用自适应快速微流式显示：短尾逐字流动，长尾每帧最多追 8 字，避免整段跳变也避免重新积压
   - `preview.59` 修复 `Qwen3-ASR` 被误听成 `千万三ASR` / `千问三ASR` 后又被中文数字归一化成 `10000003ASR` 的问题
   - `preview.67` 启动或切换语音模式时会先进入对应模型的加载态；Qwen worker 只有在 sidecar/model 真 ready 后才会上报 ready
-  - `preview.67` 的 Qwen ready 态会按 `sidecar_idle_unload_ms = 300000` 本地推导空闲卸载 deadline，托盘会在下次 idle 超时后回到“未加载”
+  - 当前 Qwen ready 态会按 `sidecar_idle_unload_ms = 3600000` 本地推导空闲卸载 deadline，托盘会在下次 idle 超时后回到“未加载”
   - 流式模式的标点主链来自官方 `ct-transformer` 标点模型；模型缺失时只降级为无标点，不再让整个流式功能启动失败
   - V19 流式提交链路禁用 AI rewrite 写入；已有改写代码不能改 HUD truth 或最终上屏文本
   - HUD 默认停靠在屏幕正下方、任务栏上方
@@ -203,8 +205,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.0-preview.68\
-dist\ainput-1.0.0-preview.68.zip
+dist\ainput-1.0.0-preview.72\
+dist\ainput-1.0.0-preview.72.zip
 ```
 
 说明：
@@ -459,13 +461,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.54\`
-- 默认启动模式是 `极速语音识别`
-- 当前源码流式主链是：`Paraformer bilingual zh-en + ASR-facing mono/16k + HUD truth state + release drain + exact HUD snapshot paste`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.72\`
+- 默认启动模式是 `流式语音识别`
+- 当前源码流式主链是：`Qwen3-ASR sidecar + ASR-facing mono/16k + HUD truth state + release drain + exact HUD snapshot paste`
 - 默认热路径由本地 ASR/HUD 单链路负责；V19 不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本
 - AI rewrite 已从当前版本范围移出；V19 只保证已有改写代码不会改 HUD truth 或最终上屏文本
-- `preview.54` 已按 V20 标点修正 + 托盘版本可见性打包到 `dist\ainput-1.0.0-preview.54\` 与 `dist\ainput-1.0.0-preview.54.zip`
-- `preview.53` 保留为 V19 单链路回滚点：`dist\ainput-1.0.0-preview.53\ainput-desktop.exe`
+- `preview.72` 已按 Qwen context echo guard 打包到 `dist\ainput-1.0.0-preview.72\` 与 `dist\ainput-1.0.0-preview.72.zip`
+- `preview.71` 会泄漏 Qwen context 到 HUD，不建议作为回滚点；需要回滚时优先回到最后一个已验证可接受的旧包并重新验证真实麦克风链路
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
 ## Roadmap / Future Work
@@ -476,6 +478,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 - 未来任何 AI rewrite 都不能绕过 HUD truth 规则：上屏文本必须来自用户可见的最终 HUD 文本。
 
 ## 本轮收口验证
+
+2026-05-11 preview.72 Qwen context echo guard:
+
+- 根因确认：Qwen sidecar 在坏音频/低信号场景下可能把 `[voice.streaming.qwen3].context` 直接作为 partial/final 文本吐出；之前的拦截点太晚，提示词会先进入 HUD 或 fast HUD snapshot。
+- 修复：`apply_qwen_sidecar_partial_update` 在写入 `last_display_text`、发送 HUD partial、更新 voice history 或 paste 之前先执行 context echo guard。
+- 修复：release final 路径在 final HUD ack 和 paste 前二次阻断 context echo；fast HUD snapshot 也拒绝提交 prompt-like `last_display_text`。
+- 保持：不改 Qwen context，不改标点策略，不恢复 offline final，不启用应用层 AI rewrite。
+- Windows 真机 `cargo fmt` 已执行。
+- Windows 真机 `cargo test -p ainput-desktop qwen_context_echo -- --nocapture` 已通过，3/3 pass。
+- Windows 真机 `cargo test -p ainput-desktop worker::tests:: -- --nocapture` 已通过，72/72 pass。
+- Windows 真机 `scripts\package-release.ps1 -Version 1.0.0-preview.72` 已通过，产出 `dist\ainput-1.0.0-preview.72\` 与 `dist\ainput-1.0.0-preview.72.zip`。
+- 包内配置已确认：`voice.streaming.ai_rewrite.enabled = false`。
+- 已启动到 Windows 交互桌面：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.72\ainput-desktop.exe`，`SessionId=1`，PID `37176`。
+- Qwen sidecar `/health` 返回 `ok=true`、`model=Qwen/Qwen3-ASR-0.6B`、`idle_unload_ms=3600000`、`effective_enforce_eager=false`。
 
 2026-05-09 preview.54 V20 punctuation + tray version visibility:
 
@@ -795,21 +811,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 - Windows 真机 `python .\scripts\readme_closeout_guard.py .` 已通过
 - 已成功打包 `dist\ainput-1.0.0-preview.24\` 和 `dist\ainput-1.0.0-preview.24.zip`
 
-## 下一轮交接 / Handoff
+## 接手提示
 
-- 当前进度：本阶段暂时收口在 `1.0.0-preview.54`；用户已明确“暂时就做到这了”。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.54\ainput-desktop.exe`；已启动到 Windows 交互桌面 session 3。
-- 当前包：`dist\ainput-1.0.0-preview.54\` 与 `dist\ainput-1.0.0-preview.54.zip`；`preview.53` 保留为 V19 单链路回滚点。
-- 当前主链：流式模式按下热键打开空白 HUD，按住期间 streaming ASR 更新 HUD，松手后停麦但继续 drain，drain 完成后粘贴 HUD truth snapshot 一次并关闭 HUD。
-- 已移除的旧模式：不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本。
-- 本轮最后修复：V20 标点策略改为保守清洗，不再按连接词硬塞逗号，也不再靠词表硬猜 `？/！`；托盘右键菜单显示 `当前版本：1.0.0-preview.54`。
-- 已验证：`cargo fmt --check`、`cargo test -p ainput-rewrite` 16/16、`cargo test -p ainput-desktop streaming_punctuation` 4/4、`cargo test -p ainput-desktop` 106/106、`scripts\readme_closeout_guard.py` 均通过；打包 exe 文件版本为 `1.0.0-preview.54`。
-- 下一轮若继续：优先从用户真实麦克风体感反馈出发；若出现 HUD 与上屏不一致、重复尾巴、硬插标点，先查 `apps\ainput-desktop\src\worker.rs` 的 HUD truth/final commit 路径和 `crates\ainput-rewrite\src\lib.rs` 的流式 rewrite helper，不要恢复旧 offline final 合并链。
-- AI rewrite 状态：暂不属于当前版本；后续要另开独立 spec，且不能绕过 HUD truth 规则。
+- 当前进度：本阶段暂时收口在 `1.0.0-preview.72`；用户要求“暂时收口，走完整收口流程”。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.72\ainput-desktop.exe`；已启动到 Windows 交互桌面 `SessionId=1`。
+- 当前包：`dist\ainput-1.0.0-preview.72\` 与 `dist\ainput-1.0.0-preview.72.zip`；注册表自启动和 `run-ainput.bat` 都指向 `.72`。
+- 当前主链：流式模式按下 `Ctrl` 打开空白 HUD，按住期间 Qwen3-ASR sidecar 更新 HUD，松手后停麦但继续 drain，drain 完成后粘贴 HUD truth snapshot 一次并关闭 HUD。
+- 已移除/隔离的旧模式：不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本；应用层 `voice.streaming.ai_rewrite.enabled = false`。
+- 本轮最后修复：Qwen context echo guard 前移到 HUD truth update 之前；context/prompt 片段不得进入 HUD、fast snapshot、final commit、last_result 或 voice history。
+- 已验证：`cargo test -p ainput-desktop qwen_context_echo` 3/3、`cargo test -p ainput-desktop worker::tests::` 72/72、`.72` 打包、`.72` 交互桌面启动、Qwen `/health` ready、包内 `ai_rewrite=false`。
+- 下一轮若继续：先从用户真实麦克风体感反馈出发；若再出现提示词泄漏，优先查 `apps\ainput-desktop\src\worker.rs` 的 `is_qwen_context_echo_text` / `apply_qwen_sidecar_partial_update` / final commit 路径，不要先改 prompt，也不要把拦截放到 HUD 显示之后。
 ## 当前边界
 
-- 当前默认还是 `CPU` 推理，不走 GPU
-- 默认 ASR/HUD 热路径不依赖外网；AI rewrite 暂不属于当前版本，后续另开独立 spec
+- 当前流式默认走本机 Windows GPU / WSL2 Qwen3-ASR sidecar；极速语音识别仍保留 SenseVoice 离线整段识别
+- 默认 ASR/HUD 热路径不依赖外部公网服务；应用层 AI rewrite 暂不属于当前版本，后续另开独立 spec
 - AI 语义改写已从当前版本范围移出；当前上屏文本只来自 HUD truth snapshot
 - `HUD 即最终结果` 是当前约束；短停顿 endpoint 和 release-time offline final 不能重新接回默认提交链
 - `scripts\run-streaming-live-e2e.ps1 -InteractiveTask` 是当前无人值守前台 synthetic 验收入口
@@ -865,14 +880,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 打包正式版
 
-## 当前交接：preview.69 Qwen 流式收口
+## 当前交接：preview.72 Qwen context echo guard 收口
 
 当前可测版本：
 
-- `dist\ainput-1.0.0-preview.69\`
-- `dist\ainput-1.0.0-preview.69.zip`
+- `dist\ainput-1.0.0-preview.72\`
+- `dist\ainput-1.0.0-preview.72.zip`
 
-preview.69 的流式默认后端是 `qwen3_sidecar`，通过 WSL2 使用原版 `Qwen/Qwen3-ASR-0.6B`。本轮冻结的 Qwen 参数是：
+preview.72 的流式默认后端是 `qwen3_sidecar`，通过 WSL2 使用原版 `Qwen/Qwen3-ASR-0.6B`。当前冻结的 Qwen 参数是：
 
 - `chunk_size_sec = 0.18`
 - `unfixed_chunk_num = 4`
@@ -885,18 +900,19 @@ preview.69 的流式默认后端是 `qwen3_sidecar`，通过 WSL2 使用原版 `
 
 - Qwen 流式路径以 HUD 当前文本为最终真相源，松开热键时优先快速提交 HUD 快照。
 - Qwen 流式路径不再本地强行补 `。` / `？` / 逗号；旧句末补标点调用保留为注释，方便以后恢复。
-- AI rewrite 是 HUD 文本层的正则化改写，目标是把口语化、错字、重复和断裂表达改写成正式、通顺、无错字的最终输入文本。
+- 应用层 AI rewrite 当前关闭；本阶段不再叠加 8317 改写请求，后续若恢复必须另开 spec 并保证不绕过 HUD truth。
+- Qwen context echo guard 必须在 HUD truth update 前执行；提示词不能先显示到 HUD 再消失。
 - 非流式 / fast SenseVoice 路径与 Qwen 流式路径保持独立，继续保留需要的手动标点逻辑。
 - WSL sidecar 由 Windows 侧 `powershell.exe Start-Process wsl.exe` 拉起，WSL 内运行 `.venv/bin/python -m uvicorn qwen3_asr_sidecar:app`，日志在 `/home/sai/ainput-qwen3-asr/qwen3_asr_sidecar.log`。
 
-preview.69 验证记录：
+preview.72 验证记录：
 
-- `cargo fmt --all`
-- `cargo test -p ainput-shell`：6/6 passed
-- `cargo test -p ainput-desktop`：113/113 passed
-- `python -m py_compile tmp\qwen3_asr_sidecar.py`
-- `scripts\package-release.ps1 -Version 1.0.0-preview.69`
-- Windows 交互会话计划任务启动后，`ainput-desktop.exe` 保持运行，WSL `pgrep -af uvicorn` 能看到 Qwen sidecar。
+- `cargo fmt`
+- `cargo test -p ainput-desktop qwen_context_echo -- --nocapture`：3/3 passed
+- `cargo test -p ainput-desktop worker::tests:: -- --nocapture`：72/72 passed
+- `scripts\package-release.ps1 -Version 1.0.0-preview.72`
+- Windows 交互会话计划任务启动后，`ainput-desktop.exe` 运行于 `SessionId=1`，路径是 `dist\ainput-1.0.0-preview.72\ainput-desktop.exe`。
+- 包内配置确认 `voice.streaming.ai_rewrite.enabled = false`。
 - `/health` 返回 `idle_unload_ms=3600000`、`requested_enforce_eager=false`、`effective_enforce_eager=false`、`enforce_eager_fallback=true`。
 
 构建正式版：

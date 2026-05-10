@@ -193,7 +193,7 @@ require_hud_flush_before_commit = true
 # 是否启用实验性 AI 尾巴改写。
 # 按住 Ctrl 时可逐步改写 HUD 当前尾巴；松开后立即停止参与本轮提交。
 # 只允许改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
-enabled = true
+enabled = false
 
 # 可选：OpenAI 兼容改写服务地址。
 # 默认走 vps-jp 上的 cliproxyapi 8317。

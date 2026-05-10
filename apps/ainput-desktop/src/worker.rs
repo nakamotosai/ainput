@@ -176,6 +176,7 @@ struct StreamingEndpointTracker {
 
 struct QwenSidecarSession {
     session_id: String,
+    context_text: String,
     input_sample_rate_hz: i32,
     sample_rate_hz: i32,
     pending_feed_samples: Vec<f32>,
@@ -199,6 +200,9 @@ struct QwenSidecarSession {
     commit_locked: bool,
     post_hud_flush_mutation_count: usize,
     sample_cursor: usize,
+    speech_gate_opened: bool,
+    speech_gate_opened_audio_ms: Option<u64>,
+    context_echo_blocks: usize,
 }
 
 struct PendingQwenSessionStart {
@@ -220,6 +224,14 @@ fn qwen_fast_release_commit_text(session: &QwenSidecarSession) -> Option<String>
     if text.is_empty() {
         return None;
     }
+    if is_qwen_context_echo_text(session, text) {
+        tracing::warn!(
+            session_id = %session.session_id,
+            text = %short_log_text(text, 120),
+            "blocked Qwen context echo before fast HUD snapshot commit"
+        );
+        return None;
+    }
 
     if session
         .last_partial_at
@@ -229,6 +241,86 @@ fn qwen_fast_release_commit_text(session: &QwenSidecarSession) -> Option<String>
     }
 
     Some(text.to_string())
+}
+
+const QWEN_CONTEXT_ECHO_MIN_PREFIX_CHARS: usize = 24;
+const QWEN_CONTEXT_ECHO_MIN_CONTAINS_CHARS: usize = 48;
+const QWEN_CONTEXT_ECHO_MARKERS: &[&str] = &[
+    "Windows 语音输入法的实时转写场景",
+    "用户主要说中文，但经常中英文混杂",
+    "请输出用户最可能真正想输入的文字",
+    "不要机械插入逗号、句号或问号",
+    "中文按中文输出，英文、数字、路径、参数名",
+    "不要解释",
+];
+
+fn is_qwen_context_echo_text(session: &QwenSidecarSession, text: &str) -> bool {
+    qwen_context_echo_matches(&session.context_text, text)
+        || qwen_context_echo_marker_hits(text) >= 2
+}
+
+fn qwen_context_echo_matches(context_text: &str, text: &str) -> bool {
+    let normalized_text = normalize_qwen_context_echo_text(text);
+    let text_chars = normalized_text.chars().count();
+    if text_chars < QWEN_CONTEXT_ECHO_MIN_PREFIX_CHARS {
+        return false;
+    }
+
+    let normalized_context = normalize_qwen_context_echo_text(context_text);
+    if normalized_context.is_empty() {
+        return false;
+    }
+
+    if normalized_context.starts_with(&normalized_text)
+        || normalized_text.starts_with(&normalized_context)
+    {
+        return true;
+    }
+
+    text_chars >= QWEN_CONTEXT_ECHO_MIN_CONTAINS_CHARS
+        && (normalized_context.contains(&normalized_text)
+            || normalized_text.contains(&normalized_context))
+}
+
+fn qwen_context_echo_marker_hits(text: &str) -> usize {
+    let normalized_text = normalize_qwen_context_echo_text(text);
+    QWEN_CONTEXT_ECHO_MARKERS
+        .iter()
+        .filter(|marker| {
+            let normalized_marker = normalize_qwen_context_echo_text(marker);
+            !normalized_marker.is_empty() && normalized_text.contains(&normalized_marker)
+        })
+        .count()
+}
+
+fn normalize_qwen_context_echo_text(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric())
+        .collect()
+}
+
+fn block_qwen_context_echo_update(
+    session: &mut QwenSidecarSession,
+    source: &'static str,
+    raw_text: &str,
+    prepared_text: &str,
+) {
+    let stale_display_is_echo = is_qwen_context_echo_text(session, &session.last_display_text);
+    session.context_echo_blocks += 1;
+    if stale_display_is_echo {
+        session.last_raw_partial.clear();
+        session.last_display_text.clear();
+        session.last_partial_at = None;
+    }
+    tracing::warn!(
+        session_id = %session.session_id,
+        source,
+        raw_text = %short_log_text(raw_text, 120),
+        prepared_text = %short_log_text(prepared_text, 120),
+        context_echo_blocks = session.context_echo_blocks,
+        "blocked Qwen context echo before HUD truth update"
+    );
 }
 
 struct QwenSidecarClient {
@@ -450,6 +542,7 @@ impl QwenSidecarSession {
     fn new(input_sample_rate_hz: i32, sidecar: QwenStartResponse, sample_cursor: usize) -> Self {
         Self {
             session_id: sidecar.session_id,
+            context_text: String::new(),
             input_sample_rate_hz,
             sample_rate_hz: sidecar.sample_rate_hz,
             pending_feed_samples: Vec::new(),
@@ -473,7 +566,15 @@ impl QwenSidecarSession {
             commit_locked: false,
             post_hud_flush_mutation_count: 0,
             sample_cursor,
+            speech_gate_opened: false,
+            speech_gate_opened_audio_ms: None,
+            context_echo_blocks: 0,
         }
+    }
+
+    fn with_context(mut self, context: &str) -> Self {
+        self.context_text = context.to_string();
+        self
     }
 }
 
@@ -1931,6 +2032,8 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                             release_tail_timeout_fallback = release_drain.timeout_fallback,
                             streamed_samples,
                             total_chunks_fed = session.total_chunks_fed,
+                            speech_gate_opened = session.speech_gate_opened,
+                            speech_gate_opened_audio_ms = session.speech_gate_opened_audio_ms,
                             "Qwen sidecar streaming recording captured"
                         );
 
@@ -2001,8 +2104,41 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                         let qwen_final_prepared = apply_streaming_punctuation_cleanup(
                             &ainput_rewrite::normalize_streaming_preview(&finish.text),
                         );
-                        let mut final_text =
-                            finalize_qwen_streaming_commit_text(qwen_final_prepared.trim());
+                        let final_is_context_echo =
+                            is_qwen_context_echo_text(&session, &finish.text)
+                                || is_qwen_context_echo_text(&session, &qwen_final_prepared);
+                        let mut final_text = if final_is_context_echo {
+                            String::new()
+                        } else {
+                            finalize_qwen_streaming_commit_text(qwen_final_prepared.trim())
+                        };
+                        if final_is_context_echo {
+                            let fallback_text = finalize_qwen_streaming_commit_text(
+                                session.last_display_text.trim(),
+                            );
+                            if !fallback_text.is_empty()
+                                && !is_qwen_context_echo_text(&session, &fallback_text)
+                            {
+                                tracing::warn!(
+                                    session_id = %session.session_id,
+                                    qwen_final_raw_text = %short_log_text(&finish.text, 120),
+                                    fallback_text = %fallback_text,
+                                    context_echo_blocks = session.context_echo_blocks,
+                                    "blocked Qwen context echo in final decode; using existing HUD truth"
+                                );
+                                final_text = fallback_text;
+                            } else {
+                                tracing::warn!(
+                                    session_id = %session.session_id,
+                                    qwen_final_raw_text = %short_log_text(&finish.text, 120),
+                                    context_echo_blocks = session.context_echo_blocks,
+                                    "blocked Qwen context echo in final decode before HUD commit"
+                                );
+                                let _ =
+                                    proxy.send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
+                                continue;
+                            }
+                        }
                         if final_text.is_empty()
                             || should_drop_low_signal_result(&final_text, &activity)
                         {
@@ -2302,7 +2438,8 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                 recording.sample_rate_hz(),
                                 sidecar_session,
                                 start_cursor,
-                            );
+                            )
+                            .with_context(&runtime.config.voice.streaming.qwen3.context);
                             tracing::info!(
                                 session_id = %session.session_id,
                                 input_sample_rate_hz = recording.sample_rate_hz(),
@@ -2416,8 +2553,12 @@ fn push_qwen_input_samples(session: &mut QwenSidecarSession, input: &[f32]) -> u
     if resampled.is_empty() {
         return 0;
     }
-    session.pending_feed_samples.extend_from_slice(&resampled);
+    let was_gate_opened = session.speech_gate_opened;
     session.captured_samples.extend_from_slice(&resampled);
+    maybe_open_qwen_speech_gate(session);
+    if was_gate_opened {
+        session.pending_feed_samples.extend_from_slice(&resampled);
+    }
     resampled.len()
 }
 
@@ -2426,9 +2567,65 @@ fn flush_qwen_audio_tail(session: &mut QwenSidecarSession) -> usize {
     if tail.is_empty() {
         return 0;
     }
-    session.pending_feed_samples.extend_from_slice(&tail);
+    let was_gate_opened = session.speech_gate_opened;
     session.captured_samples.extend_from_slice(&tail);
+    maybe_open_qwen_speech_gate(session);
+    if was_gate_opened {
+        session.pending_feed_samples.extend_from_slice(&tail);
+    }
     tail.len()
+}
+
+fn maybe_open_qwen_speech_gate(session: &mut QwenSidecarSession) {
+    if session.speech_gate_opened {
+        return;
+    }
+    let activity = analyze_audio_activity(&session.captured_samples);
+    if !should_open_qwen_speech_gate(&activity) {
+        return;
+    }
+
+    let gate_start_sample =
+        qwen_speech_gate_start_sample(&session.captured_samples, session.sample_rate_hz);
+    if gate_start_sample < session.captured_samples.len() {
+        session
+            .pending_feed_samples
+            .extend_from_slice(&session.captured_samples[gate_start_sample..]);
+    }
+    let audio_ms = audio_duration_ms(session.sample_rate_hz, session.captured_samples.len());
+    session.speech_gate_opened = true;
+    session.speech_gate_opened_audio_ms = Some(audio_ms);
+    tracing::info!(
+        session_id = %session.session_id,
+        audio_duration_ms = audio_ms,
+        gate_start_audio_ms = audio_duration_ms(session.sample_rate_hz, gate_start_sample),
+        peak_abs = format_args!("{:.6}", activity.peak_abs),
+        rms = format_args!("{:.6}", activity.rms),
+        active_ratio = format_args!("{:.4}", activity.active_ratio),
+        sustained_voice_ms = activity.sustained_voice_ms,
+        pending_feed_samples = session.pending_feed_samples.len(),
+        "Qwen speech gate opened; buffered preroll audio is now fed to ASR"
+    );
+}
+
+fn should_open_qwen_speech_gate(activity: &AudioActivity) -> bool {
+    (activity.active_ratio >= 0.003 && activity.sustained_voice_ms >= 20)
+        || activity.sustained_voice_ms >= 60
+        || (activity.peak_abs >= 0.011
+            && activity.rms >= 0.0014
+            && activity.sustained_voice_ms >= 20)
+}
+
+fn qwen_speech_gate_start_sample(samples: &[f32], sample_rate_hz: i32) -> usize {
+    if samples.is_empty() {
+        return 0;
+    }
+
+    let audio_ms = audio_duration_ms(sample_rate_hz, samples.len());
+    let speech_start_ms = estimate_speech_start_ms(samples, sample_rate_hz)
+        .unwrap_or_else(|| audio_ms.saturating_sub(900));
+    let gate_start_ms = speech_start_ms.saturating_sub(STREAMING_DEFAULT_PREROLL_MS);
+    sample_count_for_ms(sample_rate_hz, gate_start_ms).min(samples.len())
 }
 
 fn collect_qwen_stopped_recording_tail(
@@ -2577,6 +2774,11 @@ fn apply_qwen_sidecar_partial_update(
     let normalized = ainput_rewrite::normalize_streaming_preview(raw_text);
     let prepared = apply_streaming_punctuation_cleanup(&normalized);
     let prepared = prepared.trim();
+    if is_qwen_context_echo_text(session, raw_text) || is_qwen_context_echo_text(session, prepared)
+    {
+        block_qwen_context_echo_update(session, source, raw_text, prepared);
+        return None;
+    }
     if prepared.is_empty() {
         tracing::debug!(
             session_id = %session.session_id,
@@ -6925,18 +7127,19 @@ mod tests {
         current_ai_rewrite_tail, dedupe_streaming_punctuation,
         effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
         estimate_speech_start_ms, finalize_qwen_streaming_commit_text,
-        finalize_streaming_commit_text, is_ai_rewrite_outcome_current,
+        finalize_streaming_commit_text, is_ai_rewrite_outcome_current, is_qwen_context_echo_text,
         merge_ai_rewrite_tail_into_current_display, merge_rolled_over_prefix,
         merge_streaming_offline_tail_repair, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
-        qwen_fast_release_commit_text, qwen_session_has_partial_truth,
+        push_qwen_input_samples, qwen_fast_release_commit_text, qwen_session_has_partial_truth,
         resolve_streaming_rollover_commit_text, sanitize_ai_rewrite_output,
         sanitize_streaming_generated_punctuation, save_streaming_raw_capture,
         select_streaming_commit_text, select_streaming_final_raw_text,
         select_streaming_preview_text, should_drop_low_signal_result,
-        should_drop_streaming_preview_result, should_skip_streaming_preview,
-        streaming_final_quality_failures, streaming_offline_final_sample_start,
-        streaming_offline_final_scope, strip_trailing_terminal_sentence_punctuation,
+        should_drop_streaming_preview_result, should_open_qwen_speech_gate,
+        should_skip_streaming_preview, streaming_final_quality_failures,
+        streaming_offline_final_sample_start, streaming_offline_final_scope,
+        strip_trailing_terminal_sentence_punctuation,
     };
     use std::fs;
     #[test]
@@ -7030,6 +7233,145 @@ mod tests {
             qwen_fast_release_commit_text(&session),
             Some("这个怎么回事啊".to_string())
         );
+    }
+
+    #[test]
+    fn qwen_context_echo_partial_is_blocked_before_hud_truth() {
+        let context = "这是 Windows 语音输入法的实时转写场景。用户主要说中文，但经常中英文混杂，包含模型名、版本号、路径、快捷键、代码词、参数名和聊天软件输入内容。请输出用户最可能真正想输入的文字，可以把明显口语化、重复、同音错字、近音错字整理成正式、通顺、无错字的表达。";
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        )
+        .with_context(context);
+
+        let leaked_partial = "这是 Windows 语音输入法的实时转写场景。用户主要说中文，但经常中英文混杂，包含模型名、版本号、路径、快捷键、代码词、参数名和聊天软件输入内容。请输出用户最可能真正想输入的文字";
+        assert!(
+            apply_qwen_sidecar_partial_update(&mut session, leaked_partial, "qwen_partial")
+                .is_none()
+        );
+        assert_eq!(session.partial_updates, 0);
+        assert!(session.last_display_text.is_empty());
+        assert!(!qwen_session_has_partial_truth(&session));
+        assert_eq!(session.context_echo_blocks, 1);
+    }
+
+    #[test]
+    fn qwen_context_echo_fast_commit_is_blocked_if_state_is_poisoned() {
+        let context = "这是 Windows 语音输入法的实时转写场景。用户主要说中文，但经常中英文混杂。请输出用户最可能真正想输入的文字。";
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        )
+        .with_context(context);
+        session.last_display_text = context.to_string();
+
+        assert_eq!(qwen_fast_release_commit_text(&session), None);
+    }
+
+    #[test]
+    fn qwen_context_echo_guard_allows_normal_dictation_text() {
+        let context = "这是 Windows 语音输入法的实时转写场景。用户主要说中文，但经常中英文混杂。请输出用户最可能真正想输入的文字。";
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        )
+        .with_context(context);
+
+        let update = apply_qwen_sidecar_partial_update(
+            &mut session,
+            "你这个拦截应该在 HUD 上屏之前就要拦了",
+            "qwen_partial",
+        )
+        .expect("normal qwen partial should still update HUD truth");
+        assert_eq!(update.display_text, "你这个拦截应该在 HUD 上屏之前就要拦了");
+        assert_eq!(session.partial_updates, 1);
+        assert_eq!(session.context_echo_blocks, 0);
+        assert!(!is_qwen_context_echo_text(&session, &update.display_text));
+    }
+
+    #[test]
+    fn qwen_speech_gate_stays_closed_for_bad_low_signal_audio() {
+        let activity = AudioActivity {
+            peak_abs: 0.0101,
+            rms: 0.0012,
+            active_ratio: 0.0009,
+            sustained_voice_ms: 40,
+        };
+        assert!(!should_open_qwen_speech_gate(&activity));
+    }
+
+    #[test]
+    fn qwen_speech_gate_stays_closed_for_rms_only_context_leak_audio() {
+        let activity = AudioActivity {
+            peak_abs: 0.008953,
+            rms: 0.001815,
+            active_ratio: 0.0005,
+            sustained_voice_ms: 20,
+        };
+        assert!(!should_open_qwen_speech_gate(&activity));
+    }
+
+    #[test]
+    fn qwen_speech_gate_opens_for_soft_but_real_speech() {
+        let activity = AudioActivity {
+            peak_abs: 0.0121,
+            rms: 0.0016,
+            active_ratio: 0.0015,
+            sustained_voice_ms: 40,
+        };
+        assert!(should_open_qwen_speech_gate(&activity));
+    }
+
+    #[test]
+    fn qwen_audio_is_not_fed_to_asr_before_speech_gate_opens() {
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        );
+
+        let quiet = vec![0.001f32; 16_000];
+        assert_eq!(push_qwen_input_samples(&mut session, &quiet), quiet.len());
+        assert!(!session.speech_gate_opened);
+        assert!(session.pending_feed_samples.is_empty());
+        assert_eq!(session.captured_samples.len(), quiet.len());
+    }
+
+    #[test]
+    fn qwen_audio_gate_feeds_buffered_preroll_after_voice_starts() {
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        );
+
+        let mut samples = vec![0.0f32; 3_200];
+        samples.extend(vec![0.006f32; 3_200]);
+        assert_eq!(
+            push_qwen_input_samples(&mut session, &samples),
+            samples.len()
+        );
+        assert!(session.speech_gate_opened);
+        assert_eq!(session.speech_gate_opened_audio_ms, Some(400));
+        assert_eq!(session.pending_feed_samples.len(), 6_080);
     }
 
     #[test]

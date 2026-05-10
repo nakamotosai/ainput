@@ -2,6 +2,7 @@
 /target-r*/
 /.idea/
 /.vscode/
+/.codex-backup/
 /logs/
 /dist/
 /runtime/

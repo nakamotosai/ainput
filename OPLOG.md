@@ -1,5 +1,23 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.72：Qwen context echo guard 与项目暂时收口
+
+- 根因确认：Qwen3-ASR sidecar 在坏音频/低信号场景下会把 `[voice.streaming.qwen3].context` 直接作为 partial/final 文本吐出；`.71` 的拦截点太晚，提示词可能先闪到 HUD 或被 fast HUD snapshot 上屏。
+- 修复：新增 Qwen context echo guard，使用当前配置 context 和关键 prompt marker 检测回显；在 `apply_qwen_sidecar_partial_update` 写入 `last_display_text`、发送 HUD partial、进入 history/paste 之前直接拦截。
+- 修复：release final 路径在 HUD final ack 与 paste 前二次拦截 context echo；fast HUD snapshot 也拒绝提交 prompt-like `last_display_text`。
+- 保持：不改 Qwen context，不改标点策略，不恢复 offline final，不启用应用层 AI rewrite；`voice.streaming.ai_rewrite.enabled = false` 保持关闭。
+- 版本入口：workspace version 升到 `1.0.0-preview.72`，`run-ainput.bat` 与 HKCU Run 自启动均指向 `dist\ainput-1.0.0-preview.72\ainput-desktop.exe`。
+- Windows live 运行进程已切到 `dist\ainput-1.0.0-preview.72\ainput-desktop.exe`，PID `37176`，`SessionId=1`。
+
+验证：
+
+- `cargo fmt` 已执行。
+- `cargo test -p ainput-desktop qwen_context_echo -- --nocapture`：3/3 passed。
+- `cargo test -p ainput-desktop worker::tests:: -- --nocapture`：72/72 passed。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.72` 产出 `dist\ainput-1.0.0-preview.72\` 与 `dist\ainput-1.0.0-preview.72.zip`。
+- 包内配置验证：`voice.streaming.ai_rewrite.enabled = false`。
+- `.72` 日志确认 Qwen worker started、model ready、warm chunk completed；`/health` 返回 `ok=true`、`model=Qwen/Qwen3-ASR-0.6B`、`idle_unload_ms=3600000`、`effective_enforce_eager=false`。
+
 ## 2026-05-10 打包 1.0.0-preview.68：收紧上屏延迟并清理历史构建产物
 
 - live 证据确认：`preview.67` 的 `hud_final_flush_elapsed_ms` 只有约 `16-18ms`，`output_elapsed_ms` 只有约 `72-98ms`；“HUD 已经完整了但贴上去还慢”的主因不在 Ctrl+V，而在松手后的 release drain + final decode。
