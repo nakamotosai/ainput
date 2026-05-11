@@ -314,6 +314,7 @@ fn try_main() -> Result<()> {
             match bootstrap.config.voice.mode {
                 ainput_shell::VoiceMode::Fast => "fast",
                 ainput_shell::VoiceMode::Streaming => "streaming",
+                ainput_shell::VoiceMode::OnlineStreaming => "online_streaming",
             },
             bootstrap.config.hotkeys.screen_capture,
             bootstrap.runtime_paths.config_file.display()
@@ -344,7 +345,9 @@ fn effective_voice_hotkey_binding(
 ) -> String {
     match mode {
         ainput_shell::VoiceMode::Fast => configured_hotkey.to_string(),
-        ainput_shell::VoiceMode::Streaming => STREAMING_HOLD_TO_TALK_HOTKEY.to_string(),
+        ainput_shell::VoiceMode::Streaming | ainput_shell::VoiceMode::OnlineStreaming => {
+            STREAMING_HOLD_TO_TALK_HOTKEY.to_string()
+        }
     }
 }
 
@@ -809,8 +812,10 @@ struct DesktopApp {
     overlay_tick_started: bool,
     fast_worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     streaming_worker_tx: Option<mpsc::Sender<WorkerCommand>>,
+    online_streaming_worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     fast_model: VoiceModelLifecycle,
     streaming_model: VoiceModelLifecycle,
+    online_streaming_model: VoiceModelLifecycle,
     active_model_load_notice: Option<ActiveModelLoadNotice>,
     pending_model_ready_notice: Option<PendingModelReadyNotice>,
     hotkey_monitor: Option<hotkey::GlobalHotkeyMonitor>,
@@ -832,6 +837,7 @@ struct DesktopApp {
     voice_hotkey_hint_item: Option<MenuItem>,
     voice_mode_fast_item: Option<CheckMenuItem>,
     voice_mode_streaming_item: Option<CheckMenuItem>,
+    voice_mode_online_streaming_item: Option<CheckMenuItem>,
     open_hud_overlay_item: Option<MenuItem>,
     learn_terms_item: Option<MenuItem>,
     mouse_middle_item: Option<CheckMenuItem>,
@@ -865,8 +871,10 @@ impl DesktopApp {
             overlay_tick_started: false,
             fast_worker_tx: None,
             streaming_worker_tx: None,
+            online_streaming_worker_tx: None,
             fast_model: VoiceModelLifecycle::default(),
             streaming_model: VoiceModelLifecycle::default(),
+            online_streaming_model: VoiceModelLifecycle::default(),
             active_model_load_notice: None,
             pending_model_ready_notice: None,
             hotkey_monitor: None,
@@ -888,6 +896,7 @@ impl DesktopApp {
             voice_hotkey_hint_item: None,
             voice_mode_fast_item: None,
             voice_mode_streaming_item: None,
+            voice_mode_online_streaming_item: None,
             open_hud_overlay_item: None,
             learn_terms_item: None,
             mouse_middle_item: None,
@@ -981,6 +990,47 @@ impl DesktopApp {
         });
     }
 
+    fn start_online_streaming_worker_once(&mut self) {
+        if self.online_streaming_worker_tx.is_some() {
+            return;
+        }
+
+        let runtime = self.runtime.clone();
+        let proxy = self.proxy.clone();
+        let shutdown = self.shutdown.clone();
+        let (worker_tx, worker_rx) = mpsc::channel();
+        self.online_streaming_worker_tx = Some(worker_tx);
+        if self.mode == AppMode::Idle {
+            self.refresh_idle_tray_surface();
+        }
+
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker::online_streaming_push_to_talk_worker(
+                    runtime,
+                    proxy.clone(),
+                    shutdown.clone(),
+                    worker_rx,
+                );
+            }));
+
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let message = match result {
+                Ok(()) => "在线流式语音线程已退出，下次按快捷键会自动重启".to_string(),
+                Err(payload) => {
+                    format!(
+                        "在线流式语音线程异常退出：{}",
+                        panic_message(payload.as_ref())
+                    )
+                }
+            };
+            let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Unavailable(message)));
+        });
+    }
+
     fn ensure_streaming_ai_rewrite_ready(&mut self) {
         if self.runtime.ai_rewriter.is_some() {
             return;
@@ -1049,6 +1099,7 @@ impl DesktopApp {
         match self.runtime.config.voice.mode {
             ainput_shell::VoiceMode::Fast => WorkerKind::Fast,
             ainput_shell::VoiceMode::Streaming => WorkerKind::Streaming,
+            ainput_shell::VoiceMode::OnlineStreaming => WorkerKind::OnlineStreaming,
         }
     }
 
@@ -1075,6 +1126,7 @@ impl DesktopApp {
                     "流式 ASR"
                 }
             }
+            WorkerKind::OnlineStreaming => "在线 ASR",
         }
     }
 
@@ -1082,6 +1134,7 @@ impl DesktopApp {
         match kind {
             WorkerKind::Fast => &self.fast_model,
             WorkerKind::Streaming => &self.streaming_model,
+            WorkerKind::OnlineStreaming => &self.online_streaming_model,
         }
     }
 
@@ -1089,6 +1142,7 @@ impl DesktopApp {
         match kind {
             WorkerKind::Fast => &mut self.fast_model,
             WorkerKind::Streaming => &mut self.streaming_model,
+            WorkerKind::OnlineStreaming => &mut self.online_streaming_model,
         }
     }
 
@@ -1103,6 +1157,7 @@ impl DesktopApp {
     fn has_loading_voice_workers(&self) -> bool {
         self.fast_model.phase == VoiceModelPhase::Loading
             || self.streaming_model.phase == VoiceModelPhase::Loading
+            || self.online_streaming_model.phase == VoiceModelPhase::Loading
     }
 
     fn begin_voice_model_loading(&mut self, kind: WorkerKind, source: ModelLoadSource) {
@@ -1415,6 +1470,14 @@ impl DesktopApp {
         self.handle_worker_error(message);
     }
 
+    fn handle_online_streaming_worker_unavailable(&mut self, message: &str) {
+        self.online_streaming_worker_tx = None;
+        self.online_streaming_model.phase = VoiceModelPhase::Cold;
+        self.online_streaming_model.loading_started_at = None;
+        self.online_streaming_model.expected_unload_at = None;
+        self.handle_worker_error(message);
+    }
+
     fn handle_worker_error(&mut self, message: &str) {
         self.mode = AppMode::Idle;
         self.active_model_load_notice = None;
@@ -1444,7 +1507,8 @@ impl DesktopApp {
     fn voice_mode_label(mode: ainput_shell::VoiceMode) -> &'static str {
         match mode {
             ainput_shell::VoiceMode::Fast => "极速语音识别",
-            ainput_shell::VoiceMode::Streaming => "流式语音识别",
+            ainput_shell::VoiceMode::Streaming => "本地流式识别",
+            ainput_shell::VoiceMode::OnlineStreaming => "在线流式识别",
         }
     }
 
@@ -1482,6 +1546,11 @@ impl DesktopApp {
         }
         if let Some(item) = &self.voice_mode_streaming_item {
             item.set_checked(self.runtime.config.voice.mode == ainput_shell::VoiceMode::Streaming);
+        }
+        if let Some(item) = &self.voice_mode_online_streaming_item {
+            item.set_checked(
+                self.runtime.config.voice.mode == ainput_shell::VoiceMode::OnlineStreaming,
+            );
         }
     }
 
@@ -1556,6 +1625,48 @@ impl DesktopApp {
                     self.refresh_idle_tray_surface();
                 }
             }
+            ainput_shell::VoiceMode::OnlineStreaming => {
+                if self.online_streaming_model.phase != VoiceModelPhase::Ready {
+                    self.begin_voice_model_loading(WorkerKind::OnlineStreaming, source);
+                    let _ = self.send_online_streaming_worker_command(WorkerCommand::PreloadModel);
+                } else if self.mode == AppMode::Idle {
+                    self.refresh_idle_tray_surface();
+                }
+            }
+        }
+    }
+
+    fn try_send_online_streaming_worker_command(&self, command: WorkerCommand) -> bool {
+        self.online_streaming_worker_tx
+            .as_ref()
+            .is_some_and(|worker_tx| worker_tx.send(command).is_ok())
+    }
+
+    fn send_online_streaming_worker_command(&mut self, command: WorkerCommand) -> bool {
+        self.start_online_streaming_worker_once();
+        if self.try_send_online_streaming_worker_command(command) {
+            return true;
+        }
+
+        tracing::warn!("online streaming worker channel is unavailable; restarting worker");
+        self.online_streaming_worker_tx = None;
+        self.start_online_streaming_worker_once();
+        if self.try_send_online_streaming_worker_command(command) {
+            return true;
+        }
+
+        self.handle_online_streaming_worker_unavailable(
+            "在线流式语音线程不可用，请检查在线 ASR 服务",
+        );
+        false
+    }
+
+    fn current_streaming_panel_enabled(&self) -> bool {
+        match self.runtime.config.voice.mode {
+            ainput_shell::VoiceMode::OnlineStreaming => {
+                self.runtime.config.voice.online_streaming.panel_enabled
+            }
+            _ => self.runtime.config.voice.streaming.panel_enabled,
         }
     }
 
@@ -1565,7 +1676,7 @@ impl DesktopApp {
         persistent: bool,
         char_streaming: bool,
     ) {
-        if !self.runtime.config.voice.streaming.panel_enabled {
+        if !self.current_streaming_panel_enabled() {
             if let Some(overlay) = &mut self.overlay {
                 overlay.clear_status_hud();
             }
@@ -1598,7 +1709,7 @@ impl DesktopApp {
             }
         };
 
-        if !self.runtime.config.voice.streaming.panel_enabled {
+        if !self.current_streaming_panel_enabled() {
             return worker::StreamingHudCommitAck {
                 text: final_text,
                 visible: false,
@@ -1776,6 +1887,13 @@ impl DesktopApp {
             Self::voice_mode_label(ainput_shell::VoiceMode::Streaming),
             true,
             self.runtime.config.voice.mode == ainput_shell::VoiceMode::Streaming,
+            None,
+        );
+        let voice_mode_online_streaming_item = CheckMenuItem::with_id(
+            "voice_mode_online_streaming",
+            Self::voice_mode_label(ainput_shell::VoiceMode::OnlineStreaming),
+            true,
+            self.runtime.config.voice.mode == ainput_shell::VoiceMode::OnlineStreaming,
             None,
         );
         let open_hud_overlay_item =
@@ -2076,6 +2194,7 @@ impl DesktopApp {
         let _ = tray_menu.append(&separator);
         let _ = tray_menu.append(&voice_mode_fast_item);
         let _ = tray_menu.append(&voice_mode_streaming_item);
+        let _ = tray_menu.append(&voice_mode_online_streaming_item);
         let _ = tray_menu.append(&mode_separator);
         let _ = tray_menu.append(&open_hud_overlay_item);
         let _ = tray_menu.append(&hud_separator);
@@ -2111,6 +2230,7 @@ impl DesktopApp {
         self.voice_hotkey_hint_item = Some(voice_hotkey_hint);
         self.voice_mode_fast_item = Some(voice_mode_fast_item);
         self.voice_mode_streaming_item = Some(voice_mode_streaming_item);
+        self.voice_mode_online_streaming_item = Some(voice_mode_online_streaming_item);
         self.open_hud_overlay_item = Some(open_hud_overlay_item);
         self.exit_item = Some(exit_item);
         self.restart_item = Some(restart_item);
@@ -2563,7 +2683,7 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                             ainput_shell::VoiceMode::Streaming => {
                                 if !self.runtime.config.voice.streaming.enabled {
                                     self.set_tray_visual_state(TrayVisualState::Error, 0);
-                                    self.set_tray_status("状态：流式语音识别已在配置中关闭");
+                                    self.set_tray_status("状态：本地流式语音识别已在配置中关闭");
                                     return;
                                 }
                                 self.mode = AppMode::Voice;
@@ -2585,6 +2705,27 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                                 let _ = self
                                     .send_streaming_worker_command(WorkerCommand::HotkeyPressed);
                             }
+                            ainput_shell::VoiceMode::OnlineStreaming => {
+                                if !self.runtime.config.voice.online_streaming.enabled {
+                                    self.set_tray_visual_state(TrayVisualState::Error, 0);
+                                    self.set_tray_status("状态：在线流式语音识别已在配置中关闭");
+                                    return;
+                                }
+                                self.mode = AppMode::Voice;
+                                if self.online_streaming_model.phase == VoiceModelPhase::Ready {
+                                    self.set_tray_visual_state(TrayVisualState::Voice, 0);
+                                    self.set_tray_status(self.streaming_status_text());
+                                    self.show_streaming_status_overlay("", true, false);
+                                } else {
+                                    self.begin_voice_model_loading(
+                                        WorkerKind::OnlineStreaming,
+                                        ModelLoadSource::Hotkey,
+                                    );
+                                }
+                                let _ = self.send_online_streaming_worker_command(
+                                    WorkerCommand::HotkeyPressed,
+                                );
+                            }
                         }
                     }
                 }
@@ -2597,9 +2738,16 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                             }
                             ainput_shell::VoiceMode::Streaming => {
                                 self.set_tray_visual_state(TrayVisualState::Voice, 1);
-                                self.set_tray_status("状态：流式语音识别收尾中");
+                                self.set_tray_status("状态：本地流式语音识别收尾中");
                                 let _ = self
                                     .send_streaming_worker_command(WorkerCommand::HotkeyReleased);
+                            }
+                            ainput_shell::VoiceMode::OnlineStreaming => {
+                                self.set_tray_visual_state(TrayVisualState::Voice, 1);
+                                self.set_tray_status("状态：在线流式语音识别上屏中");
+                                let _ = self.send_online_streaming_worker_command(
+                                    WorkerCommand::HotkeyReleased,
+                                );
                             }
                         }
                     }
@@ -2820,6 +2968,22 @@ impl DesktopApp {
             .unwrap_or(false)
         {
             match self.set_voice_mode(ainput_shell::VoiceMode::Streaming) {
+                Ok(()) => self.refresh_idle_tray_surface(),
+                Err(error) => self.set_tray_status(&format!(
+                    "状态：切换语音模式失败 - {}",
+                    shorten(&error.to_string(), 16)
+                )),
+            }
+            return;
+        }
+
+        if self
+            .voice_mode_online_streaming_item
+            .as_ref()
+            .map(|item| event.id == *item.id())
+            .unwrap_or(false)
+        {
+            match self.set_voice_mode(ainput_shell::VoiceMode::OnlineStreaming) {
                 Ok(()) => self.refresh_idle_tray_surface(),
                 Err(error) => self.set_tray_status(&format!(
                     "状态：切换语音模式失败 - {}",

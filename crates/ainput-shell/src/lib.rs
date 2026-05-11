@@ -44,6 +44,7 @@ pub struct VoiceConfig {
     pub enabled: bool,
     pub mode: VoiceMode,
     pub streaming: StreamingVoiceConfig,
+    pub online_streaming: OnlineStreamingVoiceConfig,
     pub prefer_direct_paste: bool,
     pub fallback_to_clipboard: bool,
     pub history_file_name: String,
@@ -56,6 +57,7 @@ pub enum VoiceMode {
     #[default]
     Fast,
     Streaming,
+    OnlineStreaming,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +83,20 @@ pub struct StreamingVoiceConfig {
     pub performance: StreamingPerformanceConfig,
     pub commit: StreamingCommitConfig,
     pub ai_rewrite: StreamingAiRewriteConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OnlineStreamingVoiceConfig {
+    pub enabled: bool,
+    pub backend: String,
+    pub sidecar_url: String,
+    pub chunk_ms: u32,
+    pub release_grace_ms: u64,
+    pub finish_in_background: bool,
+    pub language: String,
+    pub automatic_punctuation: bool,
+    pub panel_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,8 +281,9 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            mode: VoiceMode::Streaming,
+            mode: VoiceMode::OnlineStreaming,
             streaming: StreamingVoiceConfig::default(),
+            online_streaming: OnlineStreamingVoiceConfig::default(),
             prefer_direct_paste: true,
             fallback_to_clipboard: true,
             history_file_name: "voice-history.log".to_string(),
@@ -280,9 +297,9 @@ impl Default for StreamingVoiceConfig {
         Self {
             enabled: true,
             model_dir: "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en".to_string(),
-            backend: "nvidia_parakeet_online".to_string(),
-            sidecar_url: "http://vps-jp.tail4b5213.ts.net:18765".to_string(),
-            sidecar_auto_start: false,
+            backend: "qwen3_sidecar".to_string(),
+            sidecar_url: "http://127.0.0.1:8765".to_string(),
+            sidecar_auto_start: true,
             sidecar_idle_unload_ms: 3_600_000,
             sidecar_wsl_distro: "Ubuntu".to_string(),
             sidecar_wsl_workdir: "/home/sai/ainput-qwen3-asr".to_string(),
@@ -304,6 +321,42 @@ impl Default for StreamingVoiceConfig {
     }
 }
 
+impl OnlineStreamingVoiceConfig {
+    pub fn to_streaming_voice_config(&self) -> StreamingVoiceConfig {
+        let mut config = StreamingVoiceConfig::default();
+        config.enabled = self.enabled;
+        config.backend = self.backend.clone();
+        config.sidecar_url = self.sidecar_url.clone();
+        config.sidecar_auto_start = false;
+        config.panel_enabled = self.panel_enabled;
+        config.rewrite_enabled = false;
+        config.chunk_ms = self.chunk_ms;
+        config.qwen3.context.clear();
+        config.performance.gpu_enabled = false;
+        config.ai_rewrite.enabled = false;
+        config.finalize.release_drain_min_ms = 0;
+        config.finalize.release_drain_idle_settle_ms = self.release_grace_ms;
+        config.finalize.release_drain_max_ms = self.release_grace_ms;
+        config
+    }
+}
+
+impl Default for OnlineStreamingVoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: "nvidia_parakeet_online".to_string(),
+            sidecar_url: "http://vps-jp.tail4b5213.ts.net:18765".to_string(),
+            chunk_ms: 100,
+            release_grace_ms: 180,
+            finish_in_background: true,
+            language: "zh-CN".to_string(),
+            automatic_punctuation: true,
+            panel_enabled: true,
+        }
+    }
+}
+
 impl Default for StreamingQwen3Config {
     fn default() -> Self {
         Self {
@@ -313,7 +366,7 @@ impl Default for StreamingQwen3Config {
             unfixed_token_num: 5,
             max_new_tokens: 64,
             enforce_eager: false,
-            gpu_memory_utilization: 0.50,
+            gpu_memory_utilization: 0.30,
             max_model_len: 2048,
             dtype: "float16".to_string(),
         }
@@ -379,7 +432,7 @@ impl Default for StreamingPerformanceConfig {
             punctuation_num_threads: 1,
             final_num_threads: 8,
             background_writer_threads: 1,
-            gpu_enabled: false,
+            gpu_enabled: true,
         }
     }
 }
@@ -1138,6 +1191,18 @@ max_context_chars = {streaming_ai_rewrite_max_context_chars}
 # 允许模型返回的尾巴最大字符数。
 max_output_chars = {streaming_ai_rewrite_max_output_chars}
 
+[voice.online_streaming]
+# 第三个独立在线流式 ASR 模式；不加载本地 Qwen/SenseVoice 模型。
+enabled = {online_streaming_enabled}
+backend = "{online_streaming_backend}"
+sidecar_url = "{online_streaming_sidecar_url}"
+chunk_ms = {online_streaming_chunk_ms}
+release_grace_ms = {online_streaming_release_grace_ms}
+finish_in_background = {online_streaming_finish_in_background}
+language = "{online_streaming_language}"
+automatic_punctuation = {online_streaming_automatic_punctuation}
+panel_enabled = {online_streaming_panel_enabled}
+
 [capture]
 # 是否启用截图主功能。
 enabled = {capture_enabled}
@@ -1227,6 +1292,7 @@ file_name = "{log_file_name}"
         voice_mode = match config.voice.mode {
             VoiceMode::Fast => "fast",
             VoiceMode::Streaming => "streaming",
+            VoiceMode::OnlineStreaming => "online_streaming",
         },
         prefer_direct_paste = config.voice.prefer_direct_paste,
         fallback_to_clipboard = config.voice.fallback_to_clipboard,
@@ -1361,6 +1427,31 @@ file_name = "{log_file_name}"
         streaming_ai_rewrite_max_context_chars =
             config.voice.streaming.ai_rewrite.max_context_chars,
         streaming_ai_rewrite_max_output_chars = config.voice.streaming.ai_rewrite.max_output_chars,
+        online_streaming_enabled = config.voice.online_streaming.enabled,
+        online_streaming_backend = config
+            .voice
+            .online_streaming
+            .backend
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        online_streaming_sidecar_url = config
+            .voice
+            .online_streaming
+            .sidecar_url
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        online_streaming_chunk_ms = config.voice.online_streaming.chunk_ms,
+        online_streaming_release_grace_ms = config.voice.online_streaming.release_grace_ms,
+        online_streaming_finish_in_background = config.voice.online_streaming.finish_in_background,
+        online_streaming_language = config
+            .voice
+            .online_streaming
+            .language
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        online_streaming_automatic_punctuation =
+            config.voice.online_streaming.automatic_punctuation,
+        online_streaming_panel_enabled = config.voice.online_streaming.panel_enabled,
         capture_enabled = config.capture.enabled,
         auto_save_to_desktop = config.capture.auto_save_to_desktop,
         automation_repeat_count = config.automation.repeat_count,

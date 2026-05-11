@@ -1,5 +1,31 @@
 # ainput DECISIONS
 
+## D-020 在线 ASR 必须是独立语音模式
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- `preview.74` / `preview.75` 把在线 Parakeet 暂时塞进 `[voice.streaming]`，导致托盘仍只显示“极速 / 流式”，用户无法区分本地 Qwen 流式和在线流式。
+- 本地 Qwen 仍需要保留为可回退能力，不能因为在线试验覆盖它的配置、显存策略和启动行为。
+- 在线 ASR 的上屏策略应更简单：HUD partial 已经是用户可见真相，松手时不应再被本地 Qwen 的 context echo guard、age gate、AI rewrite 或 final HUD ack 阻塞。
+
+决策：
+
+- 新增独立模式 `online_streaming`，配置为 `[voice.online_streaming]`，默认启动走该模式。
+- `[voice.streaming]` 重新代表本地流式模式，默认回到 `qwen3_sidecar`、本地 `127.0.0.1:8765`、WSL auto-start、`gpu_memory_utilization = 0.30` 与 `gpu_enabled = true`。
+- 在线模式复用 sidecar HTTP contract，但 worker kind、托盘菜单、生命周期状态和配置面独立。
+- 在线松手时，如果 HUD 已有文本，先直接粘贴 HUD snapshot；远端 finish/session cleanup/raw capture 保存后台完成。
+
+放弃：
+
+- 不把在线 ASR 继续伪装成本地流式 backend。
+- 不删除本地 Qwen / Sherpa 路径。
+- 不在本轮修改 `cliproxyapi` 8317 或 NVIDIA key pool。
+
+---
+
 ## D-019 临时引入 NVIDIA Parakeet 在线 ASR adapter
 
 - 日期：2026-05-11

@@ -5,6 +5,19 @@
 
 ---
 
+## Round 39：preview.76 独立在线流式模式
+
+- [x] 新增 `VoiceMode::OnlineStreaming` 和 `[voice.online_streaming]`
+- [x] 托盘一级菜单拆成 `极速语音识别 / 本地流式识别 / 在线流式识别`
+- [x] 默认模式改为 `online_streaming`
+- [x] 本地 `[voice.streaming]` 恢复为 Qwen sidecar 配置
+- [x] 在线模式不加载本地 Qwen，不启用 AI rewrite
+- [x] 在线松手优先粘贴 HUD snapshot，远端 finish/cleanup 后台执行
+- [x] `cargo fmt --all -- --check` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] 打包 `dist\ainput-1.0.0-preview.76`
+- [x] Windows 交互桌面运行 preview.76
+
 ## Round 38：preview.75 在线 Parakeet HUD 实时 partial
 
 - [x] 定位 `preview.74` HUD 空白根因：adapter `/chunk` 固定返回空文本

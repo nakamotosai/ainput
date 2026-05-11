@@ -137,6 +137,7 @@ pub(crate) struct StreamingHudCommitAck {
 pub(crate) enum WorkerKind {
     Fast,
     Streaming,
+    OnlineStreaming,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -268,6 +269,46 @@ fn qwen_fast_release_commit_text(session: &QwenSidecarSession) -> Option<String>
     Some(text.to_string())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SidecarStreamingWorkerMode {
+    kind: WorkerKind,
+    fast_hud_snapshot_without_qwen_guards: bool,
+    finish_in_background: bool,
+}
+
+impl SidecarStreamingWorkerMode {
+    fn local_qwen() -> Self {
+        Self {
+            kind: WorkerKind::Streaming,
+            fast_hud_snapshot_without_qwen_guards: false,
+            finish_in_background: false,
+        }
+    }
+
+    fn online(finish_in_background: bool) -> Self {
+        Self {
+            kind: WorkerKind::OnlineStreaming,
+            fast_hud_snapshot_without_qwen_guards: true,
+            finish_in_background,
+        }
+    }
+}
+
+fn sidecar_fast_release_commit_text(
+    session: &QwenSidecarSession,
+    mode: SidecarStreamingWorkerMode,
+) -> Option<String> {
+    if mode.fast_hud_snapshot_without_qwen_guards {
+        let text = session.last_display_text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        return Some(text.to_string());
+    }
+
+    qwen_fast_release_commit_text(session)
+}
+
 const QWEN_CONTEXT_ECHO_MIN_PREFIX_CHARS: usize = 24;
 const QWEN_CONTEXT_ECHO_MIN_CONTAINS_CHARS: usize = 48;
 const QWEN_CONTEXT_ECHO_MARKERS: &[&str] = &[
@@ -348,6 +389,7 @@ fn block_qwen_context_echo_update(
     );
 }
 
+#[derive(Clone)]
 struct QwenSidecarClient {
     http: Client,
     base_url: String,
@@ -1280,7 +1322,13 @@ pub(crate) fn streaming_push_to_talk_worker(
 ) {
     let backend = streaming_backend_key(&runtime.config.voice.streaming);
     if is_sidecar_streaming_backend_key(&backend) {
-        qwen_sidecar_streaming_push_to_talk_worker(runtime, proxy, shutdown, worker_rx);
+        sidecar_streaming_push_to_talk_worker(
+            runtime,
+            proxy,
+            shutdown,
+            worker_rx,
+            SidecarStreamingWorkerMode::local_qwen(),
+        );
         return;
     }
     if !backend.is_empty() && backend != "sherpa" {
@@ -1775,18 +1823,41 @@ pub(crate) fn streaming_push_to_talk_worker(
     }
 }
 
-fn qwen_sidecar_streaming_push_to_talk_worker(
+pub(crate) fn online_streaming_push_to_talk_worker(
+    mut runtime: AppRuntime,
+    proxy: EventLoopProxy<AppEvent>,
+    shutdown: Arc<AtomicBool>,
+    worker_rx: mpsc::Receiver<WorkerCommand>,
+) {
+    let finish_in_background = runtime.config.voice.online_streaming.finish_in_background;
+    runtime.config.voice.streaming = runtime
+        .config
+        .voice
+        .online_streaming
+        .to_streaming_voice_config();
+    runtime.ai_rewriter = None;
+    sidecar_streaming_push_to_talk_worker(
+        runtime,
+        proxy,
+        shutdown,
+        worker_rx,
+        SidecarStreamingWorkerMode::online(finish_in_background),
+    );
+}
+
+fn sidecar_streaming_push_to_talk_worker(
     runtime: AppRuntime,
     proxy: EventLoopProxy<AppEvent>,
     shutdown: Arc<AtomicBool>,
     worker_rx: mpsc::Receiver<WorkerCommand>,
+    mode: SidecarStreamingWorkerMode,
 ) {
     let backend_label = sidecar_backend_label(&runtime.config.voice.streaming);
     let sidecar = match QwenSidecarClient::create(&runtime.config.voice.streaming) {
         Ok(client) => client,
         Err(error) => {
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
-                kind: WorkerKind::Streaming,
+                kind: mode.kind,
                 message: format!("failed to initialize {backend_label} sidecar: {error}"),
             }));
             return;
@@ -1890,7 +1961,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                         };
                         let release_started_at = Instant::now();
                         cancel_qwen_ai_rewrite(&mut session, "hotkey_release");
-                        if let Some(fast_text) = qwen_fast_release_commit_text(&mut session) {
+                        if let Some(fast_text) = sidecar_fast_release_commit_text(&session, mode) {
                             session.commit_locked = true;
 
                             let hotkey_release_wait_started_at = Instant::now();
@@ -1903,7 +1974,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                 tracing::warn!(
                                     waited_ms = hotkey_release_wait_elapsed_ms,
                                     streaming_effective_hotkey = "Ctrl",
-                                    "Qwen fast HUD commit started before all modifiers fully released"
+                                    "sidecar fast HUD commit started before all modifiers fully released"
                                 );
                             }
 
@@ -1936,7 +2007,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                 }
                                 Err(error) => {
                                     let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Error(
-                                        format!("failed to output Qwen streaming text: {error}"),
+                                        format!("failed to output {backend_label} streaming text: {error}"),
                                     )));
                                     continue;
                                 }
@@ -1961,39 +2032,43 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                     .last_partial_at
                                     .map(|instant| instant.elapsed().as_millis())
                                     .unwrap_or_default(),
-                                "Qwen sidecar fast HUD snapshot delivered"
+                                "sidecar fast HUD snapshot delivered"
                             );
                             let _ = proxy.send_event(AppEvent::Worker(
                                 WorkerEvent::StreamingFinal(fast_text),
                             ));
 
-                            let cleanup_started_at = Instant::now();
-                            match recording.stop() {
-                                Ok(recorded) => {
-                                    save_streaming_raw_capture_async(
-                                        runtime
-                                            .runtime_paths
-                                            .logs_dir
-                                            .join("streaming-raw-captures"),
-                                        recorded,
+                            let raw_capture_dir = runtime
+                                .runtime_paths
+                                .logs_dir
+                                .join("streaming-raw-captures");
+                            let session_id = session.session_id.clone();
+                            if mode.finish_in_background {
+                                let cleanup_sidecar = sidecar.clone();
+                                let cleanup_backend_label = backend_label;
+                                std::thread::spawn(move || {
+                                    cleanup_sidecar_fast_commit(
+                                        cleanup_sidecar,
+                                        recording,
+                                        raw_capture_dir,
+                                        session_id,
+                                        cleanup_backend_label,
                                     );
-                                }
-                                Err(error) => {
-                                    tracing::warn!(error = %error, "Qwen fast commit recording cleanup failed");
-                                }
+                                });
+                            } else {
+                                cleanup_sidecar_fast_commit(
+                                    sidecar.clone(),
+                                    recording,
+                                    raw_capture_dir,
+                                    session_id,
+                                    backend_label,
+                                );
                             }
-                            if let Err(error) = sidecar.finish_session(&session.session_id) {
-                                tracing::warn!(error = %error, "Qwen fast commit sidecar cleanup failed");
-                            }
-                            tracing::info!(
-                                cleanup_elapsed_ms = cleanup_started_at.elapsed().as_millis(),
-                                "Qwen fast HUD commit cleanup finished after paste"
-                            );
                             let drained_commands = drain_pending_voice_commands(&worker_rx);
                             if drained_commands > 0 {
                                 tracing::warn!(
                                     drained_commands,
-                                    "dropped queued voice hotkey commands after Qwen fast commit"
+                                    "dropped queued voice hotkey commands after sidecar fast commit"
                                 );
                             }
                             continue;
@@ -2013,7 +2088,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                 sidecar_model_ready = false;
                                 let _ = proxy.send_event(AppEvent::Worker(
                                     WorkerEvent::ModelLoadFailed {
-                                        kind: WorkerKind::Streaming,
+                                        kind: mode.kind,
                                         message: format!(
                                             "failed to finalize Qwen streaming recording: {error}"
                                         ),
@@ -2040,7 +2115,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                 sidecar_model_ready = false;
                                 let _ = proxy.send_event(AppEvent::Worker(
                                     WorkerEvent::ModelLoadFailed {
-                                        kind: WorkerKind::Streaming,
+                                        kind: mode.kind,
                                         message: format!(
                                             "failed to drain Qwen streaming tail: {error}"
                                         ),
@@ -2117,7 +2192,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                                 sidecar_model_ready = false;
                                 let _ = proxy.send_event(AppEvent::Worker(
                                     WorkerEvent::ModelLoadFailed {
-                                        kind: WorkerKind::Streaming,
+                                        kind: mode.kind,
                                         message: format!(
                                             "failed to finish Qwen streaming recognition: {error}"
                                         ),
@@ -2390,9 +2465,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                 match result {
                     Ok(()) => {
                         sidecar_model_ready = true;
-                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(
-                            WorkerKind::Streaming,
-                        )));
+                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(mode.kind)));
                         if start_session_after_ready && pending_session_start.is_none() {
                             tracing::info!(
                                 sidecar_url = %runtime.config.voice.streaming.sidecar_url,
@@ -2413,7 +2486,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                             "failed to preload async Qwen sidecar model"
                         );
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
-                            kind: WorkerKind::Streaming,
+                            kind: mode.kind,
                             message,
                         }));
                     }
@@ -2438,9 +2511,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                 match result {
                     Ok((sidecar_session, sidecar_restarted)) => {
                         sidecar_model_ready = true;
-                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(
-                            WorkerKind::Streaming,
-                        )));
+                        let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::Ready(mode.kind)));
                         if !hold_active {
                             tracing::info!(
                                 session_id = %sidecar_session.session_id,
@@ -2502,7 +2573,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                         sidecar_model_ready = false;
                         tracing::error!(error = %message, "failed to bootstrap async Qwen sidecar session");
                         let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
-                            kind: WorkerKind::Streaming,
+                            kind: mode.kind,
                             message: format!("failed to create Qwen streaming session: {message}"),
                         }));
                     }
@@ -2544,7 +2615,7 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                     tracing::error!(error = %error, "Qwen sidecar live preview failed");
                     sidecar_model_ready = false;
                     let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
-                        kind: WorkerKind::Streaming,
+                        kind: mode.kind,
                         message: format!("Qwen streaming recognition failed: {error}"),
                     }));
                     drop_active_session = true;
@@ -2573,6 +2644,40 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
             }
         }
     }
+}
+
+fn cleanup_sidecar_fast_commit(
+    sidecar: QwenSidecarClient,
+    recording: ainput_audio::ActiveRecording,
+    raw_capture_dir: PathBuf,
+    session_id: String,
+    backend_label: &'static str,
+) {
+    let cleanup_started_at = Instant::now();
+    match recording.stop() {
+        Ok(recorded) => {
+            save_streaming_raw_capture_async(raw_capture_dir, recorded);
+        }
+        Err(error) => {
+            tracing::warn!(
+                backend = backend_label,
+                error = %error,
+                "sidecar fast commit recording cleanup failed"
+            );
+        }
+    }
+    if let Err(error) = sidecar.finish_session(&session_id) {
+        tracing::warn!(
+            backend = backend_label,
+            error = %error,
+            "sidecar fast commit session cleanup failed"
+        );
+    }
+    tracing::info!(
+        backend = backend_label,
+        cleanup_elapsed_ms = cleanup_started_at.elapsed().as_millis(),
+        "sidecar fast HUD commit cleanup finished after paste"
+    );
 }
 
 fn collect_qwen_audio_chunk(

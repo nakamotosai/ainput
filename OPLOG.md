@@ -1,5 +1,21 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.76：独立在线流式模式
+
+- 目标：把在线 NVIDIA Parakeet ASR 从本地 `streaming` 模式拆出来，成为第三个独立模式。
+- 修复：新增 `online_streaming` 模式、`[voice.online_streaming]` 配置和托盘一级菜单项。
+- 修复：本地 `streaming` 默认恢复到 Qwen sidecar，不再指向远端 Parakeet adapter。
+- 修复：在线 worker 独立上报 `WorkerKind::OnlineStreaming`，不污染本地 Qwen lifecycle。
+- 修复：在线松手时 HUD 有文本就直接粘贴 HUD snapshot；远端 `/finish`、session cleanup 和 raw capture 保存后台执行。
+
+验证：
+
+- `cargo fmt --all -- --check` 已通过。
+- `cargo check -p ainput-desktop` 已通过。
+- Windows `/health` 可访问 `http://vps-jp.tail4b5213.ts.net:18765/health`，adapter 仍为 `nvidia/parakeet-ctc-0_6b-zh-cn` 且 `streaming_partials=true`。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.76` 已通过，产出 `dist\ainput-1.0.0-preview.76\` 与 `dist\ainput-1.0.0-preview.76.zip`。
+- Windows 交互桌面已运行 `dist\ainput-1.0.0-preview.76\ainput-desktop.exe`，`SessionId=1`。
+
 ## 2026-05-11 打包 1.0.0-preview.75：在线 Parakeet HUD 实时 partial
 
 - 根因：`preview.74` 的 `/chunk` endpoint 每次只缓存音频并返回空文本，所有识别都在 `/finish` 才发生；因此 HUD 按住期间为空，松手后才一次性弹出。
