@@ -1,5 +1,19 @@
 # ainput OPLOG
 
+## 2026-05-11 hot rollback：preview.77 多语言 RNNT 中文失败，live 回滚 preview.76
+
+- 现象：`nvidia/parakeet-1_1b-rnnt-multilingual-asr` 配合 `language=multi` 在中文实时输入时会不断把 HUD partial 猜成多种语言，最终中文结果严重错误。
+- 判断：该模型的自动语言识别不适合作为 AInput 默认实时 ASR，尤其不能替代中文专用 `nvidia/parakeet-ctc-0_6b-zh-cn`。
+- 止血：vps-jp `ainput-parakeet-asr.service` 已回滚到 `nvidia/parakeet-ctc-0_6b-zh-cn`、function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`、`language=zh-CN`。
+- 止血：Windows 当前进程、`run-ainput.bat`、HKCU Run 均回滚到 `dist\ainput-1.0.0-preview.76\ainput-desktop.exe`。
+- 后续：新版本应把中文在线 CTC 设为默认；多语言 RNNT 只能作为日文/英文实验模式或显式语言模式，不再做默认 auto 模式。
+
+验证：
+
+- Windows live process: `C:\Users\sai\ainput\dist\ainput-1.0.0-preview.76\ainput-desktop.exe`，`SessionId=1`。
+- Windows `/health`: `model=nvidia/parakeet-ctc-0_6b-zh-cn`、`language=zh-CN`、`streaming_partials=true`。
+- preview76 启动日志确认 `voice_mode=OnlineStreaming`、`model=nvidia/parakeet-ctc-0_6b-zh-cn`、`local model preload skipped`。
+
 ## 2026-05-11 打包 1.0.0-preview.77：在线 Parakeet 多语言 RNNT
 
 - 目标：把第三个独立在线流式模式从中文专用 `nvidia/parakeet-ctc-0_6b-zh-cn` 替换为多语言 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`，优先覆盖用户的日文、中文、英文使用场景。

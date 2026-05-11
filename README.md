@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.77`
+当前稳定运行版本：`1.0.0-preview.76`（`1.0.0-preview.77` 多语言 RNNT 因中文实时识别严重漂移，已从 live 默认回滚）
 
 本 README 是本项目唯一当前进度标准。
 
@@ -14,6 +14,7 @@
 - `本地流式识别` 恢复为本机 Qwen/Sherpa 配置面，`qwen3_sidecar` 不再被在线 Parakeet backend 覆盖。
 - `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
 - `1.0.0-preview.77` 把在线 Parakeet 默认模型切到 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`，`language = "multi"`，用于日文 / 中文 / 英文混合输入验证。
+- `1.0.0-preview.77` 验证失败：`multi` 自动语言在中文实时 partial 上会乱跳多语言，中文不可作为默认；live 已回滚到 `1.0.0-preview.76` 中文专用 CTC。
 - `1.0.0-preview.76` 把在线 Parakeet 从本地流式配置里拆出来，托盘一级菜单显示 `极速语音识别 / 本地流式识别 / 在线流式识别` 三个模式。
 - `1.0.0-preview.75` 修正在线 Parakeet adapter：按住 `Ctrl` 时 `/chunk` 会返回实时 partial，HUD 不再等松手后才一次性出字。
 - `1.0.0-preview.74` 临时把默认流式主模型切到在线 `NVIDIA Parakeet CTC 0.6B zh-CN` adapter；启动不再自动加载本机 Qwen GPU 模型。

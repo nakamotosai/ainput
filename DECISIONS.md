@@ -1,5 +1,23 @@
 # ainput DECISIONS
 
+## D-022 多语言 RNNT 不再作为默认在线 ASR
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- `nvidia/parakeet-1_1b-rnnt-multilingual-asr` 的 `multi` 自动语言模式在中文实时 HUD partial 上出现严重语言漂移，无法稳定识别中文。
+- 用户中文输入是核心路径之一；中文不可用时，默认在线 ASR 必须回到中文专用模型。
+
+决策：
+
+- live 默认回滚到 `preview.76` 和 `nvidia/parakeet-ctc-0_6b-zh-cn`。
+- `preview.77` 视为失败实验包，不继续作为默认运行版本。
+- 后续 preview 应把中文、日文/英文拆成显式模式或显式语言配置，禁止再用单一 `multi` auto 模式承载三语默认输入。
+
+---
+
 ## D-021 在线 ASR 默认切到 NVIDIA Parakeet 多语言 RNNT
 
 - 日期：2026-05-11
