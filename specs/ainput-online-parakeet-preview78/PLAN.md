@@ -31,3 +31,9 @@
    - Verify startup logs show Online Streaming and no local Qwen preload.
    - Verify README closeout guard.
    - Commit and push the release.
+
+7. Freeze as baseline.
+   - Record user acceptance that preview.78 is fast and usable.
+   - Update README / OPLOG / DECISIONS / TASKLIST with freeze status.
+   - Tag the Git baseline.
+   - Keep runtime behavior unchanged during freeze closeout.

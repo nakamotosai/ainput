@@ -1,5 +1,32 @@
 # ainput DECISIONS
 
+## D-024 preview.78 冻结为后续修改基准
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户在真实 Windows 输入场景中确认 `preview.78` 效果很好，识别速度非常快，上屏速度也非常快。
+- 本项目已经经过多轮 ASR、HUD、release、rewrite 和模型切换修正，当前需要固定一个确定可用的基线，避免后续修改再次漂移。
+- `preview.77` 多语言 RNNT 已被证实中文实时识别不可用；本地 Qwen 仍保留为回滚能力，但不再是默认启动路径。
+
+决策：
+
+- `1.0.0-preview.78` 冻结为后续开发、排障和性能比较的基准版本。
+- 默认继续使用 `online_streaming`，模型为 `nvidia/parakeet-ctc-0_6b-zh-cn`，语言为 `zh-CN`。
+- 继续保持三模式独立：`极速语音识别 / 本地流式识别 / 在线流式识别`。
+- 继续保持在线 release 快速链路：HUD 有文本时松手即优先粘贴 HUD snapshot，远端 finish / cleanup 后台完成。
+- 后续任何改动如果影响识别速度、HUD 实时性、松手上屏速度、数字改写或默认模型，必须和 `preview.78` 的真实前台体感对比。
+
+放弃：
+
+- 不再把 `/health`、编译通过或包已生成当作 AInput 前台链路完成的充分条件。
+- 不再把多语言 auto 模式作为中文默认 ASR。
+- 不在默认在线链路启用会阻塞 partial 的 speech context 或额外 rewrite 判定。
+
+---
+
 ## D-023 preview.78 在线默认回到中文 CTC，英文增强词只来自用户历史
 
 - 日期：2026-05-11

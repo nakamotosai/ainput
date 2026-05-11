@@ -40,3 +40,11 @@ Ship `1.0.0-preview.78` as the next AInput preview with Online Streaming as the 
 - `run-ainput.bat` and HKCU Run point to preview.78.
 - Startup logs show Online Streaming default and no local Qwen preload.
 - Rewrite tests prove `等会儿1起修` becomes `等会儿一起修`, while pure Chinese digit runs such as `一二三四五六` still convert.
+- User confirms real Windows hotkey usage is good, recognition is fast, and release-to-paste is fast.
+
+## Frozen Baseline
+
+- Status: frozen on 2026-05-11 as the future modification baseline.
+- Baseline version: `1.0.0-preview.78`.
+- Baseline runtime: `C:\Users\sai\ainput\dist\ainput-1.0.0-preview.78\ainput-desktop.exe`.
+- Baseline rule: future changes that touch model choice, HUD realtime updates, release-to-paste, or rewrite behavior must compare against this version's real user-facing behavior, not only automated probes.

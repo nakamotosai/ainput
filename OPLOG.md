@@ -1,5 +1,26 @@
 # ainput OPLOG
 
+## 2026-05-11 冻结 1.0.0-preview.78：后续修改基准版本
+
+- 用户真实使用确认：`preview.78` 效果很好，识别速度非常快，上屏速度也非常快。
+- 冻结结论：`1.0.0-preview.78` 是当前可用基线，后续修改以它为比较对象，不再以 `preview.77` 多语言 RNNT 或本地 Qwen 实验链路为默认标准。
+- 冻结入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.78\ainput-desktop.exe`。
+- 冻结包：`dist\ainput-1.0.0-preview.78\` 与 `dist\ainput-1.0.0-preview.78.zip`。
+- 冻结默认：`online_streaming`，模型 `nvidia/parakeet-ctc-0_6b-zh-cn`，`language=zh-CN`，`partial_wait_sec=0.06`，本地 Qwen 不自动加载。
+- 冻结上屏策略：HUD 是最终真相源；松开热键后优先粘贴 HUD snapshot，远端 finish / cleanup 放后台。
+- 冻结经验：今天的正确收敛顺序是先拆出第三个在线模式，再修实时 partial，再回滚失败多语言 RNNT，再缩短 release 阻塞，再收紧数字改写，最后以用户真实前台体感放行。
+
+收口验证：
+
+- `cargo fmt --all -- --check` 已通过。
+- `cargo check -p ainput-desktop` 已通过；只剩既有 dead-code warning。
+- `cargo test -p ainput-rewrite` 已通过，18/18 passed。
+- `cargo test -p ainput-shell` 已通过，6/6 passed。
+- Windows 包内 sidecar 与 vps-jp live adapter `py_compile` 已通过。
+- Windows 和 vps-jp `/health` 均返回中文 CTC、`partial_wait_sec=0.06`、`key_count=5`。
+- Windows 交互桌面运行路径、`run-ainput.bat`、HKCU Run 均指向 `preview.78`。
+- 用户真实热键输入已确认可用，作为本轮最终验收信号。
+
 ## 2026-05-11 打包 1.0.0-preview.78：中文 CTC 在线默认、release 快速响应、数字误改收紧
 
 - 目标：在保留 `极速 / 本地流式 / 在线流式` 三个独立模式的前提下，把在线默认从失败的多语言 RNNT 拉回中文专用 CTC，并修掉松手上屏慢和中文“一”被乱改成 `1` 的问题。

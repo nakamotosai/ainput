@@ -6,6 +6,17 @@
 
 本 README 是本项目唯一当前进度标准。
 
+## 冻结基线：1.0.0-preview.78
+
+- 冻结时间：2026-05-11。
+- 冻结原因：用户在真实输入场景实测确认“效果很好，识别速度非常快，上屏速度也非常快”，本版本作为后续修改的基准版本。
+- 基准入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.78\ainput-desktop.exe`。
+- 基准包：`dist\ainput-1.0.0-preview.78\` 与 `dist\ainput-1.0.0-preview.78.zip`。
+- 基准默认模式：`在线流式识别`，启动不自动加载本地 Qwen。
+- 基准在线模型：`nvidia/parakeet-ctc-0_6b-zh-cn`，`language=zh-CN`，`partial_wait_sec=0.06`，`boost_enabled=false`。
+- 基准上屏链路：按住 `Ctrl` 时 HUD 实时显示在线 partial；松开后优先粘贴 HUD snapshot，远端 finish / cleanup 后台完成。
+- 基准回滚点：`1.0.0-preview.72` 保留为本地 Qwen 回滚版本；`1.0.0-preview.77` 只保留为多语言 RNNT 中文失败实验证据。
+
 ## 当前预览重点
 
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
@@ -874,12 +885,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 接手提示
 
+- 当前冻结：`1.0.0-preview.78` 已在 2026-05-11 经用户真实使用确认，冻结为后续修改基准版本。
+- 当前基线：识别速度快、HUD 实时、松手上屏快；后续改动不得用未实测方案覆盖这条已确认链路。
 - 当前进度：`1.0.0-preview.78` 是独立在线流式 ASR 默认版，默认模式为 `online_streaming`。
 - 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.78\ainput-desktop.exe`。
 - 当前包：`dist\ainput-1.0.0-preview.78\` 与 `dist\ainput-1.0.0-preview.78.zip`。
 - 当前主链：在线流式模式按下 `Ctrl` 打开 HUD，按住期间通过 `vps-jp` Parakeet CTC zh-CN adapter 持续返回 partial；松手时 HUD 有文本就立刻粘贴 HUD snapshot，远端 finish/cleanup 后台完成。
 - 回滚点：`dist\ainput-1.0.0-preview.72\` 保留为本机 Qwen 版本，冻结参数仍是 `gpu_memory_utilization = 0.30` 与 `sidecar_idle_unload_ms = 3600000`。
 - 安全边界：NVIDIA key 只从 `vps-jp` 8317 生产配置读取，不写入 Windows 包；本轮不修改 `cliproxyapi` 8317 生产服务本体。
+- 收口经验：AInput 前台链路只以真实 Windows hotkey/HUD/上屏体感放行为最终验收；`/health`、compile、package 和日志只能作为辅助证据。
+
 ## 当前边界
 
 - 当前流式默认走 `vps-jp` 临时在线 NVIDIA Parakeet adapter；极速语音识别仍保留 SenseVoice 离线整段识别

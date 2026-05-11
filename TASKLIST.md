@@ -5,6 +5,15 @@
 
 ---
 
+## Round 42：preview.78 冻结收口
+
+- [x] 用户真实使用确认 preview.78 效果好、识别快、上屏快
+- [x] README 增加 `1.0.0-preview.78` 冻结基线
+- [x] OPLOG 增加冻结收口记录和经验总结
+- [x] DECISIONS 增加 `D-024 preview.78 冻结为后续修改基准`
+- [x] TASKLIST 标记冻结收口完成
+- [x] 保持运行时链路不变，不修改模型、release、rewrite 或 Qwen 配置
+
 ## Round 41：preview.78 在线 Parakeet 中文 CTC 快速释放
 
 - [x] vps-jp Codex 用户指令历史扫描完成，英文 boost 词只取用户高频英文词
