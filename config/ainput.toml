@@ -230,7 +230,7 @@ sidecar_url = "http://vps-jp.tail4b5213.ts.net:18765"
 chunk_ms = 100
 release_grace_ms = 180
 finish_in_background = true
-language = "multi"
+language = "zh-CN"
 automatic_punctuation = true
 panel_enabled = true
 

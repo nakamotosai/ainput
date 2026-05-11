@@ -1,5 +1,34 @@
 # ainput DECISIONS
 
+## D-025 preview.80 在 zh-CN CTC 上做保守 code-switch 修复
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户已经确认 `preview.78` 中文识别速度和上屏速度都满意，后续修复不能为了英文岛而破坏中文主路径。
+- `preview.77` 的多语言 RNNT / `multi` 已经证明中文不可用；本轮不能再通过切模型或切部署解决。
+- 官方模型和 live Riva config 都指向当前可用调用方式是 `nvidia/parakeet-ctc-0_6b-zh-cn`、function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`、`language_code=zh-CN`。
+- 当前混说失败集中在短英文岛被吞掉或误听，例如 `multi`、`Codex` 和常见英文产品词；这类问题更适合低强度 speech context + 精确后处理，而不是广泛中文语义改写。
+
+决策：
+
+- `preview.80` 保持在线 ASR 模型、function id、`language=zh-CN` 和 vps-jp sidecar 部署不变。
+- sidecar 默认启用低强度 speech context，`boost=4.0`，默认词表只放 Riva 可编码短语，并通过 `/health` 暴露实际文件、启用状态、boost 值和样例。
+- 应用侧只加入精确 code-switch 修复：已观察到的 `multi` 丢失、`猫底/某体` 误听、`扣代斯` 等 Codex 误听，以及常见英文产品词大小写规范化。
+- 所有 mixed-language 修复必须带中文负例测试；普通中文不能因为包含相似字而被改写。
+- `1.0.0-preview.78` 继续作为中文体感冻结基线；用户实测 `.80` 不满意时优先回滚 `.78`，不再尝试 `multi`。
+
+放弃：
+
+- 不切到 `nvidia/parakeet-1_1b-rnnt-multilingual-asr` 或 `language=multi`。
+- 不换部署、不自建 NIM/Riva、不调整 `cliproxyapi` 8317 生产服务本体。
+- 不使用高 boost，例如 `18.0`。
+- 不做广泛中文语义纠错；只处理已经观测或高置信的英文岛场景。
+
+---
+
 ## D-024 preview.78 冻结为后续修改基准
 
 - 日期：2026-05-11

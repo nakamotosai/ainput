@@ -1,3 +1,4 @@
+import json
 import os
 import queue
 import re
@@ -27,41 +28,40 @@ CONFIG_PATH = Path(
 TIMEOUT_SEC = float(os.environ.get("PARAKEET_TIMEOUT_SEC", "30"))
 MAX_AUDIO_SEC = float(os.environ.get("PARAKEET_MAX_AUDIO_SEC", "90"))
 PARTIAL_WAIT_SEC = float(os.environ.get("PARAKEET_PARTIAL_WAIT_SEC", "0.06"))
-BOOST = float(os.environ.get("PARAKEET_SPEECH_CONTEXT_BOOST", "18.0"))
-BOOST_ENABLED = os.environ.get("PARAKEET_ENABLE_SPEECH_CONTEXTS", "0").strip().lower() in {
+BOOST = float(os.environ.get("PARAKEET_SPEECH_CONTEXT_BOOST", "4.0"))
+BOOST_ENABLED = os.environ.get("PARAKEET_ENABLE_SPEECH_CONTEXTS", "1").strip().lower() in {
     "1", "true", "yes", "on"
 }
+BOOST_PHRASES_FILE = Path(
+    os.environ.get(
+        "PARAKEET_BOOST_PHRASES_FILE",
+        str(Path(__file__).with_name("parakeet_code_switch_terms.json")),
+    )
+)
 DEFAULT_BOOST_PHRASES = [
-    # Derived from high-frequency user prompts in vps-jp ~/.codex/sessions.
-    "OpenClaw",
+    # Keep this list Riva-encodable. Bad phrases fail the whole request.
     "Codex",
+    "codex",
+    "multi",
     "Telegram",
-    "saaaai",
-    "npm",
-    "cnjpv2",
-    "GitHub",
     "API",
-    "CLI",
-    "TOML",
-    "JSON",
-    "cliproxyapi",
-    "vps-jp",
+    "api",
     "Windows",
-    "Cloudflare",
-    "GPT",
     "Gemini",
     "Hermes",
-    "OpenAI",
-    "Qwen",
-    "HIMEKA",
-    "ChatGPT",
-    "NVIDIA",
     "Claude",
-    "Notion",
-    "Todoist",
-    "vps-us",
-    "Tailscale",
-    "home-windows",
+    "Riva",
+    "NIM",
+    "cli",
+    "github",
+    "git hub",
+    "open ai",
+    "g p t",
+    "j s o n",
+    "t o m l",
+    "cloud flare",
+    "tail scale",
+    "parakeet",
 ]
 
 
@@ -156,9 +156,31 @@ def next_key() -> tuple[int, str]:
     return index, keys[index]
 
 
+def file_boost_phrases() -> list[str]:
+    if not BOOST_PHRASES_FILE.exists():
+        return []
+    try:
+        data = json.loads(BOOST_PHRASES_FILE.read_text(encoding="utf-8"))
+    except Exception as error:
+        print(
+            f"[parakeet-sidecar] failed to read boost phrases file={BOOST_PHRASES_FILE}: {error}",
+            flush=True,
+        )
+        return []
+    if isinstance(data, list):
+        values = data
+    elif isinstance(data, dict):
+        values = data.get("boost_phrases", [])
+    else:
+        values = []
+    phrases = [value.strip() for value in values if isinstance(value, str) and value.strip()]
+    return phrases
+
+
 def boost_phrases() -> list[str]:
     env_value = os.environ.get("PARAKEET_BOOST_PHRASES", "")
     phrases = DEFAULT_BOOST_PHRASES.copy()
+    phrases.extend(file_boost_phrases())
     if env_value.strip():
         phrases.extend(
             value.strip()
@@ -170,8 +192,6 @@ def boost_phrases() -> list[str]:
 
 def apply_speech_contexts(config) -> None:
     phrases = boost_phrases()
-    # The public zh-CN CTC streaming endpoint currently stalls when speech_contexts
-    # are attached, so phrase boosts stay opt-in until NVIDIA behavior is stable.
     if not BOOST_ENABLED:
         return
     if not phrases:
@@ -382,6 +402,9 @@ def health() -> dict:
         "boost_phrases": len(boost_phrases()),
         "boost_enabled": BOOST_ENABLED,
         "boost": BOOST,
+        "boost_phrases_file": str(BOOST_PHRASES_FILE),
+        "boost_phrases_file_exists": BOOST_PHRASES_FILE.exists(),
+        "boost_phrase_sample": boost_phrases()[:12],
     }
 
 

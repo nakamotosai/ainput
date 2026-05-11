@@ -350,7 +350,7 @@ impl Default for OnlineStreamingVoiceConfig {
             chunk_ms: 100,
             release_grace_ms: 180,
             finish_in_background: true,
-            language: "multi".to_string(),
+            language: "zh-CN".to_string(),
             automatic_punctuation: true,
             panel_enabled: true,
         }

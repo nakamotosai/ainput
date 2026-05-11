@@ -275,6 +275,7 @@ struct SidecarStreamingWorkerMode {
     kind: WorkerKind,
     fast_hud_snapshot_without_qwen_guards: bool,
     finish_in_background: bool,
+    repair_parakeet_code_switch: bool,
 }
 
 impl SidecarStreamingWorkerMode {
@@ -283,6 +284,7 @@ impl SidecarStreamingWorkerMode {
             kind: WorkerKind::Streaming,
             fast_hud_snapshot_without_qwen_guards: false,
             finish_in_background: false,
+            repair_parakeet_code_switch: false,
         }
     }
 
@@ -291,6 +293,7 @@ impl SidecarStreamingWorkerMode {
             kind: WorkerKind::OnlineStreaming,
             fast_hud_snapshot_without_qwen_guards: true,
             finish_in_background,
+            repair_parakeet_code_switch: true,
         }
     }
 }
@@ -2108,6 +2111,7 @@ fn sidecar_streaming_push_to_talk_worker(
                             chunk_samples,
                             false,
                             None,
+                            mode,
                             None,
                             Some(&proxy),
                         ) {
@@ -2204,10 +2208,11 @@ fn sidecar_streaming_push_to_talk_worker(
                             }
                         };
                         let final_decode_elapsed_ms = finish_started_at.elapsed().as_millis();
-                        if let Some(update) = apply_qwen_sidecar_partial_update(
+                        if let Some(update) = apply_qwen_sidecar_partial_update_with_mode(
                             &mut session,
                             &finish.text,
                             "qwen_final",
+                            mode,
                         ) {
                             let _ =
                                 proxy.send_event(AppEvent::Worker(WorkerEvent::StreamingPartial {
@@ -2217,9 +2222,8 @@ fn sidecar_streaming_push_to_talk_worker(
                         }
                         let had_partial_truth_after_finish =
                             qwen_session_has_partial_truth(&session);
-                        let qwen_final_prepared = apply_streaming_punctuation_cleanup(
-                            &ainput_rewrite::normalize_streaming_preview(&finish.text),
-                        );
+                        let qwen_final_prepared =
+                            prepare_qwen_sidecar_display_text(&finish.text, mode);
                         let final_is_context_echo =
                             is_qwen_context_echo_text(&session, &finish.text)
                                 || is_qwen_context_echo_text(&session, &qwen_final_prepared);
@@ -2603,6 +2607,7 @@ fn sidecar_streaming_push_to_talk_worker(
                 } else {
                     None
                 },
+                mode,
                 Some(&runtime),
                 Some(&proxy),
             ) {
@@ -2853,6 +2858,7 @@ fn feed_qwen_pending_chunks(
     chunk_num_samples: usize,
     full_chunks_only: bool,
     max_chunks: Option<usize>,
+    mode: SidecarStreamingWorkerMode,
     runtime: Option<&AppRuntime>,
     proxy: Option<&EventLoopProxy<AppEvent>>,
 ) -> Result<usize> {
@@ -2870,7 +2876,7 @@ fn feed_qwen_pending_chunks(
         consumed += chunk.len();
         sent_chunks += 1;
         session.total_chunks_fed += 1;
-        emit_qwen_response_if_changed(session, response, runtime, proxy)?;
+        emit_qwen_response_if_changed(session, response, mode, runtime, proxy)?;
     }
     if !full_chunks_only
         && !session.pending_feed_samples.is_empty()
@@ -2880,7 +2886,7 @@ fn feed_qwen_pending_chunks(
         let response = sidecar.send_chunk(&session.session_id, &chunk)?;
         consumed += chunk.len();
         session.total_chunks_fed += 1;
-        emit_qwen_response_if_changed(session, response, runtime, proxy)?;
+        emit_qwen_response_if_changed(session, response, mode, runtime, proxy)?;
     }
     Ok(consumed)
 }
@@ -2888,13 +2894,15 @@ fn feed_qwen_pending_chunks(
 fn emit_qwen_response_if_changed(
     session: &mut QwenSidecarSession,
     response: QwenChunkResponse,
+    mode: SidecarStreamingWorkerMode,
     runtime: Option<&AppRuntime>,
     proxy: Option<&EventLoopProxy<AppEvent>>,
 ) -> Result<()> {
     if response.text.trim().is_empty() {
         return Ok(());
     }
-    if let Some(update) = apply_qwen_sidecar_partial_update(session, &response.text, "qwen_partial")
+    if let Some(update) =
+        apply_qwen_sidecar_partial_update_with_mode(session, &response.text, "qwen_partial", mode)
     {
         let mut display_text = update.display_text;
         if let Some(runtime) = runtime {
@@ -2927,12 +2935,25 @@ fn apply_qwen_sidecar_partial_update(
     raw_text: &str,
     source: &'static str,
 ) -> Option<PreparedStreamingPartial> {
+    apply_qwen_sidecar_partial_update_with_mode(
+        session,
+        raw_text,
+        source,
+        SidecarStreamingWorkerMode::local_qwen(),
+    )
+}
+
+fn apply_qwen_sidecar_partial_update_with_mode(
+    session: &mut QwenSidecarSession,
+    raw_text: &str,
+    source: &'static str,
+    mode: SidecarStreamingWorkerMode,
+) -> Option<PreparedStreamingPartial> {
     if session.commit_locked {
         session.post_hud_flush_mutation_count += 1;
         return None;
     }
-    let normalized = ainput_rewrite::normalize_streaming_preview(raw_text);
-    let prepared = apply_streaming_punctuation_cleanup(&normalized);
+    let prepared = prepare_qwen_sidecar_display_text(raw_text, mode);
     let prepared = prepared.trim();
     if is_qwen_context_echo_text(session, raw_text) || is_qwen_context_echo_text(session, prepared)
     {
@@ -2977,6 +2998,18 @@ fn apply_qwen_sidecar_partial_update(
         revision,
         rejected_prefix_rewrite: false,
     })
+}
+
+fn prepare_qwen_sidecar_display_text(raw_text: &str, mode: SidecarStreamingWorkerMode) -> String {
+    let normalized = ainput_rewrite::normalize_streaming_preview(raw_text);
+    let repaired = if mode.repair_parakeet_code_switch {
+        ainput_rewrite::repair_parakeet_code_switch_terms(&normalized)
+    } else {
+        normalized
+    };
+    apply_streaming_punctuation_cleanup(&repaired)
+        .trim()
+        .to_string()
 }
 
 fn drain_pending_voice_commands(worker_rx: &mpsc::Receiver<WorkerCommand>) -> usize {
@@ -7280,9 +7313,10 @@ mod tests {
     use super::{
         AudioActivity, QwenSidecarSession, QwenStartResponse,
         STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS, STREAMING_OFFLINE_FINAL_HARD_MS,
-        STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT, StreamingCommitSource,
-        StreamingOfflineFinalScope, StreamingResampler, analyze_recent_audio_activity,
-        append_with_suffix_prefix_overlap, apply_qwen_sidecar_partial_update,
+        STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT,
+        SidecarStreamingWorkerMode, StreamingCommitSource, StreamingOfflineFinalScope,
+        StreamingResampler, analyze_recent_audio_activity, append_with_suffix_prefix_overlap,
+        apply_qwen_sidecar_partial_update, apply_qwen_sidecar_partial_update_with_mode,
         apply_streaming_punctuation_cleanup, build_streaming_ai_rewrite_candidate,
         current_ai_rewrite_tail, dedupe_streaming_punctuation,
         effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
@@ -7346,6 +7380,54 @@ mod tests {
             "exact duplicate qwen partial should still be skipped"
         );
         assert_eq!(session.partial_updates, 2);
+    }
+
+    #[test]
+    fn online_parakeet_partial_repairs_known_dropped_multi_islands() {
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-online-parakeet".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        );
+        let mode = SidecarStreamingWorkerMode::online(true);
+
+        let first = apply_qwen_sidecar_partial_update_with_mode(
+            &mut session,
+            "因为我之前禁用。",
+            "qwen_partial",
+            mode,
+        )
+        .expect("online Parakeet partial should be accepted");
+        assert_eq!(first.display_text, "因为我之前禁用 multi。");
+
+        let second = apply_qwen_sidecar_partial_update_with_mode(
+            &mut session,
+            "根本就不支持中文。",
+            "qwen_partial",
+            mode,
+        )
+        .expect("online Parakeet partial should be accepted");
+        assert_eq!(second.display_text, "multi 模型根本就不支持中文。");
+    }
+
+    #[test]
+    fn local_qwen_partial_does_not_infer_dropped_multi_islands() {
+        let mut session = QwenSidecarSession::new(
+            16_000,
+            QwenStartResponse {
+                session_id: "test-local-qwen".to_string(),
+                sample_rate_hz: 16_000,
+            },
+            0,
+        );
+
+        let update =
+            apply_qwen_sidecar_partial_update(&mut session, "根本就不支持中文。", "qwen_partial")
+                .expect("local Qwen partial should be accepted");
+        assert_eq!(update.display_text, "根本就不支持中文。");
     }
 
     #[test]

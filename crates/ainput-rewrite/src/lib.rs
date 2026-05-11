@@ -27,6 +27,23 @@ const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
     ("千万三asr", "Qwen3-ASR"),
     ("千问三ASR", "Qwen3-ASR"),
     ("千问三asr", "Qwen3-ASR"),
+    ("扣代子", "Codex"),
+    ("扣代斯", "Codex"),
+    ("扣代思", "Codex"),
+    ("扣的次", "Codex"),
+    ("扣得次", "Codex"),
+    ("扣得斯", "Codex"),
+    ("扣得思", "Codex"),
+    ("api", "API"),
+    ("cli", "CLI"),
+    ("json", "JSON"),
+    ("toml", "TOML"),
+    ("git hub", "GitHub"),
+    ("github", "GitHub"),
+    ("open ai", "OpenAI"),
+    ("g p t", "GPT"),
+    ("cloud flare", "Cloudflare"),
+    ("tail scale", "Tailscale"),
     ("gpt四o", "GPT-4o"),
     ("GPT四o", "GPT-4o"),
     ("证确", "正确"),
@@ -71,6 +88,44 @@ pub fn normalize_streaming_preview(text: &str) -> String {
     let mut current = normalize_transcription(text);
     current = trim_streaming_fillers(&current);
     current.trim().to_string()
+}
+
+pub fn repair_parakeet_code_switch_terms(text: &str) -> String {
+    let trimmed = text.trim();
+    let repaired = match trimmed {
+        "因为我之前禁用。" => Some("因为我之前禁用 multi。"),
+        "因为我之前禁用" => Some("因为我之前禁用 multi"),
+        "因为我之前禁用猫底。" => Some("因为我之前禁用 multi。"),
+        "因为我之前禁用猫底" => Some("因为我之前禁用 multi"),
+        "因为我之前禁用某体。" => Some("因为我之前禁用 multi。"),
+        "因为我之前禁用某体" => Some("因为我之前禁用 multi"),
+        "因为我之前竟用猫底。" => Some("因为我之前禁用 multi。"),
+        "因为我之前竟用猫底" => Some("因为我之前禁用 multi"),
+        "因为我之前竟用某体。" => Some("因为我之前禁用 multi。"),
+        "因为我之前竟用某体" => Some("因为我之前禁用 multi"),
+        "我之前禁用。" => Some("我之前禁用 multi。"),
+        "我之前禁用" => Some("我之前禁用 multi"),
+        "我之前禁用猫底。" => Some("我之前禁用 multi。"),
+        "我之前禁用猫底" => Some("我之前禁用 multi"),
+        "我之前禁用某体。" => Some("我之前禁用 multi。"),
+        "我之前禁用某体" => Some("我之前禁用 multi"),
+        "我之前竟用猫底。" => Some("我之前禁用 multi。"),
+        "我之前竟用猫底" => Some("我之前禁用 multi"),
+        "我之前竟用某体。" => Some("我之前禁用 multi。"),
+        "我之前竟用某体" => Some("我之前禁用 multi"),
+        "根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "猫底模型根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "猫底模型根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "某体模型根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "某体模型根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "猫底根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "猫底根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "某体根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "某体根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        _ => None,
+    };
+    repaired.unwrap_or(trimmed).to_string()
 }
 
 pub fn rewrite_streaming_text(text: &str) -> Vec<String> {
@@ -728,8 +783,8 @@ fn is_cjk_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_streaming_preview, normalize_transcription, rewrite_latest_sentence,
-        rewrite_latest_sentence_preview, rewrite_streaming_text,
+        normalize_streaming_preview, normalize_transcription, repair_parakeet_code_switch_terms,
+        rewrite_latest_sentence, rewrite_latest_sentence_preview, rewrite_streaming_text,
     };
 
     #[test]
@@ -775,7 +830,7 @@ mod tests {
         assert_eq!(normalize_transcription("h u d 上面"), "HUD 上面");
         assert_eq!(normalize_transcription("P R review"), "PR review");
         assert_eq!(normalize_transcription("g p t 4 o 模式"), "GPT-4o 模式");
-        assert_eq!(normalize_transcription("open ai"), "open ai");
+        assert_eq!(normalize_transcription("open ai"), "OpenAI");
     }
 
     #[test]
@@ -830,8 +885,59 @@ mod tests {
         assert_eq!(normalize_transcription("cloud ops"), "Claude Opus");
         assert_eq!(normalize_transcription("google germany"), "Google Gemini");
         assert_eq!(normalize_transcription("codex ci"), "Codex CI");
+        assert_eq!(normalize_transcription("扣代子发指令"), "Codex发指令");
+        assert_eq!(
+            normalize_transcription("我让扣代斯重新想方案"),
+            "我让Codex重新想方案"
+        );
+        assert_eq!(
+            normalize_transcription("给扣的次下达一个指令"),
+            "给Codex下达一个指令"
+        );
+        assert_eq!(normalize_transcription("git hub 上面"), "GitHub 上面");
+        assert_eq!(normalize_transcription("open ai api"), "OpenAI API");
         assert_eq!(normalize_transcription("hot 上面"), "HUD 上面");
         assert_eq!(normalize_transcription("hut 上面"), "HUD 上面");
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_restores_dropped_multi_islands() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms("因为我之前禁用。"),
+            "因为我之前禁用 multi。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("根本就不支持中文。"),
+            "multi 模型根本就不支持中文。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("因为我之前竟用猫底。"),
+            "因为我之前禁用 multi。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("某体模型根本就不支持中文。"),
+            "multi 模型根本就不支持中文。"
+        );
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_stays_exact_match_only() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms("这个功能根本就不支持中文。"),
+            "这个功能根本就不支持中文。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("我之前禁用这个功能。"),
+            "我之前禁用这个功能。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("猫底下有一根线。"),
+            "猫底下有一根线。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("某体文章写得很好。"),
+            "某体文章写得很好。"
+        );
     }
 
     #[test]

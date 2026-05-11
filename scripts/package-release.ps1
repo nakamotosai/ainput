@@ -635,10 +635,13 @@ Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $packageDir "README.md") 
 Copy-Item (Join-Path $repoRoot "assets\app-icon.ico") (Join-Path $packageDir "assets\app-icon.ico") -Force
 Copy-Item (Join-Path $repoRoot "assets\app-icon-256.png") (Join-Path $packageDir "assets\app-icon-256.png") -Force
 Copy-Item (Join-Path $repoRoot "data\terms\base_terms.json") (Join-Path $packageDir "data\terms\base_terms.json") -Force
+Copy-Item (Join-Path $repoRoot "data\terms\parakeet_code_switch_terms.json") (Join-Path $packageDir "data\terms\parakeet_code_switch_terms.json") -Force
 Copy-Item (Join-Path $repoRoot "scripts\run-streaming-live-e2e.ps1") (Join-Path $packageDir "scripts\run-streaming-live-e2e.ps1") -Force
 Copy-Item (Join-Path $repoRoot "scripts\run-streaming-raw-corpus.ps1") (Join-Path $packageDir "scripts\run-streaming-raw-corpus.ps1") -Force
 Copy-Item (Join-Path $repoRoot "scripts\run-startup-idle-acceptance.ps1") (Join-Path $packageDir "scripts\run-startup-idle-acceptance.ps1") -Force
+Copy-Item (Join-Path $repoRoot "scripts\run-online-code-switch-replay.ps1") (Join-Path $packageDir "scripts\run-online-code-switch-replay.ps1") -Force
 Copy-Item (Join-Path $repoRoot "sidecars\nvidia_parakeet_online_sidecar.py") (Join-Path $packageDir "sidecars\nvidia_parakeet_online_sidecar.py") -Force
+Copy-Item (Join-Path $repoRoot "sidecars\parakeet_code_switch_terms.json") (Join-Path $packageDir "sidecars\parakeet_code_switch_terms.json") -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-hud-e2e\manifest.json") (Join-Path $packageDir "fixtures\streaming-hud-e2e\manifest.json") -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-selftest\*") (Join-Path $packageDir "fixtures\streaming-selftest") -Recurse -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-user-regression-v12\*") (Join-Path $packageDir "fixtures\streaming-user-regression-v12") -Recurse -Force
@@ -675,10 +678,13 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     ("- models\\punctuation\\" + $streamingPunctuationModelName + "\\: streaming punctuation model"),
     "- assets\app-icon.ico: tray icon resource",
     "- data\terms\base_terms.json: built-in AI terms",
+    "- data\terms\parakeet_code_switch_terms.json: low-boost online ASR code-switch terms",
     "- scripts\run-streaming-live-e2e.ps1: streaming HUD/readback acceptance script",
     "- scripts\run-streaming-raw-corpus.ps1: raw capture replay acceptance script",
     "- scripts\run-startup-idle-acceptance.ps1: startup idle no-auto-recording acceptance script",
+    "- scripts\run-online-code-switch-replay.ps1: online Parakeet code-switch replay acceptance script",
     "- sidecars\nvidia_parakeet_online_sidecar.py: temporary online ASR adapter source",
+    "- sidecars\parakeet_code_switch_terms.json: sidecar low-boost phrase list",
     "- fixtures\streaming-hud-e2e\: synthetic HUD/readback acceptance fixtures",
     "- fixtures\streaming-selftest\: fixed wav streaming acceptance fixtures",
     "- logs\: runtime logs",
@@ -687,7 +693,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
-    "- Voice modes are separate: Fast, Local Streaming, and Online Streaming; preview.78 defaults to Online Streaming with NVIDIA Parakeet CTC zh-CN and does not load local Qwen unless you switch modes",
+    "- Voice modes are separate: Fast, Local Streaming, and Online Streaming; preview.80 defaults to Online Streaming with NVIDIA Parakeet CTC zh-CN and does not load local Qwen unless you switch modes",
     "- You can open config\hud-overlay.toml directly from the tray menu to adjust font size, color, width, and position",
     "- Saving config\hud-overlay.toml hot-reloads the HUD immediately",
     "- New preview packages reuse the latest dist HUD config when available so HUD settings are kept",

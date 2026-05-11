@@ -84,6 +84,7 @@ fn is_cli_invocation() -> bool {
                 | "transcribe-streaming-wav"
                 | "record-once"
                 | "test-ai-rewrite"
+                | "repair-online-transcript"
                 | "probe-streaming-live"
                 | "replay-streaming-wav"
                 | "replay-streaming-manifest"
@@ -177,6 +178,53 @@ fn try_main() -> Result<()> {
         })?;
         if let Some(response) = response {
             println!("{}", response.rewritten_tail);
+        }
+        return Ok(());
+    }
+
+    if args.get(1).map(String::as_str) == Some("repair-online-transcript") {
+        let usage =
+            "usage: ainput-desktop repair-online-transcript [--in <path>] [--out <path>] [text]";
+        let mut input_path: Option<&str> = None;
+        let mut out_path: Option<&str> = None;
+        let mut raw_arg: Option<&str> = None;
+        let mut index = 2;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--in" => {
+                    index += 1;
+                    input_path = Some(args.get(index).ok_or_else(|| anyhow!(usage))?);
+                }
+                "--out" => {
+                    index += 1;
+                    out_path = Some(args.get(index).ok_or_else(|| anyhow!(usage))?);
+                }
+                value => {
+                    if raw_arg.replace(value).is_some() {
+                        return Err(anyhow!(usage));
+                    }
+                }
+            }
+            index += 1;
+        }
+        if input_path.is_some() && raw_arg.is_some() {
+            return Err(anyhow!(usage));
+        }
+        let raw_text = if let Some(input_path) = input_path {
+            fs::read_to_string(input_path)
+                .with_context(|| format!("read repair input from {input_path}"))?
+                .trim_end_matches(&['\r', '\n'][..])
+                .to_string()
+        } else {
+            raw_arg.ok_or_else(|| anyhow!(usage))?.to_string()
+        };
+        let normalized = ainput_rewrite::normalize_streaming_preview(&raw_text);
+        let repaired = ainput_rewrite::repair_parakeet_code_switch_terms(&normalized);
+        if let Some(out_path) = out_path {
+            fs::write(out_path, format!("{repaired}\n"))
+                .with_context(|| format!("write repair output to {out_path}"))?;
+        } else {
+            println!("{repaired}");
         }
         return Ok(());
     }

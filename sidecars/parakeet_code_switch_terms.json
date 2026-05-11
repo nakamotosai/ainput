@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "description": "Riva-encodable low-boost terms for AInput Mandarin-English code-switching. Keep this file small and verify new phrases before adding them.",
+  "boost_phrases": [
+    "Codex",
+    "codex",
+    "multi",
+    "Telegram",
+    "API",
+    "api",
+    "Windows",
+    "Gemini",
+    "Hermes",
+    "Claude",
+    "Riva",
+    "NIM",
+    "cli",
+    "github",
+    "git hub",
+    "open ai",
+    "g p t",
+    "j s o n",
+    "t o m l",
+    "cloud flare",
+    "tail scale",
+    "parakeet"
+  ]
+}

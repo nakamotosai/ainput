@@ -1,5 +1,35 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.80：zh-CN Parakeet 安全中英混说修复
+
+- 目标：不切模型、不切部署、不使用 `multi`，在 `nvidia/parakeet-ctc-0_6b-zh-cn` + `language=zh-CN` 当前链路上改善中英混说短英文岛，同时保护用户已经满意的中文识别体感。
+- 保持：vps-jp sidecar 仍使用 function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`，AInput 仍走 `online_streaming`，不修改 `cliproxyapi` 8317，不把 NVIDIA key 写入 Windows 包或 repo。
+- 修复：sidecar 默认启用低强度 speech context，`boost=4.0`，词表来自 `sidecars\parakeet_code_switch_terms.json`，只包含当前 Riva 可编码短语。
+- 修复：包内同时带 `data\terms\parakeet_code_switch_terms.json`，方便后续把用户确认有效的术语沉淀成可维护词表。
+- 修复：应用侧新增保守 code-switch 后处理，只精确修复已观察到的 `multi` 丢失、`猫底/某体` 误听、`扣代斯` 等 Codex 误听，以及 `OpenAI / API / CLI / GitHub` 等常见英文产品词大小写。
+- 保护：中文负例 `猫底下有一根线。`、`某体文章写得很好。` 必须保持原样，避免为了修 mixed English island 误伤正常中文。
+- 入口：`run-ainput.bat`、HKCU Run、当前 Windows 交互桌面进程都已指向 `dist\ainput-1.0.0-preview.80\ainput-desktop.exe`。
+- 回滚：如果用户实测中文体感变差，优先回滚到冻结基线 `1.0.0-preview.78`；如果只怀疑 boost 影响，可先禁用 sidecar `PARAKEET_ENABLE_SPEECH_CONTEXTS`。
+
+验证：
+
+- `python3 -m py_compile /tmp/ainput-preview80/sidecars/nvidia_parakeet_online_sidecar.py` 已通过；Windows `python -m py_compile sidecars\nvidia_parakeet_online_sidecar.py` 已通过；vps-jp live sidecar `python3 -m py_compile` 已通过。
+- `cargo fmt --all -- --check` 已通过。
+- `cargo check -p ainput-desktop` 已通过；只剩既有 dead-code warning。
+- `cargo test -p ainput-rewrite` 已通过，20/20 passed，覆盖 code-switch 修复和中文负例。
+- `cargo test -p ainput-desktop online_parakeet -- --nocapture` 已通过，1/1 passed。
+- `git diff --check` 已通过；只剩 Windows LF/CRLF 提示。
+- vps-jp `ainput-parakeet-asr.service` 已重启并 active；`/health` 返回 `model=nvidia/parakeet-ctc-0_6b-zh-cn`、`language=zh-CN`、function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`、`boost_enabled=true`、`boost=4.0`、`boost_phrases=22`。
+- debug exe 通过 `scripts\run-online-code-switch-replay.ps1 -ExePath .\target\debug\ainput-desktop.exe -RawDir .\tmp\preview79-code-switch-raw`，覆盖 3 段 preview.79 原始 WAV 和新增文本回归。
+- dist exe 通过同一回放脚本，`-ExePath .\dist\ainput-1.0.0-preview.80\ainput-desktop.exe`。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.80` 已通过，产出 `dist\ainput-1.0.0-preview.80\` 与 `dist\ainput-1.0.0-preview.80.zip`。
+- 包内确认存在 `sidecars\nvidia_parakeet_online_sidecar.py`、`sidecars\parakeet_code_switch_terms.json`、`data\terms\parakeet_code_switch_terms.json`、`scripts\run-online-code-switch-replay.ps1`。
+- Windows live process: `C:\Users\sai\ainput\dist\ainput-1.0.0-preview.80\ainput-desktop.exe`，`SessionId=1`。
+
+未覆盖：
+
+- 我无法替用户做真人麦克风主观体感验收；这版已经通过历史 WAV 回放和文本回归，但自由中文和自由中英混说仍要用户实测。
+
 ## 2026-05-11 冻结 1.0.0-preview.78：后续修改基准版本
 
 - 用户真实使用确认：`preview.78` 效果很好，识别速度非常快，上屏速度也非常快。
