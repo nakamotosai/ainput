@@ -1,5 +1,22 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.77：在线 Parakeet 多语言 RNNT
+
+- 目标：把第三个独立在线流式模式从中文专用 `nvidia/parakeet-ctc-0_6b-zh-cn` 替换为多语言 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`，优先覆盖用户的日文、中文、英文使用场景。
+- 修复：vps-jp live adapter 与 Windows 包内 sidecar 默认模型改为 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`。
+- 修复：NVIDIA function id 改为 `71203149-d3b7-4460-8231-1be2543a1fca`，`language_code` 改为 `multi`。
+- 保持：本地 Qwen/Sherpa 模式不变；`preview.76` 仍是中文 CTC 在线模式回滚包；不修改或重启 `cliproxyapi` 8317；不把 NVIDIA key 写入 repo、dist 或日志。
+
+验证：
+
+- vps-jp `ainput-parakeet-asr.service` 已重启并 active，`/health` 返回新模型、新 function id、`language=multi`、`key_count=5`、`streaming_partials=true`。
+- Windows 访问 `http://vps-jp.tail4b5213.ts.net:18765/health` 已返回同样的新模型配置。
+- `python3 -m py_compile` 已通过 vps-jp live adapter；Windows 包内 sidecar `python -m py_compile` 已通过。
+- `cargo fmt --all -- --check` 已通过。
+- `cargo check -p ainput-desktop` 已通过；只剩既有 unused / dead-code warning。
+- `cargo test -p ainput-shell` 已通过，6/6 passed。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.77` 已通过，产出 `dist\ainput-1.0.0-preview.77\` 与 `dist\ainput-1.0.0-preview.77.zip`。
+
 ## 2026-05-11 打包 1.0.0-preview.76：独立在线流式模式
 
 - 目标：把在线 NVIDIA Parakeet ASR 从本地 `streaming` 模式拆出来，成为第三个独立模式。

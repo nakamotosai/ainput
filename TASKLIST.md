@@ -5,6 +5,20 @@
 
 ---
 
+## Round 40：preview.77 在线 Parakeet 多语言 RNNT
+
+- [x] 新增 Spec：`specs/ainput-online-parakeet-multilingual-preview77/`
+- [x] vps-jp live adapter 切到 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`
+- [x] NVIDIA function id 改为 `71203149-d3b7-4460-8231-1be2543a1fca`
+- [x] 在线 language 改为 `multi`
+- [x] Windows 源码和包内 sidecar 同步新模型配置
+- [x] 默认仍走 `online_streaming`，本地 `[voice.streaming]` 仍保留 Qwen sidecar
+- [x] vps-jp 与 Windows `/health` 均返回新模型、新 function id、`language=multi`
+- [x] `cargo fmt --all -- --check` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] `cargo test -p ainput-shell` 通过
+- [x] 打包 `dist\ainput-1.0.0-preview.77`
+
 ## Round 39：preview.76 独立在线流式模式
 
 - [x] 新增 `VoiceMode::OnlineStreaming` 和 `[voice.online_streaming]`

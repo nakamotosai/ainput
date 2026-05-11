@@ -1,5 +1,31 @@
 # ainput DECISIONS
 
+## D-021 在线 ASR 默认切到 NVIDIA Parakeet 多语言 RNNT
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户主要说日文、中文、英文，中文专用 `nvidia/parakeet-ctc-0_6b-zh-cn` 不适合作为长期默认在线模型。
+- NVIDIA Build 页面提供 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`，用户已明确要求替换到这个多语言版本。
+- 在线 ASR 已经在 `preview.76` 独立成第三模式，本轮只替换在线模式的远端模型，不应再影响本地 Qwen 流式模式。
+
+决策：
+
+- `preview.77` 默认在线模型为 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`。
+- NVIDIA function id 使用 `71203149-d3b7-4460-8231-1be2543a1fca`。
+- 在线语言参数使用 `multi`，配置面写入 `[voice.online_streaming].language = "multi"`。
+- vps-jp adapter 和 Windows 包内 sidecar 保持同一模型 / function id / language 默认值。
+
+放弃：
+
+- 不删除中文 CTC 在线回滚包 `preview.76`。
+- 不改本地 Qwen / Sherpa 配置和显存策略。
+- 不把 NVIDIA key 写入 Windows 包、repo、dist 或日志。
+
+---
+
 ## D-020 在线 ASR 必须是独立语音模式
 
 - 日期：2026-05-11

@@ -13,11 +13,11 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 
-MODEL = "nvidia/parakeet-ctc-0_6b-zh-cn"
+MODEL = "nvidia/parakeet-1_1b-rnnt-multilingual-asr"
 SAMPLE_RATE = int(os.environ.get("PARAKEET_SAMPLE_RATE_HZ", "16000"))
-LANGUAGE_CODE = os.environ.get("PARAKEET_LANGUAGE_CODE", "zh-CN")
+LANGUAGE_CODE = os.environ.get("PARAKEET_LANGUAGE_CODE", "multi")
 URI = os.environ.get("PARAKEET_GRPC_URI", "grpc.nvcf.nvidia.com:443")
-FUNCTION_ID = os.environ.get("PARAKEET_FUNCTION_ID", "9add5ef7-322e-47e0-ad7a-5653fb8d259b")
+FUNCTION_ID = os.environ.get("PARAKEET_FUNCTION_ID", "71203149-d3b7-4460-8231-1be2543a1fca")
 CONFIG_PATH = Path(
     os.environ.get(
         "PARAKEET_CLIPROXY_CONFIG",
