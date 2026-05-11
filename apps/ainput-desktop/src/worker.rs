@@ -70,6 +70,31 @@ const STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MAX_CHARS: usize = 18;
 static STREAMING_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const QWEN_SIDECAR_HEALTH_WAIT: Duration = Duration::from_secs(240);
 const QWEN_SIDECAR_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+const NVIDIA_PARAKEET_ONLINE_BACKEND: &str = "nvidia_parakeet_online";
+
+fn streaming_backend_key(config: &ainput_shell::StreamingVoiceConfig) -> String {
+    config.backend.trim().to_ascii_lowercase()
+}
+
+fn is_qwen_streaming_backend_key(backend: &str) -> bool {
+    backend == "qwen3_sidecar" || backend == "qwen"
+}
+
+fn is_online_parakeet_streaming_backend_key(backend: &str) -> bool {
+    backend == NVIDIA_PARAKEET_ONLINE_BACKEND || backend == "parakeet_online"
+}
+
+fn is_sidecar_streaming_backend_key(backend: &str) -> bool {
+    is_qwen_streaming_backend_key(backend) || is_online_parakeet_streaming_backend_key(backend)
+}
+
+fn sidecar_backend_label(config: &ainput_shell::StreamingVoiceConfig) -> &'static str {
+    if is_online_parakeet_streaming_backend_key(&streaming_backend_key(config)) {
+        "NVIDIA Parakeet online ASR"
+    } else {
+        "Qwen3-ASR"
+    }
+}
 
 pub(crate) enum WorkerEvent {
     Ready(WorkerKind),
@@ -610,9 +635,11 @@ impl QwenSidecarClient {
     }
 
     fn ensure_ready(&self, config: &ainput_shell::StreamingVoiceConfig) -> Result<()> {
+        let backend_label = sidecar_backend_label(config);
         match self.health() {
             Ok(health) => {
                 tracing::info!(
+                    backend = backend_label,
                     model = %health.model.as_deref().unwrap_or("unknown"),
                     sessions = health.sessions.unwrap_or_default(),
                     sample_rate_hz = health.sample_rate_hz.unwrap_or_default(),
@@ -622,19 +649,22 @@ impl QwenSidecarClient {
                     effective_enforce_eager = health.effective_enforce_eager.unwrap_or_default(),
                     enforce_eager_fallback = health.enforce_eager_fallback.unwrap_or_default(),
                     sidecar_url = %self.base_url,
-                    "Qwen3-ASR sidecar is ready"
+                    "streaming sidecar is ready"
                 );
                 return Ok(());
             }
             Err(error) if config.sidecar_auto_start => {
                 tracing::warn!(
+                    backend = backend_label,
                     error = %error,
                     sidecar_url = %self.base_url,
-                    "Qwen3-ASR sidecar unavailable; attempting WSL auto-start"
+                    "streaming sidecar unavailable; attempting WSL auto-start"
                 );
                 start_qwen_sidecar_via_wsl(config)?;
             }
-            Err(error) => return Err(error).context("Qwen3-ASR sidecar is not ready"),
+            Err(error) => {
+                return Err(error).with_context(|| format!("{backend_label} sidecar is not ready"));
+            }
         }
 
         let deadline = Instant::now() + QWEN_SIDECAR_HEALTH_WAIT;
@@ -643,6 +673,7 @@ impl QwenSidecarClient {
             match self.health() {
                 Ok(health) => {
                     tracing::info!(
+                        backend = backend_label,
                         model = %health.model.as_deref().unwrap_or("unknown"),
                         sessions = health.sessions.unwrap_or_default(),
                         sample_rate_hz = health.sample_rate_hz.unwrap_or_default(),
@@ -651,7 +682,7 @@ impl QwenSidecarClient {
                         requested_enforce_eager = health.requested_enforce_eager.unwrap_or_default(),
                         effective_enforce_eager = health.effective_enforce_eager.unwrap_or_default(),
                         enforce_eager_fallback = health.enforce_eager_fallback.unwrap_or_default(),
-                        "Qwen3-ASR sidecar became ready after auto-start"
+                        "streaming sidecar became ready after auto-start"
                     );
                     return Ok(());
                 }
@@ -710,6 +741,13 @@ impl QwenSidecarClient {
         config: &ainput_shell::StreamingVoiceConfig,
     ) -> Result<()> {
         self.ensure_ready(config)?;
+        if is_online_parakeet_streaming_backend_key(&streaming_backend_key(config)) {
+            tracing::info!(
+                sidecar_url = %self.base_url,
+                "NVIDIA Parakeet online ASR adapter ready; local model preload skipped"
+            );
+            return Ok(());
+        }
         let sample_rate_hz = self
             .health()
             .ok()
@@ -791,6 +829,8 @@ fn start_qwen_sidecar_via_wsl(config: &ainput_shell::StreamingVoiceConfig) -> Re
         format!("QWEN3_ENFORCE_EAGER={enforce_eager}"),
         "QWEN3_ENFORCE_EAGER_FALLBACK=1".to_string(),
         format!("QWEN3_MAX_NEW_TOKENS={}", config.qwen3.max_new_tokens),
+        "QWEN3_MAX_NUM_BATCHED_TOKENS=2048".to_string(),
+        "QWEN3_MAX_NUM_SEQS=1".to_string(),
         format!(
             "QWEN3_CHUNK_SIZE_SEC={}",
             shell_env_value(&format!("{:.3}", config.qwen3.chunk_size_sec))
@@ -843,7 +883,7 @@ fn start_qwen_sidecar_via_wsl(config: &ainput_shell::StreamingVoiceConfig) -> Re
     command.stderr(Stdio::null());
     command
         .spawn()
-        .with_context(|| format!("start Qwen3-ASR sidecar via WSL distro {distro}"))?;
+        .with_context(|| format!("start Qwen3-ASR sidecar via WSL systemd-run distro {distro}"))?;
     Ok(())
 }
 
@@ -1238,14 +1278,8 @@ pub(crate) fn streaming_push_to_talk_worker(
     shutdown: Arc<AtomicBool>,
     worker_rx: mpsc::Receiver<WorkerCommand>,
 ) {
-    let backend = runtime
-        .config
-        .voice
-        .streaming
-        .backend
-        .trim()
-        .to_ascii_lowercase();
-    if backend == "qwen3_sidecar" || backend == "qwen" {
+    let backend = streaming_backend_key(&runtime.config.voice.streaming);
+    if is_sidecar_streaming_backend_key(&backend) {
         qwen_sidecar_streaming_push_to_talk_worker(runtime, proxy, shutdown, worker_rx);
         return;
     }
@@ -1747,12 +1781,13 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
     shutdown: Arc<AtomicBool>,
     worker_rx: mpsc::Receiver<WorkerCommand>,
 ) {
+    let backend_label = sidecar_backend_label(&runtime.config.voice.streaming);
     let sidecar = match QwenSidecarClient::create(&runtime.config.voice.streaming) {
         Ok(client) => client,
         Err(error) => {
             let _ = proxy.send_event(AppEvent::Worker(WorkerEvent::ModelLoadFailed {
                 kind: WorkerKind::Streaming,
-                message: format!("failed to initialize Qwen3-ASR sidecar: {error}"),
+                message: format!("failed to initialize {backend_label} sidecar: {error}"),
             }));
             return;
         }
@@ -1760,7 +1795,8 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
     tracing::info!(
         sidecar_url = %runtime.config.voice.streaming.sidecar_url,
         chunk_ms = runtime.config.voice.streaming.chunk_ms,
-        "ainput Qwen3-ASR sidecar streaming worker loop started"
+        backend = backend_label,
+        "ainput sidecar streaming worker loop started"
     );
     let mut sidecar_model_ready = false;
     let mut standby_recording: Option<ainput_audio::ActiveRecording> = None;
@@ -1779,7 +1815,8 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                     {
                         tracing::info!(
                             sidecar_url = %runtime.config.voice.streaming.sidecar_url,
-                            "starting async Qwen sidecar model preload"
+                            backend = backend_label,
+                            "starting async sidecar readiness preload"
                         );
                         pending_model_preload = Some(PendingQwenModelPreload {
                             rx: spawn_qwen_sidecar_model_preload(
@@ -1794,7 +1831,8 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                         if sidecar_model_ready && pending_session_start.is_none() {
                             tracing::info!(
                                 sidecar_url = %runtime.config.voice.streaming.sidecar_url,
-                                "starting async Qwen sidecar session bootstrap"
+                                backend = backend_label,
+                                "starting async sidecar session bootstrap"
                             );
                             pending_session_start = Some(PendingQwenSessionStart {
                                 rx: spawn_qwen_sidecar_session_start(
@@ -1809,7 +1847,8 @@ fn qwen_sidecar_streaming_push_to_talk_worker(
                         } else {
                             tracing::info!(
                                 sidecar_url = %runtime.config.voice.streaming.sidecar_url,
-                                "starting async Qwen sidecar preload before first session bootstrap"
+                                backend = backend_label,
+                                "starting async sidecar readiness preload before first session bootstrap"
                             );
                             pending_model_preload = Some(PendingQwenModelPreload {
                                 rx: spawn_qwen_sidecar_model_preload(

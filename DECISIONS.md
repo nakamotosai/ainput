@@ -1,5 +1,30 @@
 # ainput DECISIONS
 
+## D-019 临时引入 NVIDIA Parakeet 在线 ASR adapter
+
+- 日期：2026-05-11
+- 状态：temporary
+
+原因：
+
+- 本机 Qwen3-ASR 0.6B 在 Windows GPU 上显存占用过高，且近期真实热键链路不稳定。
+- NVIDIA Parakeet CTC zh-CN 在线 API 已通过试用验证效果可用，但它是 Riva gRPC/NVCF，不是 OpenAI 兼容音频转写接口。
+- 现有 `vps-jp` `cliproxyapi` 8317 生产配置已经持有 5 个 NVIDIA key；临时 adapter 可读取该 key pool，避免把 key 写入 Windows 包。
+
+决策：
+
+- 新增第三个流式 backend：`nvidia_parakeet_online`。
+- AInput 仍走现有 sidecar session HTTP contract，临时 adapter 在 `vps-jp` 上把 HTTP session 转成 NVIDIA Riva gRPC offline recognition。
+- `preview.74` 默认使用在线 backend，`sidecar_auto_start = false`，不自动拉起本地 Qwen WSL sidecar。
+
+放弃：
+
+- 不修改 `cliproxyapi` 8317 生产服务本体。
+- 不在 Rust 主程序里直接实现 Riva gRPC。
+- 不把 NVIDIA key 放进 TOML、dist 或 git。
+
+---
+
 ## D-001 选用 Rust 作为主语言
 
 - 日期：2026-03-25

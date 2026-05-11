@@ -1,5 +1,26 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.74：临时在线 NVIDIA Parakeet ASR
+
+- 背景：本机 Qwen3-ASR 0.6B 虽然模型权重约 1.88GB，但 vLLM / CUDA 运行态会把 Windows GPU 显存顶到约 5GB 以上；用户本轮要求新增在线 ASR 模式并默认绕开本地模型加载。
+- 接口事实：NVIDIA Parakeet CTC zh-CN 是 Riva gRPC/NVCF 形态，不是 OpenAI-compatible `/v1/audio/transcriptions`；因此不能只把 AInput 指向 `cliproxyapi` 8317 的 OpenAI HTTP endpoint。
+- 方案：新增 `nvidia_parakeet_online` backend；AInput 继续复用现有 sidecar session HTTP contract，`vps-jp` 临时 adapter 负责读取 8317 生产配置中的 5 个 NVIDIA keys 并轮询调用 Parakeet。
+- 安全边界：不修改或重启 `cliproxyapi` 8317；不把 NVIDIA key 写入 Windows TOML、dist、git 或日志。
+- 默认配置：`voice.mode = "streaming"`，`voice.streaming.backend = "nvidia_parakeet_online"`，`sidecar_url = "http://vps-jp.tail4b5213.ts.net:18765"`，`sidecar_auto_start = false`，`gpu_enabled = false`。
+
+验证：
+
+- `cargo fmt --all -- --check` 已通过。
+- `cargo check -p ainput-desktop` 已通过；仍有既有 dead-code warnings。
+- `cargo test -p ainput-shell render_config_file_contains_streaming_ai_rewrite_section` 已通过。
+- `vps-jp` adapter `/health` 从 Windows 可访问，返回 Parakeet 模型、16k sample rate、5 个 key。
+- 已知 WAV 通过在线 adapter 实测转写，11.38s 音频耗时约 2.15s。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.74` 已通过，产出 `dist\ainput-1.0.0-preview.74\` 与 `dist\ainput-1.0.0-preview.74.zip`。
+- Windows 交互桌面已运行 `dist\ainput-1.0.0-preview.74\ainput-desktop.exe`，`SessionId=1`。
+- 启动日志确认 backend 为 `NVIDIA Parakeet online ASR`，且出现 `local model preload skipped`；未出现本地 Qwen model preload。
+- 已停止 `.72` 遗留的 WSL Qwen/vLLM 进程；复查 WSL 中无 qwen/vllm sidecar 进程。
+- GPU 复查约 `2856 / 11264 MiB`，未见本地 Qwen 6GB 负载。
+
 ## 2026-05-11 打包 1.0.0-preview.72：Qwen context echo guard 与项目暂时收口
 
 - 根因确认：Qwen3-ASR sidecar 在坏音频/低信号场景下会把 `[voice.streaming.qwen3].context` 直接作为 partial/final 文本吐出；`.71` 的拦截点太晚，提示词可能先闪到 HUD 或被 fast HUD snapshot 上屏。

@@ -5,6 +5,23 @@
 
 ---
 
+## Round 37：preview.74 临时在线 Parakeet ASR
+
+- [x] 新增 Spec：`specs/ainput-online-parakeet-preview74/`
+- [x] 决定不把 NVIDIA API key 写入 Windows 包，改由 `vps-jp` adapter 读取 8317 生产配置里的 key pool
+- [x] 新增 `nvidia_parakeet_online` 第三种流式 ASR backend
+- [x] 默认流式配置切到在线 Parakeet adapter，且 `sidecar_auto_start = false`
+- [x] 在线模式复用 sidecar session HTTP contract，但跳过 Qwen 本地模型 warm preload
+- [x] `cargo fmt --all` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] `vps-jp` adapter `/health` 从 Windows 可访问
+- [x] 已用已知 WAV 通过在线 adapter 实测转写
+- [x] 打包 `dist\ainput-1.0.0-preview.74`
+- [x] Windows 交互桌面运行 preview.74
+- [x] 日志确认没有 Qwen preload，GPU 未新增 Qwen 显存占用
+
+---
+
 ## Round 36：preview.68 收紧上屏延迟并清理构建垃圾
 
 - [x] 定位 live 延迟分解：HUD final 之后粘贴本身只需几十毫秒，主要延迟在 release drain + final decode

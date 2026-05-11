@@ -265,7 +265,7 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            mode: VoiceMode::Fast,
+            mode: VoiceMode::Streaming,
             streaming: StreamingVoiceConfig::default(),
             prefer_direct_paste: true,
             fallback_to_clipboard: true,
@@ -280,9 +280,9 @@ impl Default for StreamingVoiceConfig {
         Self {
             enabled: true,
             model_dir: "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en".to_string(),
-            backend: "sherpa".to_string(),
-            sidecar_url: "http://127.0.0.1:8765".to_string(),
-            sidecar_auto_start: true,
+            backend: "nvidia_parakeet_online".to_string(),
+            sidecar_url: "http://vps-jp.tail4b5213.ts.net:18765".to_string(),
+            sidecar_auto_start: false,
             sidecar_idle_unload_ms: 3_600_000,
             sidecar_wsl_distro: "Ubuntu".to_string(),
             sidecar_wsl_workdir: "/home/sai/ainput-qwen3-asr".to_string(),
@@ -978,8 +978,27 @@ history_limit = {history_limit}
 # 是否启用流式语音识别模式。
 enabled = {streaming_enabled}
 
+# 流式 ASR 后端。
+# nvidia_parakeet_online = vps-jp 临时在线 NVIDIA Parakeet CTC zh-CN adapter
+# qwen3_sidecar = 本机 Windows GPU / WSL2 原版 Qwen3-ASR-0.6B
+# sherpa = 旧的本地 sherpa-onnx streaming paraformer 回退路径
+backend = "{streaming_backend}"
+
 # 流式 ASR 模型目录。
 model_dir = "{streaming_model_dir}"
+
+# sidecar / adapter 地址。
+sidecar_url = "{streaming_sidecar_url}"
+
+# sidecar 不在时是否自动通过 WSL 拉起。在线 Parakeet adapter 固定为 false。
+sidecar_auto_start = {streaming_sidecar_auto_start}
+
+# Qwen sidecar 空闲多久后自动退出并释放显存（毫秒）；在线 Parakeet adapter 不使用本地显存。
+sidecar_idle_unload_ms = {streaming_sidecar_idle_unload_ms}
+
+# Qwen sidecar 的 WSL 位置；在线 Parakeet adapter 不使用。
+sidecar_wsl_distro = "{streaming_sidecar_wsl_distro}"
+sidecar_wsl_workdir = "{streaming_sidecar_wsl_workdir}"
 
 # 是否显示流式语音面板。
 panel_enabled = {streaming_panel_enabled}
@@ -1214,7 +1233,33 @@ file_name = "{log_file_name}"
         history_file_name = config.voice.history_file_name,
         history_limit = config.voice.history_limit,
         streaming_enabled = config.voice.streaming.enabled,
+        streaming_backend = config
+            .voice
+            .streaming
+            .backend
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
         streaming_model_dir = config.voice.streaming.model_dir,
+        streaming_sidecar_url = config
+            .voice
+            .streaming
+            .sidecar_url
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        streaming_sidecar_auto_start = config.voice.streaming.sidecar_auto_start,
+        streaming_sidecar_idle_unload_ms = config.voice.streaming.sidecar_idle_unload_ms,
+        streaming_sidecar_wsl_distro = config
+            .voice
+            .streaming
+            .sidecar_wsl_distro
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        streaming_sidecar_wsl_workdir = config
+            .voice
+            .streaming
+            .sidecar_wsl_workdir
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
         streaming_panel_enabled = config.voice.streaming.panel_enabled,
         streaming_rewrite_enabled = config.voice.streaming.rewrite_enabled,
         streaming_punctuation_model_dir = config.voice.streaming.punctuation_model_dir,
@@ -1688,6 +1733,8 @@ text_color = "#111111"
     fn render_config_file_contains_streaming_ai_rewrite_section() {
         let rendered = render_config_file(&AppConfig::default());
         assert!(rendered.contains("[voice.streaming.endpoint]"));
+        assert!(rendered.contains("backend = \"nvidia_parakeet_online\""));
+        assert!(rendered.contains("sidecar_url = \"http://vps-jp.tail4b5213.ts.net:18765\""));
         assert!(rendered.contains("pause_ms = 560"));
         assert!(rendered.contains("soft_flush_ms = 240"));
         assert!(rendered.contains("[voice.streaming.stability]"));

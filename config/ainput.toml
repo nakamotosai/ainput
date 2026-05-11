@@ -62,18 +62,19 @@ history_limit = 500
 enabled = true
 
 # 流式 ASR 后端
+# nvidia_parakeet_online = vps-jp 临时在线 NVIDIA Parakeet CTC zh-CN adapter
 # qwen3_sidecar = 本机 Windows GPU / WSL2 原版 Qwen3-ASR-0.6B
 # sherpa = 旧的本地 sherpa-onnx streaming paraformer 回退路径
-backend = "qwen3_sidecar"
+backend = "nvidia_parakeet_online"
 
 # 流式 ASR 模型目录。
 model_dir = "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 
-# Qwen3-ASR sidecar 地址
-sidecar_url = "http://127.0.0.1:8765"
+# 在线 ASR adapter / Qwen3-ASR sidecar 地址
+sidecar_url = "http://vps-jp.tail4b5213.ts.net:18765"
 
-# sidecar 不在时，是否自动通过 WSL 拉起
-sidecar_auto_start = true
+# sidecar 不在时，是否自动通过 WSL 拉起；在线 adapter 是远端服务，不能拉本地 Qwen
+sidecar_auto_start = false
 
 # sidecar 空闲多久后自动退出并释放显存（毫秒）
 # Preview.69 默认 1 小时；下次按热键时会自动重新拉起
@@ -111,7 +112,7 @@ unfixed_token_num = 5
 # vLLM / Qwen3-ASR 启动参数。
 max_new_tokens = 64
 enforce_eager = false
-gpu_memory_utilization = 0.50
+gpu_memory_utilization = 0.30
 max_model_len = 2048
 dtype = "float16"
 
@@ -176,8 +177,8 @@ final_num_threads = 8
 # 后台写 raw capture / trace 的线程预算。
 background_writer_threads = 1
 
-# Qwen3 sidecar 使用 Windows 本机 GPU。
-gpu_enabled = true
+# 在线 Parakeet 不使用 Windows 本机 GPU。
+gpu_enabled = false
 
 [voice.streaming.commit]
 # 每轮松手只允许创建一个最终上屏 envelope。

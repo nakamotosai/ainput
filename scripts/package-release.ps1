@@ -552,6 +552,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "logs") | Out-N
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "assets") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "data\terms") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "scripts") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "sidecars") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-hud-e2e") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-selftest") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "fixtures\streaming-user-regression-v12") | Out-Null
@@ -637,6 +638,7 @@ Copy-Item (Join-Path $repoRoot "data\terms\base_terms.json") (Join-Path $package
 Copy-Item (Join-Path $repoRoot "scripts\run-streaming-live-e2e.ps1") (Join-Path $packageDir "scripts\run-streaming-live-e2e.ps1") -Force
 Copy-Item (Join-Path $repoRoot "scripts\run-streaming-raw-corpus.ps1") (Join-Path $packageDir "scripts\run-streaming-raw-corpus.ps1") -Force
 Copy-Item (Join-Path $repoRoot "scripts\run-startup-idle-acceptance.ps1") (Join-Path $packageDir "scripts\run-startup-idle-acceptance.ps1") -Force
+Copy-Item (Join-Path $repoRoot "sidecars\nvidia_parakeet_online_sidecar.py") (Join-Path $packageDir "sidecars\nvidia_parakeet_online_sidecar.py") -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-hud-e2e\manifest.json") (Join-Path $packageDir "fixtures\streaming-hud-e2e\manifest.json") -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-selftest\*") (Join-Path $packageDir "fixtures\streaming-selftest") -Recurse -Force
 Copy-Item (Join-Path $repoRoot "fixtures\streaming-user-regression-v12\*") (Join-Path $packageDir "fixtures\streaming-user-regression-v12") -Recurse -Force
@@ -676,6 +678,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- scripts\run-streaming-live-e2e.ps1: streaming HUD/readback acceptance script",
     "- scripts\run-streaming-raw-corpus.ps1: raw capture replay acceptance script",
     "- scripts\run-startup-idle-acceptance.ps1: startup idle no-auto-recording acceptance script",
+    "- sidecars\nvidia_parakeet_online_sidecar.py: temporary online ASR adapter source",
     "- fixtures\streaming-hud-e2e\: synthetic HUD/readback acceptance fixtures",
     "- fixtures\streaming-selftest\: fixed wav streaming acceptance fixtures",
     "- logs\: runtime logs",
@@ -684,7 +687,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
-    "- Streaming voice now uses hold Ctrl to trigger the local streaming paraformer model, and submits the finalized text after release",
+    "- Streaming voice now uses hold Ctrl to trigger the configured streaming backend; preview.74 defaults to the online NVIDIA Parakeet adapter and submits finalized text after release",
     "- You can open config\hud-overlay.toml directly from the tray menu to adjust font size, color, width, and position",
     "- Saving config\hud-overlay.toml hot-reloads the HUD immediately",
     "- New preview packages reuse the latest dist HUD config when available so HUD settings are kept",

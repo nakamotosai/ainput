@@ -1057,12 +1057,20 @@ impl DesktopApp {
         backend.eq_ignore_ascii_case("qwen3_sidecar") || backend.eq_ignore_ascii_case("qwen")
     }
 
+    fn is_online_parakeet_streaming_backend(&self) -> bool {
+        let backend = self.runtime.config.voice.streaming.backend.trim();
+        backend.eq_ignore_ascii_case("nvidia_parakeet_online")
+            || backend.eq_ignore_ascii_case("parakeet_online")
+    }
+
     fn voice_model_label(&self, kind: WorkerKind) -> &'static str {
         match kind {
             WorkerKind::Fast => "极速 ASR",
             WorkerKind::Streaming => {
                 if self.is_qwen_streaming_backend() {
                     "Qwen ASR"
+                } else if self.is_online_parakeet_streaming_backend() {
+                    "在线 ASR"
                 } else {
                     "流式 ASR"
                 }
@@ -2559,7 +2567,12 @@ impl ApplicationHandler<AppEvent> for DesktopApp {
                                     return;
                                 }
                                 self.mode = AppMode::Voice;
-                                if self.streaming_model.phase == VoiceModelPhase::Ready {
+                                if self.is_qwen_streaming_backend() {
+                                    self.begin_voice_model_loading(
+                                        WorkerKind::Streaming,
+                                        ModelLoadSource::Hotkey,
+                                    );
+                                } else if self.streaming_model.phase == VoiceModelPhase::Ready {
                                     self.set_tray_visual_state(TrayVisualState::Voice, 0);
                                     self.set_tray_status(self.streaming_status_text());
                                     self.show_streaming_status_overlay("", true, false);
