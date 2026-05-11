@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前稳定运行版本：`1.0.0-preview.76`（`1.0.0-preview.77` 多语言 RNNT 因中文实时识别严重漂移，已从 live 默认回滚）
+当前稳定运行版本：`1.0.0-preview.78`（`1.0.0-preview.77` 多语言 RNNT 因中文实时识别严重漂移，已从 live 默认回滚）
 
 本 README 是本项目唯一当前进度标准。
 
@@ -13,6 +13,9 @@
 - `在线流式识别` 是第三个独立模式：默认走 `vps-jp` NVIDIA Parakeet adapter，不加载本地 Qwen；松开 `Ctrl` 时如果 HUD 已有文本，先立刻粘贴 HUD snapshot，再后台 finish/cleanup。
 - `本地流式识别` 恢复为本机 Qwen/Sherpa 配置面，`qwen3_sidecar` 不再被在线 Parakeet backend 覆盖。
 - `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
+- `1.0.0-preview.78` 默认回到 `nvidia/parakeet-ctc-0_6b-zh-cn`，在线 adapter `partial_wait_sec` 收紧到 `0.06s`，并只使用 vps-jp Codex 用户指令历史里的高频英文词做 speech context boost。
+- `1.0.0-preview.78` 在线 worker 每个 tick 最多发送一个远端 `/chunk`，避免积压的同步 HTTP chunk 阻塞松手命令；松手时仍完整 drain 队列。
+- `1.0.0-preview.78` 中文数字归一化改为保守策略，只处理纯中文数字连读；`一起 / 一边 / 一下 / 一个` 等自然中文词不再被上屏改成 `1起 / 1边 / 1下 / 1个`。
 - `1.0.0-preview.77` 把在线 Parakeet 默认模型切到 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`，`language = "multi"`，用于日文 / 中文 / 英文混合输入验证。
 - `1.0.0-preview.77` 验证失败：`multi` 自动语言在中文实时 partial 上会乱跳多语言，中文不可作为默认；live 已回滚到 `1.0.0-preview.76` 中文专用 CTC。
 - `1.0.0-preview.76` 把在线 Parakeet 从本地流式配置里拆出来，托盘一级菜单显示 `极速语音识别 / 本地流式识别 / 在线流式识别` 三个模式。
@@ -31,12 +34,12 @@
 - 托盘右键菜单现在会直接显示当前版本号。
 - AI rewrite 不属于 V19：本版流式主链路会绕开/隔离已有改写代码，改写能力移到 Roadmap / Future Work。
 - 新增 `scripts\prune-artifacts.ps1`，可以清掉历史 `dist` / `target*` 构建垃圾，同时保留当前版本和一个回滚版本。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.77\` 与 `dist\ainput-1.0.0-preview.77.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.78\` 与 `dist\ainput-1.0.0-preview.78.zip`。
 
 它不做系统级 IME。当前默认热路径由本地 ASR/HUD 单链路负责；AI rewrite 暂不参与 V19 语音提交链路。当前重点是把四条前台主链路做稳：
 
-1. 按住语音热键开始录音，流式模式松开后继续 drain 未完成识别，再把 HUD 最终文本送进当前输入区
-1. 语音支持 `极速语音识别 / 流式语音识别` 双模式，直接从托盘一级菜单切换
+1. 按住语音热键开始录音，在线流式模式松开后优先提交 HUD snapshot，再后台 finish/cleanup
+1. 语音支持 `极速语音识别 / 本地流式识别 / 在线流式识别` 三模式，直接从托盘一级菜单切换
 2. 按截图热键进入冻结框选态，完成后把图片送进剪贴板
 3. 按录屏热键框选区域，实时录下视频和系统音频并导出到桌面
 4. 按自动化热键录制和回放真实键盘鼠标操作
@@ -67,9 +70,9 @@
   - 运行时：`sherpa-onnx Rust API`
   - 默认：`CPU / 4 线程`
 - 语音输入主链路
-  - 托盘一级菜单直接切换 `极速语音识别 / 流式语音识别`
+  - 托盘一级菜单直接切换 `极速语音识别 / 本地流式识别 / 在线流式识别`
   - `极速语音识别` 保留原有 `SenseVoice` 离线整段识别
-  - `流式语音识别` 默认使用 `vps-jp` 上的临时 NVIDIA Parakeet 在线 adapter；可通过 `backend = "qwen3_sidecar"` 回退本机 Qwen，或通过 `backend = "sherpa"` 回退旧 sherpa 流式模型
+  - `在线流式识别` 默认使用 `vps-jp` 上的 NVIDIA Parakeet CTC zh-CN adapter；本地 Qwen / Sherpa 只在切到 `本地流式识别` 后进入对应配置面
   - 流式模式按住热键时显示 HUD 面板
   - 流式模式按住时持续显示流式文字，默认只走本地识别 + 本地轻整理
   - 流式模式会持续喂入在线音频块，HUD truth state 是最终提交的唯一文本来源
@@ -147,8 +150,10 @@
   - 托盘一级菜单直接显示当前 `preview` 版本号
 - `极速语音识别`
   - 一级菜单直接切到离线整段识别模式
-- `流式语音识别`
-  - 一级菜单直接切到 HUD + 流式整段整理提交模式
+- `本地流式识别`
+  - 一级菜单直接切到本机 Qwen/Sherpa HUD 流式提交模式
+- `在线流式识别`
+  - 一级菜单直接切到 vps-jp NVIDIA Parakeet 在线 HUD 流式提交模式
 - `打开 HUD 参数文档`
   - 一级菜单直接打开 `config\hud-overlay.toml`
   - 可调整 HUD 字号、字体、颜色、宽度、圆角、位置、停留时间等参数
@@ -212,8 +217,8 @@ run-latest.bat
 正式交付只推荐便携版：
 
 ```text
-dist\ainput-1.0.0-preview.74\
-dist\ainput-1.0.0-preview.74.zip
+dist\ainput-1.0.0-preview.78\
+dist\ainput-1.0.0-preview.78.zip
 ```
 
 说明：
@@ -260,15 +265,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 - 松开
 - 等待整段离线识别结果自动进入当前输入框
 
-#### 流式语音识别
+#### 在线流式识别
 
-- 在托盘一级菜单切到 `流式语音识别`
+- 在托盘一级菜单切到 `在线流式识别`
 - 按住 `Ctrl`
 - 说话时屏幕正下方 HUD 只显示当前识别文字，最新尾巴允许被实时修正
 - 如果你正在编辑 `config\hud-overlay.toml`，保存后 HUD 会立刻刷新
-- 松开后程序会快速收尾，并把 HUD 当前 revision 对应的最终文本提交到输入框
+- 松开后程序优先提交 HUD snapshot，远端 finish 和清理在后台完成
 - 如果直贴失败，会按配置退回到剪贴板
 - 如果想调字号、颜色、宽度或位置，直接在托盘右键点 `打开 HUD 参数文档`
+
+#### 本地流式识别
+
+- 在托盘一级菜单切到 `本地流式识别`
+- 按住 `Ctrl`
+- 本地 Qwen/Sherpa 会按配置加载模型；这一路仍保留本机显存与 idle unload 策略
+- 松开后程序按本地流式配置 drain，并把 HUD truth 文本提交到输入框
 
 ### 鼠标触发
 
@@ -468,12 +480,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.77\`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.78\`
 - 默认启动模式是 `在线流式识别`
-- 当前源码在线流式主链是：`NVIDIA Parakeet online adapter + ASR-facing mono/16k + HUD truth state + immediate HUD snapshot paste + background finish`
+- 当前源码在线流式主链是：`NVIDIA Parakeet CTC zh-CN online adapter + ASR-facing mono/16k + HUD truth state + responsive chunk feed + immediate HUD snapshot paste + background finish`
 - 默认热路径由本地 ASR/HUD 单链路负责；V19 不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本
 - AI rewrite 已从当前版本范围移出；V19 只保证已有改写代码不会改 HUD truth 或最终上屏文本
-- `preview.76` 默认切到独立在线流式模式；`preview.75` 是在线 Parakeet 实时 partial 回滚点，`preview.72` 仍是本机 Qwen 回滚点
+- `preview.78` 默认使用中文 CTC 在线模型并修复 release lag / 数字误改；`preview.77` 是失败的多语言 RNNT 实验包；`preview.76` 是中文 CTC 在线模式回滚点；`preview.72` 仍是本机 Qwen 回滚点
 - `preview.71` 会泄漏 Qwen context 到 HUD，不建议作为回滚点；需要回滚时优先回到最后一个已验证可接受的旧包并重新验证真实麦克风链路
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
@@ -485,6 +497,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 - 未来任何 AI rewrite 都不能绕过 HUD truth 规则：上屏文本必须来自用户可见的最终 HUD 文本。
 
 ## 本轮收口验证
+
+2026-05-11 preview.78 online Parakeet zh-CN fast release:
+
+- 修复：在线默认回到 `nvidia/parakeet-ctc-0_6b-zh-cn`，不再使用失败的 `multi` RNNT 默认。
+- 修复：在线 worker 每个 tick 最多发送 1 个远端 `/chunk`，避免 chunk 队列同步 HTTP 阻塞松手命令。
+- 修复：vps-jp adapter `PARTIAL_WAIT_SEC` 默认收紧到 `0.06s`，减少 `/chunk` 等待堆积。
+- 修复：speech context boost 只使用 vps-jp Codex 用户指令历史中统计到的高频英文词。
+- 修复：中文数字归一化只处理纯中文数字连读；自然中文 `一起 / 一边 / 一下 / 一个` 不再被强行改成阿拉伯数字。
+- 验证：见本轮 OPLOG，必须包含 Rust 测试、sidecar py_compile、Windows 打包、vps-jp `/health` 和 live 启动入口回读。
 
 2026-05-11 preview.76 independent online streaming mode:
 
@@ -853,10 +874,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 接手提示
 
-- 当前进度：`1.0.0-preview.77` 是独立在线流式 ASR 实验版，默认模式为 `online_streaming`。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.77\ainput-desktop.exe`。
-- 当前包：`dist\ainput-1.0.0-preview.77\` 与 `dist\ainput-1.0.0-preview.77.zip`。
-- 当前主链：在线流式模式按下 `Ctrl` 打开 HUD，按住期间通过 `vps-jp` Parakeet adapter 持续返回 partial；松手时 HUD 有文本就立刻粘贴 HUD snapshot，远端 finish/cleanup 后台完成。
+- 当前进度：`1.0.0-preview.78` 是独立在线流式 ASR 默认版，默认模式为 `online_streaming`。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.78\ainput-desktop.exe`。
+- 当前包：`dist\ainput-1.0.0-preview.78\` 与 `dist\ainput-1.0.0-preview.78.zip`。
+- 当前主链：在线流式模式按下 `Ctrl` 打开 HUD，按住期间通过 `vps-jp` Parakeet CTC zh-CN adapter 持续返回 partial；松手时 HUD 有文本就立刻粘贴 HUD snapshot，远端 finish/cleanup 后台完成。
 - 回滚点：`dist\ainput-1.0.0-preview.72\` 保留为本机 Qwen 版本，冻结参数仍是 `gpu_memory_utilization = 0.30` 与 `sidecar_idle_unload_ms = 3600000`。
 - 安全边界：NVIDIA key 只从 `vps-jp` 8317 生产配置读取，不写入 Windows 包；本轮不修改 `cliproxyapi` 8317 生产服务本体。
 ## 当前边界

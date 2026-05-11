@@ -5,6 +5,25 @@
 
 ---
 
+## Round 41：preview.78 在线 Parakeet 中文 CTC 快速释放
+
+- [x] vps-jp Codex 用户指令历史扫描完成，英文 boost 词只取用户高频英文词
+- [x] 删除非历史来源的猜测 boost 词
+- [x] 在线默认模型回到 `nvidia/parakeet-ctc-0_6b-zh-cn`
+- [x] 在线 language 回到 `zh-CN`
+- [x] 在线 sidecar `PARTIAL_WAIT_SEC` 默认收紧到 `0.06`
+- [x] 在线 worker 活跃录音 tick 限制为最多发送 1 个 `/chunk`
+- [x] 中文数字归一化改为保守策略，不再把自然中文 `一起 / 一边 / 一下 / 一个` 改成阿拉伯数字
+- [x] vps-jp live adapter 同步并重启 `ainput-parakeet-asr.service`
+- [x] `cargo fmt --all -- --check` 通过
+- [x] `cargo check -p ainput-desktop` 通过
+- [x] `cargo test -p ainput-rewrite` 通过
+- [x] `cargo test -p ainput-shell` 通过
+- [x] 打包 `dist\ainput-1.0.0-preview.78`
+- [x] Windows 交互桌面运行 preview.78
+- [x] Windows `/health` 返回中文 CTC、`partial_wait_sec=0.06`、boost 词数量
+- [x] 启动日志确认默认 `OnlineStreaming`，且不自动加载本地 Qwen
+
 ## Round 40：preview.77 在线 Parakeet 多语言 RNNT
 
 - [x] 新增 Spec：`specs/ainput-online-parakeet-multilingual-preview77/`

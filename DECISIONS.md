@@ -1,5 +1,33 @@
 # ainput DECISIONS
 
+## D-023 preview.78 在线默认回到中文 CTC，英文增强词只来自用户历史
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- `preview.77` 多语言 RNNT 的 `multi` 模式中文实时识别严重漂移，不能作为用户日常默认。
+- 用户明确要求英文词汇增强只能来自 vps-jp Codex 历史里自己发过的指令，不能凭主观猜词。
+- 在线上屏慢的主要证据指向 AInput worker 在处理释放命令前被同步 `/chunk` 调用阻塞，而不是最终粘贴或 WeChat 输入慢。
+- 中文数字改写已经误伤自然中文词，例如 `一起 / 一边 / 一个`，默认改写必须更保守。
+
+决策：
+
+- `preview.78` 默认在线模型回到 `nvidia/parakeet-ctc-0_6b-zh-cn`，`language=zh-CN`。
+- 在线 ASR speech context boost 只内置 vps-jp `~/.codex/sessions` 用户指令历史统计出的高频英文词；项目词若不在统计结果里，不进入默认 boost 列表。
+- 在线 worker 活跃录音时每 tick 最多发送 1 个远端 `/chunk`，优先保证 `CtrlUp` 释放命令响应；释放时仍完整 drain 队列。
+- 中文数字归一化只保留纯中文数字连读场景，单位表达和自然中文“一 + 量词/副词/结构词”默认保留中文。
+
+放弃：
+
+- 不继续把多语言 RNNT 作为中文默认。
+- 不用猜测的英文术语表补 boost。
+- 不改本地 Qwen / Sherpa 的模型配置、显存策略和 idle unload。
+- 不修改 `cliproxyapi` 8317 生产服务本体。
+
+---
+
 ## D-022 多语言 RNNT 不再作为默认在线 ASR
 
 - 日期：2026-05-11

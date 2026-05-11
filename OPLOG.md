@@ -1,5 +1,29 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.78：中文 CTC 在线默认、release 快速响应、数字误改收紧
+
+- 目标：在保留 `极速 / 本地流式 / 在线流式` 三个独立模式的前提下，把在线默认从失败的多语言 RNNT 拉回中文专用 CTC，并修掉松手上屏慢和中文“一”被乱改成 `1` 的问题。
+- 修复：vps-jp live adapter 与 Windows 包内 sidecar 默认模型回到 `nvidia/parakeet-ctc-0_6b-zh-cn`、function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`、`language=zh-CN`。
+- 修复：在线 worker 在活跃录音 tick 内最多发送 1 个远端 `/chunk`，避免积压 chunk 的同步 HTTP 调用阻塞 `CtrlUp` 释放命令；释放路径仍完整 drain。
+- 修复：vps-jp adapter `PARTIAL_WAIT_SEC` 默认从 `0.18s` 收紧到 `0.06s`，减少没有新 partial 时的等待堆积。
+- 修复：speech context boost 只使用 vps-jp `~/.codex/sessions` 用户指令历史统计出的高频英文词，未加入猜测词。
+- 修复：中文数字归一化改为保守策略，只处理纯中文数字连读；`一起 / 一边 / 一下 / 一个` 等自然中文词不再被强行改成 `1起 / 1边 / 1下 / 1个`。
+- 保持：本地 Qwen/Sherpa 模式不变；`preview.77` 保留为失败实验证据；不修改或重启 `cliproxyapi` 8317；不把 NVIDIA key 写入 repo、dist 或日志。
+
+验证：
+
+- `cargo fmt --all -- --check` 已通过。
+- `cargo check -p ainput-desktop` 已通过；只剩既有 dead-code warning。
+- `cargo test -p ainput-rewrite` 已通过，18/18 passed，覆盖 `等会儿1起修 -> 等会儿一起修` 与纯中文数字连读转换。
+- `cargo test -p ainput-shell` 已通过，6/6 passed。
+- Windows 包内 sidecar `python -m py_compile` 已通过；vps-jp live adapter `python3 -m py_compile` 已通过。
+- vps-jp `ainput-parakeet-asr.service` 是 user service，已重启并 active；`/health` 返回 `model=nvidia/parakeet-ctc-0_6b-zh-cn`、`language=zh-CN`、`partial_wait_sec=0.06`、`boost_phrases=29`、`key_count=5`。
+- Windows 访问 `http://vps-jp.tail4b5213.ts.net:18765/health` 返回同样配置。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.78` 已通过，产出 `dist\ainput-1.0.0-preview.78\` 与 `dist\ainput-1.0.0-preview.78.zip`。
+- `run-ainput.bat` 与 HKCU Run 自启动均指向 `dist\ainput-1.0.0-preview.78\ainput-desktop.exe`。
+- Windows 交互桌面已运行 `dist\ainput-1.0.0-preview.78\ainput-desktop.exe`，`SessionId=1`。
+- preview78 启动日志确认 `voice_mode=OnlineStreaming`、backend 为 `NVIDIA Parakeet online ASR`、模型为中文 CTC，并出现 `local model preload skipped`。
+
 ## 2026-05-11 hot rollback：preview.77 多语言 RNNT 中文失败，live 回滚 preview.76
 
 - 现象：`nvidia/parakeet-1_1b-rnnt-multilingual-asr` 配合 `language=multi` 在中文实时输入时会不断把 HUD partial 猜成多种语言，最终中文结果严重错误。

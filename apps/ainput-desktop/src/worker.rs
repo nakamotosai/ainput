@@ -70,6 +70,7 @@ const STREAMING_FINAL_FUZZY_TAIL_OVERLAP_MAX_CHARS: usize = 18;
 static STREAMING_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const QWEN_SIDECAR_HEALTH_WAIT: Duration = Duration::from_secs(240);
 const QWEN_SIDECAR_HTTP_TIMEOUT: Duration = Duration::from_secs(180);
+const ONLINE_SIDECAR_MAX_CHUNKS_PER_TICK: usize = 1;
 const NVIDIA_PARAKEET_ONLINE_BACKEND: &str = "nvidia_parakeet_online";
 
 fn streaming_backend_key(config: &ainput_shell::StreamingVoiceConfig) -> String {
@@ -2107,6 +2108,7 @@ fn sidecar_streaming_push_to_talk_worker(
                             chunk_samples,
                             false,
                             None,
+                            None,
                             Some(&proxy),
                         ) {
                             Ok(samples) => samples,
@@ -2596,6 +2598,11 @@ fn sidecar_streaming_push_to_talk_worker(
                 session,
                 chunk_samples,
                 true,
+                if mode.finish_in_background {
+                    Some(ONLINE_SIDECAR_MAX_CHUNKS_PER_TICK)
+                } else {
+                    None
+                },
                 Some(&runtime),
                 Some(&proxy),
             ) {
@@ -2845,21 +2852,30 @@ fn feed_qwen_pending_chunks(
     session: &mut QwenSidecarSession,
     chunk_num_samples: usize,
     full_chunks_only: bool,
+    max_chunks: Option<usize>,
     runtime: Option<&AppRuntime>,
     proxy: Option<&EventLoopProxy<AppEvent>>,
 ) -> Result<usize> {
     let mut consumed = 0usize;
+    let mut sent_chunks = 0usize;
     while session.pending_feed_samples.len() >= chunk_num_samples {
+        if max_chunks.is_some_and(|limit| sent_chunks >= limit) {
+            break;
+        }
         let chunk: Vec<f32> = session
             .pending_feed_samples
             .drain(..chunk_num_samples)
             .collect();
         let response = sidecar.send_chunk(&session.session_id, &chunk)?;
         consumed += chunk.len();
+        sent_chunks += 1;
         session.total_chunks_fed += 1;
         emit_qwen_response_if_changed(session, response, runtime, proxy)?;
     }
-    if !full_chunks_only && !session.pending_feed_samples.is_empty() {
+    if !full_chunks_only
+        && !session.pending_feed_samples.is_empty()
+        && !max_chunks.is_some_and(|limit| sent_chunks >= limit)
+    {
         let chunk: Vec<f32> = session.pending_feed_samples.drain(..).collect();
         let response = sidecar.send_chunk(&session.session_id, &chunk)?;
         consumed += chunk.len();

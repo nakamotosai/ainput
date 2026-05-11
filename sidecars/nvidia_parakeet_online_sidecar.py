@@ -13,11 +13,11 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 
-MODEL = "nvidia/parakeet-1_1b-rnnt-multilingual-asr"
+MODEL = "nvidia/parakeet-ctc-0_6b-zh-cn"
 SAMPLE_RATE = int(os.environ.get("PARAKEET_SAMPLE_RATE_HZ", "16000"))
-LANGUAGE_CODE = os.environ.get("PARAKEET_LANGUAGE_CODE", "multi")
+LANGUAGE_CODE = os.environ.get("PARAKEET_LANGUAGE_CODE", "zh-CN")
 URI = os.environ.get("PARAKEET_GRPC_URI", "grpc.nvcf.nvidia.com:443")
-FUNCTION_ID = os.environ.get("PARAKEET_FUNCTION_ID", "71203149-d3b7-4460-8231-1be2543a1fca")
+FUNCTION_ID = os.environ.get("PARAKEET_FUNCTION_ID", "9add5ef7-322e-47e0-ad7a-5653fb8d259b")
 CONFIG_PATH = Path(
     os.environ.get(
         "PARAKEET_CLIPROXY_CONFIG",
@@ -26,7 +26,43 @@ CONFIG_PATH = Path(
 )
 TIMEOUT_SEC = float(os.environ.get("PARAKEET_TIMEOUT_SEC", "30"))
 MAX_AUDIO_SEC = float(os.environ.get("PARAKEET_MAX_AUDIO_SEC", "90"))
-PARTIAL_WAIT_SEC = float(os.environ.get("PARAKEET_PARTIAL_WAIT_SEC", "0.18"))
+PARTIAL_WAIT_SEC = float(os.environ.get("PARAKEET_PARTIAL_WAIT_SEC", "0.06"))
+BOOST = float(os.environ.get("PARAKEET_SPEECH_CONTEXT_BOOST", "18.0"))
+BOOST_ENABLED = os.environ.get("PARAKEET_ENABLE_SPEECH_CONTEXTS", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+DEFAULT_BOOST_PHRASES = [
+    # Derived from high-frequency user prompts in vps-jp ~/.codex/sessions.
+    "OpenClaw",
+    "Codex",
+    "Telegram",
+    "saaaai",
+    "npm",
+    "cnjpv2",
+    "GitHub",
+    "API",
+    "CLI",
+    "TOML",
+    "JSON",
+    "cliproxyapi",
+    "vps-jp",
+    "Windows",
+    "Cloudflare",
+    "GPT",
+    "Gemini",
+    "Hermes",
+    "OpenAI",
+    "Qwen",
+    "HIMEKA",
+    "ChatGPT",
+    "NVIDIA",
+    "Claude",
+    "Notion",
+    "Todoist",
+    "vps-us",
+    "Tailscale",
+    "home-windows",
+]
 
 
 @dataclass
@@ -118,6 +154,31 @@ def next_key() -> tuple[int, str]:
         index = key_cursor % len(keys)
         key_cursor += 1
     return index, keys[index]
+
+
+def boost_phrases() -> list[str]:
+    env_value = os.environ.get("PARAKEET_BOOST_PHRASES", "")
+    phrases = DEFAULT_BOOST_PHRASES.copy()
+    if env_value.strip():
+        phrases.extend(
+            value.strip()
+            for value in re.split(r"[\n,]+", env_value)
+            if value.strip()
+        )
+    return list(dict.fromkeys(phrases))
+
+
+def apply_speech_contexts(config) -> None:
+    phrases = boost_phrases()
+    # The public zh-CN CTC streaming endpoint currently stalls when speech_contexts
+    # are attached, so phrase boosts stay opt-in until NVIDIA behavior is stable.
+    if not BOOST_ENABLED:
+        return
+    if not phrases:
+        return
+    context = config.speech_contexts.add()
+    context.phrases.extend(phrases)
+    context.boost = BOOST
 
 
 def make_service(api_key: str) -> riva.client.ASRService:
@@ -220,6 +281,7 @@ def run_streaming_session(session_id: str, session: AsrSession) -> None:
         audio_channel_count=1,
         enable_automatic_punctuation=True,
     )
+    apply_speech_contexts(config)
     streaming_config = riva.client.StreamingRecognitionConfig(
         config=config,
         interim_results=True,
@@ -273,6 +335,7 @@ def transcribe_pcm16(pcm16: bytes) -> tuple[str, int]:
         audio_channel_count=1,
         enable_automatic_punctuation=True,
     )
+    apply_speech_contexts(config)
     streaming_config = riva.client.StreamingRecognitionConfig(
         config=config,
         interim_results=False,
@@ -315,6 +378,10 @@ def health() -> dict:
         "streaming_partials": True,
         "uri": URI,
         "function_id": FUNCTION_ID,
+        "partial_wait_sec": PARTIAL_WAIT_SEC,
+        "boost_phrases": len(boost_phrases()),
+        "boost_enabled": BOOST_ENABLED,
+        "boost": BOOST,
     }
 
 

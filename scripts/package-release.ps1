@@ -687,7 +687,7 @@ Set-Content -Path (Join-Path $packageDir "README.txt") -Encoding UTF8 -Value @(
     "- Launch at login is enabled by default and can be toggled from the tray menu",
     "- Release build does not show a console window",
     "- data\terms\user_terms.json and learned_terms.json will be created on first use",
-    "- Voice modes are separate: Fast, Local Streaming, and Online Streaming; preview.77 defaults to Online Streaming with NVIDIA Parakeet 1.1B RNNT multilingual and does not load local Qwen unless you switch modes",
+    "- Voice modes are separate: Fast, Local Streaming, and Online Streaming; preview.78 defaults to Online Streaming with NVIDIA Parakeet CTC zh-CN and does not load local Qwen unless you switch modes",
     "- You can open config\hud-overlay.toml directly from the tray menu to adjust font size, color, width, and position",
     "- Saving config\hud-overlay.toml hot-reloads the HUD immediately",
     "- New preview packages reuse the latest dist HUD config when available so HUD settings are kept",

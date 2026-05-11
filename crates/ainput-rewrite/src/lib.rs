@@ -27,6 +27,8 @@ const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
     ("千万三asr", "Qwen3-ASR"),
     ("千问三ASR", "Qwen3-ASR"),
     ("千问三asr", "Qwen3-ASR"),
+    ("gpt四o", "GPT-4o"),
+    ("GPT四o", "GPT-4o"),
     ("证确", "正确"),
     ("土字", "吐字"),
     ("强治", "简直"),
@@ -53,8 +55,10 @@ pub fn normalize_transcription(text: &str) -> String {
     let mut current = collapse_whitespace(text);
     current = collapse_known_duplicates(&current);
     current = cleanup_punctuation_spacing(&current);
+    current = repair_misrecognized_chinese_one_words(&current);
     current = normalize_common_text_rewrites(&current);
     current = normalize_chinese_number_sequences(&current);
+    current = repair_misrecognized_chinese_one_words(&current);
     current = merge_spelled_ascii_sequences(&current);
     current = normalize_common_product_names(&current);
     current = normalize_common_text_rewrites(&current);
@@ -232,35 +236,11 @@ fn should_normalize_chinese_number_segment(
     }
 
     let char_count = segment.chars().count();
-    if segment.chars().any(is_chinese_unit_char) {
-        if next.is_some_and(is_ascii_term_char) {
-            return false;
-        }
-        if has_high_unit_bare_digit_tail(segment) {
-            return false;
-        }
-        return char_count >= 2;
-    }
-
-    if char_count >= 2 {
-        return true;
-    }
-
-    previous.is_some_and(is_ascii_term_char) && next.is_some_and(is_ascii_term_char)
-}
-
-fn has_high_unit_bare_digit_tail(segment: &str) -> bool {
-    let Some((index, _)) = segment
-        .char_indices()
-        .filter(|(_, ch)| matches!(ch, '万' | '亿'))
-        .last()
-    else {
+    if char_count < 2 {
         return false;
-    };
+    }
 
-    let tail_start = index + '万'.len_utf8();
-    let tail = &segment[tail_start..];
-    !tail.is_empty() && tail.chars().all(is_chinese_digit_char)
+    segment.chars().all(is_chinese_digit_char) && !next.is_some_and(is_ascii_term_char)
 }
 
 fn normalize_chinese_number_segment(segment: &str) -> Option<String> {
@@ -281,6 +261,59 @@ fn normalize_chinese_number_segment(segment: &str) -> Option<String> {
     }
 
     parse_chinese_number_with_units(segment).map(|value| value.to_string())
+}
+
+fn repair_misrecognized_chinese_one_words(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '1' && should_restore_one_word(&chars, index) {
+            result.push('一');
+            index += 1;
+            continue;
+        }
+        result.push(chars[index]);
+        index += 1;
+    }
+
+    result
+}
+
+fn should_restore_one_word(chars: &[char], index: usize) -> bool {
+    let Some(next) = chars.get(index + 1).copied() else {
+        return false;
+    };
+    let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
+    if previous.is_some_and(|ch| ch.is_ascii_alphanumeric()) {
+        return false;
+    }
+    matches!(
+        next,
+        '起' | '边'
+            | '下'
+            | '个'
+            | '种'
+            | '会'
+            | '点'
+            | '直'
+            | '定'
+            | '样'
+            | '些'
+            | '次'
+            | '段'
+            | '条'
+            | '轮'
+            | '块'
+            | '堆'
+            | '层'
+            | '套'
+            | '版'
+            | '句'
+            | '项'
+            | '部'
+    )
 }
 
 fn parse_chinese_number_with_units(segment: &str) -> Option<u64> {
@@ -752,8 +785,26 @@ mod tests {
             "验证码123456"
         );
         assert_eq!(normalize_transcription("今年是二零二六年"), "今年是2026年");
-        assert_eq!(normalize_transcription("一百二十三个"), "123个");
+        assert_eq!(normalize_transcription("一百二十三个"), "一百二十三个");
         assert_eq!(normalize_transcription("g p t 四 o 模式"), "GPT-4o 模式");
+    }
+
+    #[test]
+    fn normalize_transcription_keeps_natural_chinese_one_words() {
+        assert_eq!(normalize_transcription("等会儿一起修"), "等会儿一起修");
+        assert_eq!(normalize_transcription("等会儿1起修"), "等会儿一起修");
+        assert_eq!(
+            normalize_transcription("一边识别一边显示"),
+            "一边识别一边显示"
+        );
+        assert_eq!(
+            normalize_transcription("1边识别1边显示最新的1边"),
+            "一边识别一边显示最新的一边"
+        );
+        assert_eq!(
+            normalize_transcription("一战中是一名作者"),
+            "一战中是一名作者"
+        );
     }
 
     #[test]
