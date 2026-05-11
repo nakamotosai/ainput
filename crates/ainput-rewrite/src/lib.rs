@@ -21,6 +21,10 @@ const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
     ("cloud opus", "Claude Opus"),
     ("google gemini", "Google Gemini"),
     ("google germany", "Google Gemini"),
+    ("open ai", "OpenAI"),
+    ("gate hub", "GitHub"),
+    ("git hub", "GitHub"),
+    ("github", "GitHub"),
 ];
 const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
     ("千万三ASR", "Qwen3-ASR"),
@@ -34,6 +38,12 @@ const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
     ("扣得次", "Codex"),
     ("扣得斯", "Codex"),
     ("扣得思", "Codex"),
+    ("扣袋", "Codex"),
+    ("扣带", "Codex"),
+    ("扣戴", "Codex"),
+    ("AIAPICLI", "AI API CLI"),
+    ("Aiapicli", "AI API CLI"),
+    ("aiapicli", "AI API CLI"),
     ("api", "API"),
     ("cli", "CLI"),
     ("json", "JSON"),
@@ -72,6 +82,7 @@ pub fn normalize_transcription(text: &str) -> String {
     let mut current = collapse_whitespace(text);
     current = collapse_known_duplicates(&current);
     current = cleanup_punctuation_spacing(&current);
+    current = repair_compacted_ascii_code_switch_terms(&current);
     current = repair_misrecognized_chinese_one_words(&current);
     current = normalize_common_text_rewrites(&current);
     current = normalize_chinese_number_sequences(&current);
@@ -80,6 +91,7 @@ pub fn normalize_transcription(text: &str) -> String {
     current = normalize_common_product_names(&current);
     current = normalize_common_text_rewrites(&current);
     current = repair_isolated_ascii_tail_artifacts(&current);
+    current = repair_ascii_punctuation_spacing(&current);
 
     current.trim().to_string()
 }
@@ -92,6 +104,8 @@ pub fn normalize_streaming_preview(text: &str) -> String {
 
 pub fn repair_parakeet_code_switch_terms(text: &str) -> String {
     let trimmed = text.trim();
+    let contextual = repair_contextual_multi_mishears(trimmed);
+    let trimmed = contextual.trim();
     let repaired = match trimmed {
         "因为我之前禁用。" => Some("因为我之前禁用 multi。"),
         "因为我之前禁用" => Some("因为我之前禁用 multi"),
@@ -207,6 +221,45 @@ fn cleanup_punctuation_spacing(text: &str) -> String {
     }
 
     result
+}
+
+fn repair_ascii_punctuation_spacing(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch == ' '
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| matches!(next, '.' | ','))
+        {
+            continue;
+        }
+        result.push(ch);
+    }
+
+    result
+}
+
+fn repair_compacted_ascii_code_switch_terms(text: &str) -> String {
+    let mut current = text.to_string();
+    for (spoken, canonical) in [
+        ("Open AIAPICLI Gate Hub", "OpenAI API CLI GitHub"),
+        ("Open AIAPICLI Git Hub", "OpenAI API CLI GitHub"),
+        ("Open AIAPICLI Github", "OpenAI API CLI GitHub"),
+        ("Open AI APICLI Gate Hub", "OpenAI API CLI GitHub"),
+        ("Open AI APICLI Git Hub", "OpenAI API CLI GitHub"),
+        ("Open AI API CLI Gate Hub", "OpenAI API CLI GitHub"),
+        ("open aiapicli gate hub", "OpenAI API CLI GitHub"),
+        ("open aiapicli git hub", "OpenAI API CLI GitHub"),
+        ("AIAPICLI Gate Hub", "AI API CLI GitHub"),
+        ("AIAPICLI Git Hub", "AI API CLI GitHub"),
+        ("APICLI Gate Hub", "API CLI GitHub"),
+        ("APICLI Git Hub", "API CLI GitHub"),
+    ] {
+        current = replace_case_insensitive_ascii_phrase(&current, spoken, canonical);
+    }
+    current
 }
 
 fn merge_spelled_ascii_sequences(text: &str) -> String {
@@ -471,6 +524,36 @@ fn normalize_common_text_rewrites(text: &str) -> String {
     for (spoken, canonical) in COMMON_TEXT_REWRITES {
         current = current.replace(spoken, canonical);
     }
+    current
+}
+
+fn repair_contextual_multi_mishears(text: &str) -> String {
+    let mut current = text.to_string();
+
+    for (spoken, canonical) in [
+        ("之前竟用猫底模型", "之前禁用 multi 模型"),
+        ("之前竟用某体模型", "之前禁用 multi 模型"),
+        ("之前禁用猫底模型", "之前禁用 multi 模型"),
+        ("之前禁用某体模型", "之前禁用 multi 模型"),
+        ("之前竟用猫底", "之前禁用 multi"),
+        ("之前竟用某体", "之前禁用 multi"),
+        ("之前禁用猫底", "之前禁用 multi"),
+        ("之前禁用某体", "之前禁用 multi"),
+    ] {
+        current = current.replace(spoken, canonical);
+    }
+
+    for (spoken, canonical) in [
+        ("猫底模型根本就不支持中文", "multi 模型根本就不支持中文"),
+        ("某体模型根本就不支持中文", "multi 模型根本就不支持中文"),
+        ("猫底根本就不支持中文", "multi 模型根本就不支持中文"),
+        ("某体根本就不支持中文", "multi 模型根本就不支持中文"),
+    ] {
+        if current.contains("不支持中文") {
+            current = current.replace(spoken, canonical);
+        }
+    }
+
     current
 }
 
@@ -891,11 +974,19 @@ mod tests {
             "我让Codex重新想方案"
         );
         assert_eq!(
+            normalize_transcription("我让扣袋重新想方案"),
+            "我让Codex重新想方案"
+        );
+        assert_eq!(
             normalize_transcription("给扣的次下达一个指令"),
             "给Codex下达一个指令"
         );
         assert_eq!(normalize_transcription("git hub 上面"), "GitHub 上面");
         assert_eq!(normalize_transcription("open ai api"), "OpenAI API");
+        assert_eq!(
+            normalize_transcription("Open AIAPICLI Gate Hub ."),
+            "OpenAI API CLI GitHub."
+        );
         assert_eq!(normalize_transcription("hot 上面"), "HUD 上面");
         assert_eq!(normalize_transcription("hut 上面"), "HUD 上面");
     }
@@ -913,6 +1004,10 @@ mod tests {
         assert_eq!(
             repair_parakeet_code_switch_terms("因为我之前竟用猫底。"),
             "因为我之前禁用 multi。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("因为我之前竟用猫底模型根本就不支持中文。"),
+            "因为我之前禁用 multi 模型根本就不支持中文。"
         );
         assert_eq!(
             repair_parakeet_code_switch_terms("某体模型根本就不支持中文。"),

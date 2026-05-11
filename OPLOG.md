@@ -1,5 +1,35 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.81：补上 preview.80 漏掉的真实混说输出
+
+- 背景：用户实测反馈 `.80` “跟没改一模一样”，并怀疑是否拉起旧版本。先核实真实运行面后确认：`.80` 当时确实已经是 Windows 交互桌面 SessionId=1 的运行进程，HKCU Run 和 `run-ainput.bat` 也都指向 `.80`。
+- 根因：不是版本没更新，而是 `.80` 规则太窄。它覆盖了部分拆开的 `multi / Codex / OpenAI / API / CLI / GitHub` 形态，但漏掉用户真实 ASR 输出的连写形态：`之前竟用猫底模型根本就不支持中文`、`扣袋`、`Open AIAPICLI Gate Hub .`。
+- 保持：不切模型、不切部署、不使用 `multi`；仍使用 `nvidia/parakeet-ctc-0_6b-zh-cn`，function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`，`language=zh-CN`。
+- 修复：应用侧新增 `扣袋 / 扣带 / 扣戴 -> Codex`。
+- 修复：应用侧新增 `Open AIAPICLI Gate Hub . -> OpenAI API CLI GitHub.`、`Gate Hub -> GitHub` 等紧凑英文术语修复，并清理 ASCII 句号前空格。
+- 修复：应用侧新增上下文修复，把 `之前竟用猫底模型根本就不支持中文` 这类输出修成 `之前禁用 multi 模型根本就不支持中文`。
+- 保护：`你这套方案是有问题的。` 和普通中文负例保持不变，避免为了 code-switch 误伤中文主路径。
+- 入口：`run-ainput.bat`、HKCU Run、当前 Windows 交互桌面进程都已指向 `dist\ainput-1.0.0-preview.81\ainput-desktop.exe`。
+- 回滚：如果用户实测中文体感变差，优先回滚到冻结基线 `1.0.0-preview.78`。
+
+验证：
+
+- `cargo fmt --all -- --check` 已通过。
+- `cargo test -p ainput-rewrite` 已通过，20/20 passed，覆盖用户反馈的三条真实失败输出和中文负例。
+- `cargo test -p ainput-desktop online_parakeet -- --nocapture` 已通过，1/1 passed。
+- debug exe 通过 `scripts\run-online-code-switch-replay.ps1 -ExePath .\target\debug\ainput-desktop.exe -RawDir .\tmp\preview79-code-switch-raw`。
+- dist exe 通过同一回放脚本，`-ExePath .\dist\ainput-1.0.0-preview.81\ainput-desktop.exe`。
+- CLI 直接验证：`因为我之前竟用猫底模型根本就不支持中文。` 输出 `因为我之前禁用 multi 模型根本就不支持中文。`。
+- CLI 直接验证：`我让扣袋重新想方案。` 输出 `我让Codex重新想方案。`。
+- CLI 直接验证：`Open AIAPICLI Gate Hub .` 输出 `OpenAI API CLI GitHub.`。
+- CLI 直接验证：`你这套方案是有问题的。` 保持不变。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.81` 已通过，产出 `dist\ainput-1.0.0-preview.81\` 与 `dist\ainput-1.0.0-preview.81.zip`。
+- Windows live process: `C:\Users\sai\ainput\dist\ainput-1.0.0-preview.81\ainput-desktop.exe`，`SessionId=1`，StartTime `2026/05/11 17:29:00`。
+
+未覆盖：
+
+- 我无法替用户做真人麦克风主观体感验收；`.81` 已覆盖用户反馈的 `.80` 真实输出，但自由混说仍需要用户实测。
+
 ## 2026-05-11 打包 1.0.0-preview.80：zh-CN Parakeet 安全中英混说修复
 
 - 目标：不切模型、不切部署、不使用 `multi`，在 `nvidia/parakeet-ctc-0_6b-zh-cn` + `language=zh-CN` 当前链路上改善中英混说短英文岛，同时保护用户已经满意的中文识别体感。

@@ -1,5 +1,33 @@
 # ainput DECISIONS
 
+## D-026 preview.81 必须以用户真实 ASR 输出作为 code-switch 回归样本
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户实测确认 `.80` “跟没改一模一样”。排查后确认 `.80` 当时确实是 live 进程，问题不是拉起旧版本，而是 `.80` 的修复样本和用户真实输出不一致。
+- `.80` 只覆盖较窄的拆分短语；真实失败输出是连写和错分词形态，例如 `因为我之前竟用猫底模型根本就不支持中文。`、`我让扣袋重新想方案。`、`Open AIAPICLI Gate Hub .`。
+- 用户已经明确不能换模型和部署，且 `multi` 模型中文不可用；修复只能继续在当前 zh-CN CTC 链路上做保守后处理。
+- `preview.78` 中文体感仍是冻结基线，任何新增修复都必须保护普通中文负例。
+
+决策：
+
+- `preview.81` 保持在线 ASR 模型、function id、`language=zh-CN`、vps-jp sidecar 部署和 preview.80 的低强度 speech context 不变。
+- 应用侧 code-switch 修复必须把用户真实 ASR 输出作为一等回归样本，而不是只凭推测词形补规则。
+- 新增 `扣袋 / 扣带 / 扣戴 -> Codex`，新增 `Open AIAPICLI Gate Hub . -> OpenAI API CLI GitHub.`，新增 `之前竟用猫底模型... -> 之前禁用 multi 模型...` 等精确上下文修复。
+- 对 `multi / Codex / OpenAI / API / CLI / GitHub` 这类术语的修复继续保持窄范围；中文普通句子和中文负例必须保持原样。
+- 每次打包必须验证 debug exe 和 dist exe，而不只跑库测试，避免“源码改了但真实 exe 没变”的误判。
+
+放弃：
+
+- 不把 `.80` 失败归因成旧进程；真实证据已经证明当时 `.80` 运行面正确。
+- 不切到 `language=multi` 或多语言 RNNT。
+- 不做广泛中文语义纠错，不让后处理猜用户所有中文意思。
+
+---
+
 ## D-025 preview.80 在 zh-CN CTC 上做保守 code-switch 修复
 
 - 日期：2026-05-11

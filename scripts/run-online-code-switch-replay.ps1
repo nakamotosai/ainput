@@ -135,6 +135,12 @@ $textCases = @(
         expected_repaired = "因为我之前禁用 multi。"
     },
     [pscustomobject]@{
+        id = "text_live_multi_catdi_model_joined"
+        raw_text = "因为我之前竟用猫底模型根本就不支持中文。"
+        expected_contains = "multi 模型"
+        expected_repaired = "因为我之前禁用 multi 模型根本就不支持中文。"
+    },
+    [pscustomobject]@{
         id = "text_new_multi_mouti_model"
         raw_text = "某体模型根本就不支持中文。"
         expected_contains = "multi 模型"
@@ -145,6 +151,12 @@ $textCases = @(
         raw_text = "我让扣代斯重新想方案"
         expected_contains = "Codex"
         expected_repaired = "我让Codex重新想方案"
+    },
+    [pscustomobject]@{
+        id = "text_live_codex_koudai"
+        raw_text = "我让扣袋重新想方案。"
+        expected_contains = "Codex"
+        expected_repaired = "我让Codex重新想方案。"
     },
     [pscustomobject]@{
         id = "text_pure_chinese_unchanged"
@@ -163,6 +175,12 @@ $textCases = @(
         raw_text = "open ai api cli git hub"
         expected_contains = "OpenAI API CLI GitHub"
         expected_repaired = "OpenAI API CLI GitHub"
+    },
+    [pscustomobject]@{
+        id = "text_live_compacted_english_terms"
+        raw_text = "Open AIAPICLI Gate Hub ."
+        expected_contains = "OpenAI API CLI GitHub"
+        expected_repaired = "OpenAI API CLI GitHub."
     }
 )
 
