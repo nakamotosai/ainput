@@ -4674,7 +4674,8 @@ fn resolve_final_streaming_commit(
 
 fn finalize_streaming_commit_text(text: &str) -> String {
     let normalized = ainput_rewrite::normalize_transcription(text);
-    apply_streaming_punctuation_cleanup(&normalized)
+    let repaired = ainput_rewrite::repair_parakeet_code_switch_terms(&normalized);
+    apply_streaming_punctuation_cleanup(&repaired)
 }
 
 fn finalize_qwen_streaming_commit_text(text: &str) -> String {
@@ -7114,6 +7115,7 @@ fn prepare_streaming_output_text(
     }
 
     let normalized = ainput_rewrite::normalize_transcription(final_text);
+    let normalized = ainput_rewrite::repair_parakeet_code_switch_terms(&normalized);
     let prepared = if rewrite_enabled {
         apply_streaming_punctuation_content_safe(&normalized, punctuator, true)
     } else {
@@ -8265,6 +8267,17 @@ mod tests {
         assert_eq!(
             finalize_streaming_commit_text("强距就是灾难的标点，符号都不对I 。"),
             "简直就是灾难的标点符号都不对。"
+        );
+    }
+
+    #[test]
+    fn streaming_output_text_repairs_online_codex_proof_case() {
+        let (prepared, source) = prepare_streaming_output_text("让 codex 改这", false, None);
+        assert_eq!(prepared, "让 Codex 改这里");
+        assert_eq!(source, StreamingCommitSource::StreamingTailRepair);
+        assert_eq!(
+            finalize_streaming_commit_text("让Codex改这。"),
+            "让 Codex 改这里。"
         );
     }
 

@@ -1,5 +1,32 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.83：Codex 先行的中英混合 8/10 基准
+
+- 背景：用户要求不要切模型、不要换部署、不要使用 `multi`；必须先拿 `03-codex.wav` 单项证明路线可行，如果 Codex 多轮仍无法修好就停止汇报。
+- 保持：在线 ASR 仍使用 `nvidia/parakeet-ctc-0_6b-zh-cn`，function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`，`language=zh-CN`；不启用 AI rewrite 热路径。
+- 修复：新增 `scripts\run-mixed-terms-baseline.ps1`，支持 `-OnlyTerm Codex`、`-MinPass 8`、`-Repeat 2`，固定使用 `user-voice-corpus\baselines\mixed-terms-2026-05-11-200101`。
+- 修复：Codex 单项先通过后，才扩展到 HUD、Claude Code、OpenAI、GitHub、CPA、token、VPS 等低风险固定模板修复。
+- 保护：JSON 与 Gemini 没有强行追满分；`把这项发给我` 这类普通中文高歧义句不做全局 `JSON` 替换。
+- 入口：`run-ainput.bat`、HKCU Run、当前 Windows 交互桌面进程都已指向 `dist\ainput-1.0.0-preview.83\ainput-desktop.exe`。
+- 回滚：如果用户实测中文体感变差，优先回滚到冻结基线 `1.0.0-preview.78`；如果只怀疑本轮 mixed-term repair，可对照 `.82`。
+
+验证：
+
+- `cargo test -p ainput-rewrite -- --nocapture` 已通过，22/22 passed。
+- `cargo test -p ainput-desktop streaming_output_text_repairs_online_codex_proof_case -- --nocapture` 已通过。
+- `cargo test -p ainput-desktop final_commit_text_repairs_display_selected_i_and_punctuation_artifacts -- --nocapture` 已通过。
+- `cargo build -p ainput-desktop` 已通过。
+- 源码 exe `run-mixed-terms-baseline.ps1 -OnlyTerm Codex -MinPass 1` 已通过。
+- 源码 exe `run-mixed-terms-baseline.ps1 -MinPass 8` 已通过，8/10，behavior failures = 0。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.83` 已通过，产出 `dist\ainput-1.0.0-preview.83\` 与 `dist\ainput-1.0.0-preview.83.zip`。
+- 打包 exe `run-mixed-terms-baseline.ps1 -OnlyTerm Codex -MinPass 1` 已通过，1/1，behavior failures = 0。
+- 打包 exe `run-mixed-terms-baseline.ps1 -MinPass 8 -Repeat 2` 已通过，连续两轮均为 8/10，behavior failures = 0；固定失败项为 JSON 和 Gemini。
+- Windows live process: `C:\Users\sai\ainput\dist\ainput-1.0.0-preview.83\ainput-desktop.exe`，`SessionId=1`。
+
+未覆盖：
+
+- 用户自由口述主观中文体感仍需要用户实测；本轮验收范围是固定 10 条真实录音基准达到 8/10。
+
 ## 2026-05-11 打包 1.0.0-preview.82：自动保存用户真实录音语料
 
 - 背景：用户要求以后真实测试不要再只靠临时样本或推测文本，而是每次正式录音后自动留下真实声音，方便后续随机抽样做回归。

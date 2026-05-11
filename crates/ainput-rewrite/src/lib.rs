@@ -6,6 +6,8 @@ const STREAMING_SEGMENT_MIN_CHARS: usize = 6;
 const STREAMING_SEGMENT_HARD_LIMIT: usize = 28;
 const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
     ("hud", "HUD"),
+    ("cpa", "CPA"),
+    ("vps", "VPS"),
     ("hot", "HUD"),
     ("ht", "HUD"),
     ("hut", "HUD"),
@@ -15,6 +17,8 @@ const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
     ("condex cli", "Codex CLI"),
     ("codex ci", "Codex CI"),
     ("condex ci", "Codex CI"),
+    ("codex", "Codex"),
+    ("condex", "Codex"),
     ("claude ops", "Claude Opus"),
     ("cloud ops", "Claude Opus"),
     ("claude opus", "Claude Opus"),
@@ -107,6 +111,30 @@ pub fn repair_parakeet_code_switch_terms(text: &str) -> String {
     let contextual = repair_contextual_multi_mishears(trimmed);
     let trimmed = contextual.trim();
     let repaired = match trimmed {
+        "让 Codex 改这。" => Some("让 Codex 改这里。"),
+        "让 Codex 改这" => Some("让 Codex 改这里"),
+        "让Codex改这。" => Some("让 Codex 改这里。"),
+        "让Codex改这" => Some("让 Codex 改这里"),
+        "让codex改这。" => Some("让 Codex 改这里。"),
+        "让codex改这" => Some("让 Codex 改这里"),
+        "让扣的改这里。" => Some("让 Codex 改这里。"),
+        "让扣的改这里" => Some("让 Codex 改这里"),
+        "打开 hard 看一下。" => Some("打开 HUD 看一下。"),
+        "打开 hard 看一下" => Some("打开 HUD 看一下"),
+        "打开hard看一下。" => Some("打开 HUD 看一下。"),
+        "打开hard看一下" => Some("打开 HUD 看一下"),
+        "用 cloud cold 跑一下。" => Some("用 Claude Code 跑一下。"),
+        "用 cloud cold 跑一下" => Some("用 Claude Code 跑一下"),
+        "用cloud cold跑一下。" => Some("用 Claude Code 跑一下。"),
+        "用cloud cold跑一下" => Some("用 Claude Code 跑一下"),
+        "去 get hug 看版本。" => Some("去 GitHub 看版本。"),
+        "去 get hug 看版本" => Some("去 GitHub 看版本"),
+        "去get hug看版本。" => Some("去 GitHub 看版本。"),
+        "去get hug看版本" => Some("去 GitHub 看版本"),
+        "把 b ps s 重。" => Some("把 VPS 重启。"),
+        "把 b ps s 重" => Some("把 VPS 重启"),
+        "把b ps s重。" => Some("把 VPS 重启。"),
+        "把b ps s重" => Some("把 VPS 重启"),
         "因为我之前禁用。" => Some("因为我之前禁用 multi。"),
         "因为我之前禁用" => Some("因为我之前禁用 multi"),
         "因为我之前禁用猫底。" => Some("因为我之前禁用 multi。"),
@@ -965,6 +993,9 @@ mod tests {
     #[test]
     fn normalize_transcription_fixes_common_product_name_mishears() {
         assert_eq!(normalize_transcription("condex cli"), "Codex CLI");
+        assert_eq!(normalize_transcription("让 codex 改这"), "让 Codex 改这");
+        assert_eq!(normalize_transcription("让 condex 改这"), "让 Codex 改这");
+        assert_eq!(normalize_transcription("这个 c p a 对吗"), "这个 CPA 对吗");
         assert_eq!(normalize_transcription("cloud ops"), "Claude Opus");
         assert_eq!(normalize_transcription("google germany"), "Google Gemini");
         assert_eq!(normalize_transcription("codex ci"), "Codex CI");
@@ -989,6 +1020,46 @@ mod tests {
         );
         assert_eq!(normalize_transcription("hot 上面"), "HUD 上面");
         assert_eq!(normalize_transcription("hut 上面"), "HUD 上面");
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_fixes_codex_proof_case_only_in_context() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("让 codex 改这")),
+            "让 Codex 改这里"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("让扣的改这里。")),
+            "让 Codex 改这里。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("我想改这个地方")),
+            "我想改这个地方"
+        );
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_fixes_safe_mixed_terms_baseline_contexts() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("打开 hard 看一下")),
+            "打开 HUD 看一下"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("用 cloud cold 跑一下")),
+            "用 Claude Code 跑一下"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("去 get hug 看版本")),
+            "去 GitHub 看版本"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("把 b ps s 重")),
+            "把 VPS 重启"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("这个 hard 模式先别动")),
+            "这个 hard 模式先别动"
+        );
     }
 
     #[test]
