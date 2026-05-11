@@ -2,19 +2,20 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前实测候选版本：`1.0.0-preview.81`；中文体感冻结基线仍是 `1.0.0-preview.78`（`1.0.0-preview.77` 多语言 RNNT 因中文实时识别严重漂移，已从 live 默认回滚）
+当前实测候选版本：`1.0.0-preview.82`；中文体感冻结基线仍是 `1.0.0-preview.78`（`1.0.0-preview.77` 多语言 RNNT 因中文实时识别严重漂移，已从 live 默认回滚）
 
 本 README 是本项目唯一当前进度标准。
 
-## 当前实测候选：1.0.0-preview.81
+## 当前实测候选：1.0.0-preview.82
 
 - 发布时间：2026-05-11。
-- 目标：不换模型、不换部署、不使用 `multi` 模型，在现有 `nvidia/parakeet-ctc-0_6b-zh-cn` + `language=zh-CN` 链路上修复用户实测 `.80` 仍失败的真实中英混说输出。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.81\ainput-desktop.exe`。
-- 当前包：`dist\ainput-1.0.0-preview.81\` 与 `dist\ainput-1.0.0-preview.81.zip`。
+- 目标：不换模型、不换部署、不使用 `multi` 模型，在保留 `.81` code-switch 修复的基础上自动沉淀用户真实录音，给后续回归测试使用。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.82\ainput-desktop.exe`。
+- 当前包：`dist\ainput-1.0.0-preview.82\` 与 `dist\ainput-1.0.0-preview.82.zip`。
 - 当前在线模型：`nvidia/parakeet-ctc-0_6b-zh-cn`，function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`，`language=zh-CN`。
 - 当前 sidecar：`boost_enabled=true`，`boost=4.0`，词表来自 `sidecars\parakeet_code_switch_terms.json`，只放 Riva 可编码的低风险英文术语。
-- 当前应用侧修复：`.80` 已确认实际在跑，但规则只覆盖拆开的短片段，未覆盖 `之前竟用猫底模型根本就不支持中文`、`扣袋`、`Open AIAPICLI Gate Hub .` 这类真实连写输出；`.81` 把这些真实失败句加入精确后处理和回归。
+- 当前应用侧修复：`.81` 已把 `.80` 漏掉的真实失败句加入精确后处理和回归；`.82` 不改识别链路，只新增真实录音保存。
+- 当前真实录音语料：正式录音会写入 `C:\Users\sai\ainput\user-voice-corpus\streaming-raw-captures\`，最多保存 `1000` 条；满额后跳过新增，不删除旧样本。
 - 回滚点：如果用户实测中文体感变差，优先回到 `1.0.0-preview.78`；如果只怀疑 speech context boost，可先在 sidecar 环境禁用 `PARAKEET_ENABLE_SPEECH_CONTEXTS`。
 
 ## 冻结基线：1.0.0-preview.78
@@ -35,6 +36,7 @@
 - `在线流式识别` 是第三个独立模式：默认走 `vps-jp` NVIDIA Parakeet adapter，不加载本地 Qwen；松开 `Ctrl` 时如果 HUD 已有文本，先立刻粘贴 HUD snapshot，再后台 finish/cleanup。
 - `本地流式识别` 恢复为本机 Qwen/Sherpa 配置面，`qwen3_sidecar` 不再被在线 Parakeet backend 覆盖。
 - `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
+- `1.0.0-preview.82` 新增稳定真实录音语料库：每次正式语音录制结束后写入 `user-voice-corpus\streaming-raw-captures\`，后续 raw-corpus 测试优先从这里随机抽样。
 - `1.0.0-preview.81` 在不换模型/部署的前提下修复用户实测 `.80` 仍失败的真实连写形态：`猫底模型 -> multi 模型`、`扣袋 -> Codex`、`Open AIAPICLI Gate Hub . -> OpenAI API CLI GitHub.`。
 - `1.0.0-preview.80` 在不换模型/部署的前提下尝试修复中英混说短英文岛；已确认真实进程运行过，但规则太窄，未命中用户实测连写输出。
 - `1.0.0-preview.78` 默认回到 `nvidia/parakeet-ctc-0_6b-zh-cn`，在线 adapter `partial_wait_sec` 收紧到 `0.06s`，并只使用 vps-jp Codex 用户指令历史里的高频英文词做 speech context boost。
@@ -58,7 +60,7 @@
 - 托盘右键菜单现在会直接显示当前版本号。
 - AI rewrite 不属于 V19：本版流式主链路会绕开/隔离已有改写代码，改写能力移到 Roadmap / Future Work。
 - 新增 `scripts\prune-artifacts.ps1`，可以清掉历史 `dist` / `target*` 构建垃圾，同时保留当前版本和一个回滚版本。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.81\` 与 `dist\ainput-1.0.0-preview.81.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.82\` 与 `dist\ainput-1.0.0-preview.82.zip`。
 
 它不做系统级 IME。当前默认热路径由本地 ASR/HUD 单链路负责；AI rewrite 暂不参与 V19 语音提交链路。当前重点是把四条前台主链路做稳：
 
@@ -115,7 +117,8 @@
   - 可从托盘右键菜单直接打开 `HUD 参数文档`
   - `config\hud-overlay.toml` 保存后会自动热加载
   - 松开热键后只停止继续收麦克风；HUD 会继续等待队列音频和 ASR 输出 drain，drain 完成后粘贴 HUD 文本一次并关闭
-  - 流式模式会异步保存每次按住说话的原始录音到 `logs\streaming-raw-captures\`，自动只保留最近 `20` 组 wav + json
+  - 流式模式会异步保存每次按住说话的原始录音到 `logs\streaming-raw-captures\`，自动只保留最近 `20` 组 wav + json，供短期调试使用
+  - 正式语音录制还会保存到项目级 `user-voice-corpus\streaming-raw-captures\`，供后续真实录音回归测试随机抽样；该目录最多 `1000` 条 wav，满额后只跳过新增，不自动删除
   - 语音热键可配置
   - 自动直贴失败时，可按配置降级到剪贴板
   - 普通输入框与终端输入区使用不同句号策略
@@ -504,12 +507,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.81\`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.82\`
 - 默认启动模式是 `在线流式识别`
 - 当前源码在线流式主链是：`NVIDIA Parakeet CTC zh-CN online adapter + ASR-facing mono/16k + HUD truth state + responsive chunk feed + immediate HUD snapshot paste + background finish`
 - 默认热路径由本地 ASR/HUD 单链路负责；V19 不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本
 - AI rewrite 已从当前版本范围移出；V19 只保证已有改写代码不会改 HUD truth 或最终上屏文本
-- `preview.81` 是基于用户实测 `.80` 失败句子的保守中英混说修复候选；`preview.78` 是中文体感冻结基线和快速回滚点；`preview.77` 是失败的多语言 RNNT 实验包；`preview.76` 是中文 CTC 在线模式回滚点；`preview.72` 仍是本机 Qwen 回滚点
+- `preview.82` 是在 `preview.81` 保守中英混说修复候选基础上新增真实录音语料自动保存的版本；`preview.78` 是中文体感冻结基线和快速回滚点；`preview.77` 是失败的多语言 RNNT 实验包；`preview.76` 是中文 CTC 在线模式回滚点；`preview.72` 仍是本机 Qwen 回滚点
 - `preview.71` 会泄漏 Qwen context 到 HUD，不建议作为回滚点；需要回滚时优先回到最后一个已验证可接受的旧包并重新验证真实麦克风链路
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
@@ -521,6 +524,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 - 未来任何 AI rewrite 都不能绕过 HUD truth 规则：上屏文本必须来自用户可见的最终 HUD 文本。
 
 ## 本轮收口验证
+
+2026-05-11 preview.82 real user voice corpus:
+
+- 目标：不修改模型、部署、function id、`language=zh-CN` 或 `.81` 的 code-switch 后处理，只新增用户真实录音自动留样。
+- 修复：流式热键、sidecar fast commit、极速语音热键和 `record-once` 录音结束后会写入项目级 `user-voice-corpus\streaming-raw-captures\`。
+- 保护：现有 `logs\streaming-raw-captures\` 仍是短期调试目录，只保留最近 `20` 组 wav + json；长期用户语料目录最多 `1000` 条 wav，满额后跳过新增，不清理旧样本。
+- 工具：`scripts\run-streaming-raw-corpus.ps1` 默认优先选择 `user-voice-corpus\streaming-raw-captures\`；使用该目录时默认随机抽样，可用 `-Deterministic` 回到短/长样本选择。
+- 验证：`cargo fmt --all -- --check` passed；`cargo test -p ainput-desktop raw_capture -- --nocapture` 2/2 passed；`cargo test -p ainput-desktop user_voice_corpus -- --nocapture` 3/3 passed；`git diff --check` passed；`python .\scripts\readme_closeout_guard.py .` passed。
+- 验证：`scripts\package-release.ps1 -Version 1.0.0-preview.82` 已生成 dist 与 zip；Windows 交互桌面已运行 `dist\ainput-1.0.0-preview.82\ainput-desktop.exe`，`SessionId=1`；`run-ainput.bat` 与 HKCU Run 均指向 preview.82。
+- 验证：包内 `record-once 1` 实测写入 `user-voice-corpus\streaming-raw-captures\`，当前语料目录已有 `1` 组 wav + json，最新 wav `94124` bytes。
+- 验证：`scripts\run-streaming-raw-corpus.ps1` 选择逻辑命中 `raw_dir_source=user_voice_corpus`、`selection_mode=random`、`cases_total=1`。
+- 未覆盖：用户自由口述的主观识别质量仍以后续真实使用为准；`.82` 只负责沉淀真实录音，不改变识别策略。
 
 2026-05-11 preview.81 Parakeet real-output code-switch repair:
 
@@ -924,12 +939,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 接手提示
 
-- 当前运行：`1.0.0-preview.81` 已启动到 Windows 交互桌面，作为中英混说实测候选。
+- 当前运行：`1.0.0-preview.82` 已启动到 Windows 交互桌面，作为真实录音语料自动保存候选。
 - 当前冻结：`1.0.0-preview.78` 已在 2026-05-11 经用户真实使用确认，仍是中文体感冻结基线和快速回滚点。
 - 当前基线：识别速度快、HUD 实时、松手上屏快；后续改动不得用未实测方案覆盖这条已确认链路。
-- 当前进度：`1.0.0-preview.81` 是独立在线流式 ASR 默认版，默认模式为 `online_streaming`，只在 zh-CN CTC 上修复用户实测 `.80` 失败的 code-switch 输出。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.81\ainput-desktop.exe`。
-- 当前包：`dist\ainput-1.0.0-preview.81\` 与 `dist\ainput-1.0.0-preview.81.zip`。
+- 当前进度：`1.0.0-preview.82` 是独立在线流式 ASR 默认版，默认模式为 `online_streaming`，沿用 `.81` 的 zh-CN CTC code-switch 修复，并新增真实录音语料保存。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.82\ainput-desktop.exe`。
+- 当前包：`dist\ainput-1.0.0-preview.82\` 与 `dist\ainput-1.0.0-preview.82.zip`。
+- 当前真实录音语料：`C:\Users\sai\ainput\user-voice-corpus\streaming-raw-captures\`，最多 `1000` 条 wav，后续测试优先从这里随机抽样。
 - 当前主链：在线流式模式按下 `Ctrl` 打开 HUD，按住期间通过 `vps-jp` Parakeet CTC zh-CN adapter 持续返回 partial；松手时 HUD 有文本就立刻粘贴 HUD snapshot，远端 finish/cleanup 后台完成。
 - 回滚点：`dist\ainput-1.0.0-preview.78\` 是当前中文体感快速回滚；`dist\ainput-1.0.0-preview.72\` 保留为本机 Qwen 版本，冻结参数仍是 `gpu_memory_utilization = 0.30` 与 `sidecar_idle_unload_ms = 3600000`。
 - 安全边界：NVIDIA key 只从 `vps-jp` 8317 生产配置读取，不写入 Windows 包；本轮不修改 `cliproxyapi` 8317 生产服务本体。
@@ -938,7 +954,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 ## 当前边界
 
 - 当前流式默认走 `vps-jp` 临时在线 NVIDIA Parakeet adapter；极速语音识别仍保留 SenseVoice 离线整段识别
-- preview.81 没有切模型和部署；沿用 preview.80 的低强度可禁用 speech context，并把用户实测失败的真实输出加入精确后处理
+- preview.82 没有切模型和部署；沿用 preview.81 的低强度可禁用 speech context 和真实输出精确后处理，只新增用户真实录音语料保存
 - 默认流式 ASR 依赖 NVIDIA 在线服务；应用层 AI rewrite 暂不属于当前版本，后续另开独立 spec
 - AI 语义改写已从当前版本范围移出；当前上屏文本只来自 HUD truth snapshot
 - `HUD 即最终结果` 是当前约束；短停顿 endpoint 和 release-time offline final 不能重新接回默认提交链

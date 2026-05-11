@@ -1,5 +1,30 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.82：自动保存用户真实录音语料
+
+- 背景：用户要求以后真实测试不要再只靠临时样本或推测文本，而是每次正式录音后自动留下真实声音，方便后续随机抽样做回归。
+- 保持：不切模型、不切部署、不使用 `multi`；仍使用 `nvidia/parakeet-ctc-0_6b-zh-cn`，function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`，`language=zh-CN`。
+- 修复：新增项目级真实录音语料目录 `user-voice-corpus\streaming-raw-captures\`，流式热键、sidecar fast commit、极速语音热键和 `record-once` 结束后会保存 wav + json。
+- 保护：现有 `logs\streaming-raw-captures\` 仍只作为短期调试目录，保留最近 `20` 组；长期用户语料目录最多 `1000` 条 wav，满额后跳过新增，不删除旧录音。
+- 工具：`scripts\run-streaming-raw-corpus.ps1` 默认优先选择用户真实语料目录；使用该目录时默认随机抽样，仍可用 `-Deterministic` 走旧的短/长样本选择。
+- 入口：`run-ainput.bat`、HKCU Run、当前 Windows 交互桌面进程需要指向 `dist\ainput-1.0.0-preview.82\ainput-desktop.exe`。
+
+验证：
+
+- `cargo fmt --all -- --check` 已通过。
+- `cargo test -p ainput-desktop raw_capture -- --nocapture` 已通过，2/2 passed。
+- `cargo test -p ainput-desktop user_voice_corpus -- --nocapture` 已通过，3/3 passed。
+- `git diff --check` 已通过。
+- `python .\scripts\readme_closeout_guard.py .` 已通过。
+- `scripts\package-release.ps1 -Version 1.0.0-preview.82` 已通过，产出 `dist\ainput-1.0.0-preview.82\` 与 `dist\ainput-1.0.0-preview.82.zip`。
+- Windows live process: `C:\Users\sai\ainput\dist\ainput-1.0.0-preview.82\ainput-desktop.exe`，`SessionId=1`。
+- 包内 `record-once 1` 实测写入 `user-voice-corpus\streaming-raw-captures\`，当前语料计数从 `0` 增至 `1` 组 wav + json，最新 wav `94124` bytes。
+- `scripts\run-streaming-raw-corpus.ps1` 选择逻辑验证通过：默认命中 `raw_dir_source=user_voice_corpus`，`selection_mode=random`，`cases_total=1`。
+
+未覆盖：
+
+- 用户自由口述主观识别质量仍需要用户实测；`.82` 不改变 ASR 识别策略，只沉淀真实音频。
+
 ## 2026-05-11 打包 1.0.0-preview.81：补上 preview.80 漏掉的真实混说输出
 
 - 背景：用户实测反馈 `.80` “跟没改一模一样”，并怀疑是否拉起旧版本。先核实真实运行面后确认：`.80` 当时确实已经是 Windows 交互桌面 SessionId=1 的运行进程，HKCU Run 和 `run-ainput.bat` 也都指向 `.80`。

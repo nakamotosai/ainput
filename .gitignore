@@ -4,6 +4,7 @@
 /.vscode/
 /.codex-backup/
 /logs/
+/user-voice-corpus/
 /dist/
 /runtime/
 /models/

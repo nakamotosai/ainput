@@ -144,6 +144,13 @@ fn try_main() -> Result<()> {
         let recording = ainput_audio::ActiveRecording::start_default_input()?;
         thread::sleep(Duration::from_secs(seconds));
         let audio = recording.stop()?;
+        worker::save_user_voice_corpus_capture_for_raw_dir(
+            runtime
+                .runtime_paths
+                .logs_dir
+                .join("streaming-raw-captures"),
+            &audio,
+        )?;
         let transcription = recognizer.transcribe_samples(
             audio.sample_rate_hz,
             &audio.samples,

@@ -1,5 +1,32 @@
 # ainput DECISIONS
 
+## D-027 preview.82 必须沉淀用户真实录音语料
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户已经明确后续测试要使用自己的真实声音，不能只依赖临时 raw captures、推测文本或少量手工夹具。
+- 当前 `logs\streaming-raw-captures\` 是短期调试缓存，只保留最近 `20` 组，且跟随版本目录漂移，不适合作为长期回归语料。
+- 中英混说问题只有用真实录音反复回放，才能区分“模型确实听错”和“应用层后处理/上屏链路出错”。
+
+决策：
+
+- 新增项目级真实录音语料目录：`user-voice-corpus\streaming-raw-captures\`。
+- 正式语音录制结束后写入该目录；流式热键、sidecar fast commit、极速语音热键和 `record-once` 都纳入保存范围。
+- 长期语料最多保留 `1000` 条 wav；达到上限后跳过新增，不自动删除、不滚动、不清理旧录音。
+- `logs\streaming-raw-captures\` 继续作为短期调试缓存，只保留最近 `20` 组，不承担长期语料职责。
+- 后续 raw-corpus 回归默认优先从 `user-voice-corpus\streaming-raw-captures\` 取样，并支持随机抽样。
+
+放弃：
+
+- 不把真实录音放进版本化 `dist\ainput-*` 目录。
+- 不在本轮迁移或删除既有历史录音。
+- 不借这个版本改模型、改部署、改 `language=zh-CN` 或扩大中英混说后处理范围。
+
+---
+
 ## D-026 preview.81 必须以用户真实 ASR 输出作为 code-switch 回归样本
 
 - 日期：2026-05-11

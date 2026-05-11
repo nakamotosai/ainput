@@ -4,6 +4,9 @@ param(
     [string]$ReportDir = "",
     [int]$ShortCount = 2,
     [int]$LongCount = 2,
+    [int]$RandomCount = 4,
+    [switch]$Random,
+    [switch]$Deterministic,
     [int]$ShortMinBytes = 200000,
     [int]$TailToleranceChars = 1,
     [int]$PunctuationMinDurationMs = 1200
@@ -26,8 +29,45 @@ if (!(Test-Path $ExePath)) {
     throw "missing executable: $ExePath"
 }
 
+function Has-UsableRawWav([string]$CandidateDir, [int]$MinBytes) {
+    if (!(Test-Path $CandidateDir)) {
+        return $false
+    }
+    $first = Get-ChildItem $CandidateDir -Filter "streaming-raw-*.wav" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Length -ge $MinBytes } |
+        Select-Object -First 1
+    return $null -ne $first
+}
+
+function Get-ProjectRootForUserVoiceCorpus([string]$RuntimeRoot) {
+    $leaf = Split-Path -Leaf $RuntimeRoot
+    $parent = Split-Path -Parent $RuntimeRoot
+    if (![string]::IsNullOrWhiteSpace($parent) -and
+        $leaf -like "ainput-*" -and
+        (Split-Path -Leaf $parent) -ieq "dist") {
+        return Split-Path -Parent $parent
+    }
+    return $RuntimeRoot
+}
+
+$rawDirSource = "explicit"
 if ([string]::IsNullOrWhiteSpace($RawDir)) {
-    $RawDir = Join-Path $repoRoot "logs\streaming-raw-captures"
+    $projectRoot = Get-ProjectRootForUserVoiceCorpus $repoRoot
+    $userCorpusRawDir = Join-Path $projectRoot "user-voice-corpus\streaming-raw-captures"
+    $shortTermRawDir = Join-Path $repoRoot "logs\streaming-raw-captures"
+    if (Has-UsableRawWav $userCorpusRawDir $ShortMinBytes) {
+        $RawDir = $userCorpusRawDir
+        $rawDirSource = "user_voice_corpus"
+    } elseif (Has-UsableRawWav $shortTermRawDir $ShortMinBytes) {
+        $RawDir = $shortTermRawDir
+        $rawDirSource = "short_term_logs"
+    } elseif (Test-Path $userCorpusRawDir) {
+        $RawDir = $userCorpusRawDir
+        $rawDirSource = "user_voice_corpus"
+    } else {
+        $RawDir = $shortTermRawDir
+        $rawDirSource = "short_term_logs"
+    }
 }
 if (!(Test-Path $RawDir)) {
     throw "missing raw capture dir: $RawDir"
@@ -176,75 +216,96 @@ if ($allWavs.Count -eq 0) {
     throw "no raw capture wav files large enough for replay found in $RawDir"
 }
 
-$shortCandidates = @($allWavs | Where-Object { $_.Length -ge $ShortMinBytes } | Select-Object -First $ShortCount)
-if ($shortCandidates.Count -lt $ShortCount) {
-    $shortCandidates = @($allWavs | Select-Object -First $ShortCount)
-}
-$shortPaths = @{}
-foreach ($wav in $shortCandidates) {
-    if ($null -ne $wav) {
-        $shortPaths[$wav.FullName] = $true
-    }
-}
-$longCandidates = @(
-    $allWavs |
-        Sort-Object Length -Descending |
-        Where-Object { !$shortPaths.ContainsKey($_.FullName) } |
-        Select-Object -First $LongCount
-)
-if ($longCandidates.Count -lt $LongCount) {
-    $longCandidatePaths = @{}
-    foreach ($wav in $longCandidates) {
+$selected = @{}
+$selectedRoles = @{}
+$useRandomSelection = [bool]$Random -or ((![bool]$Deterministic) -and $rawDirSource -eq "user_voice_corpus")
+$selectionMode = if ($useRandomSelection) { "random" } else { "short_long" }
+
+if ($useRandomSelection) {
+    $takeCount = [Math]::Min($allWavs.Count, [Math]::Max(1, $RandomCount))
+    foreach ($wav in @($allWavs | Get-Random -Count $takeCount)) {
         if ($null -ne $wav) {
-            $longCandidatePaths[$wav.FullName] = $true
+            $selected[$wav.FullName] = $wav
+            $selectedRoles[$wav.FullName] = "random"
+        }
+    }
+} else {
+    $shortCandidates = @($allWavs | Where-Object { $_.Length -ge $ShortMinBytes } | Select-Object -First $ShortCount)
+    if ($shortCandidates.Count -lt $ShortCount) {
+        $shortCandidates = @($allWavs | Select-Object -First $ShortCount)
+    }
+    $shortPaths = @{}
+    foreach ($wav in $shortCandidates) {
+        if ($null -ne $wav) {
+            $shortPaths[$wav.FullName] = $true
         }
     }
     $longCandidates = @(
-        $longCandidates +
-            ($allWavs |
-                Sort-Object Length -Descending |
-                Where-Object { !$longCandidatePaths.ContainsKey($_.FullName) } |
-                Select-Object -First ($LongCount - $longCandidates.Count))
+        $allWavs |
+            Sort-Object Length -Descending |
+            Where-Object { !$shortPaths.ContainsKey($_.FullName) } |
+            Select-Object -First $LongCount
     )
-}
-$selected = @{}
-$selectedRoles = @{}
-foreach ($wav in $shortCandidates) {
-    if ($null -ne $wav) {
-        $selected[$wav.FullName] = $wav
-        $selectedRoles[$wav.FullName] = "short"
+    if ($longCandidates.Count -lt $LongCount) {
+        $longCandidatePaths = @{}
+        foreach ($wav in $longCandidates) {
+            if ($null -ne $wav) {
+                $longCandidatePaths[$wav.FullName] = $true
+            }
+        }
+        $longCandidates = @(
+            $longCandidates +
+                ($allWavs |
+                    Sort-Object Length -Descending |
+                    Where-Object { !$longCandidatePaths.ContainsKey($_.FullName) } |
+                    Select-Object -First ($LongCount - $longCandidates.Count))
+        )
     }
-}
-foreach ($wav in $longCandidates) {
-    if ($null -ne $wav) {
-        $selected[$wav.FullName] = $wav
-        if ($selectedRoles.ContainsKey($wav.FullName)) {
-            $selectedRoles[$wav.FullName] = $selectedRoles[$wav.FullName] + ",long"
-        } else {
-            $selectedRoles[$wav.FullName] = "long"
+    foreach ($wav in $shortCandidates) {
+        if ($null -ne $wav) {
+            $selected[$wav.FullName] = $wav
+            $selectedRoles[$wav.FullName] = "short"
+        }
+    }
+    foreach ($wav in $longCandidates) {
+        if ($null -ne $wav) {
+            $selected[$wav.FullName] = $wav
+            if ($selectedRoles.ContainsKey($wav.FullName)) {
+                $selectedRoles[$wav.FullName] = $selectedRoles[$wav.FullName] + ",long"
+            } else {
+                $selectedRoles[$wav.FullName] = "long"
+            }
+        }
+    }
+    foreach ($wav in @($shortCandidates + $longCandidates)) {
+        if ($null -ne $wav) {
+            $selected[$wav.FullName] = $wav
         }
     }
 }
-foreach ($wav in @($shortCandidates + $longCandidates)) {
-    if ($null -ne $wav) {
-        $selected[$wav.FullName] = $wav
-    }
+$cases = if ($useRandomSelection) {
+    @($selected.Values | Sort-Object Name)
+} else {
+    @($selected.Values | Sort-Object Length)
 }
-$cases = @($selected.Values | Sort-Object Length)
 
 $rows = @()
 $failures = @()
 $selectedShortCount = @($selectedRoles.GetEnumerator() | Where-Object { $_.Value -like "*short*" }).Count
 $selectedLongCount = @($selectedRoles.GetEnumerator() | Where-Object { $_.Value -like "*long*" }).Count
-$minimumDistinctCases = [Math]::Min($allWavs.Count, [Math]::Max(1, $ShortCount) + [Math]::Max(1, $LongCount))
-if ($selectedShortCount -lt 1) {
+$minimumDistinctCases = if ($useRandomSelection) {
+    [Math]::Min($allWavs.Count, [Math]::Max(1, $RandomCount))
+} else {
+    [Math]::Min($allWavs.Count, [Math]::Max(1, $ShortCount) + [Math]::Max(1, $LongCount))
+}
+if (!$useRandomSelection -and $selectedShortCount -lt 1) {
     $failures += [pscustomobject]@{
         case_id = "selection"
         category = "raw_short_sample_missing"
         message = "raw corpus selection did not include any short sample"
     }
 }
-if ($selectedLongCount -lt 1) {
+if (!$useRandomSelection -and $selectedLongCount -lt 1) {
     $failures += [pscustomobject]@{
         case_id = "selection"
         category = "raw_long_sample_missing"
@@ -406,6 +467,8 @@ foreach ($wav in $cases) {
 $summary = [pscustomobject]@{
     overall_status = if ($failures.Count -eq 0) { "pass" } else { "fail" }
     raw_dir = $RawDir
+    raw_dir_source = $rawDirSource
+    selection_mode = $selectionMode
     report_dir = $ReportDir
     cases_total = $cases.Count
     failures = $failures
@@ -417,6 +480,8 @@ $summary | ConvertTo-Json -Depth 8 | Set-Content -Path $summaryPath -Encoding UT
 Write-Host ""
 Write-Host "streaming raw corpus replay"
 Write-Host ("overall_status={0}" -f $summary.overall_status)
+Write-Host ("raw_dir_source={0}" -f $summary.raw_dir_source)
+Write-Host ("selection_mode={0}" -f $summary.selection_mode)
 Write-Host ("cases_total={0}" -f $summary.cases_total)
 Write-Host ("report_dir={0}" -f $ReportDir)
 Write-Host ""

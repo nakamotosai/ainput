@@ -59,6 +59,9 @@ const STREAMING_PUNCTUATION_HARD_MS: u128 = 220;
 const STREAMING_RELEASE_TO_COMMIT_TARGET_MS: u128 = 720;
 const STREAMING_RELEASE_TO_COMMIT_HARD_MS: u128 = 1200;
 const STREAMING_RAW_CAPTURE_LIMIT: usize = 20;
+const STREAMING_USER_VOICE_CORPUS_LIMIT: usize = 1_000;
+const USER_VOICE_CORPUS_DIR_NAME: &str = "user-voice-corpus";
+const STREAMING_RAW_CAPTURE_DIR_NAME: &str = "streaming-raw-captures";
 const AUDIO_ACTIVITY_FRAME_SAMPLES: usize = 320;
 const AUDIO_ACTIVITY_SPEECH_FRAME_RMS: f32 = 0.004;
 const AUDIO_ACTIVITY_FRAME_MS: u64 = 20;
@@ -1147,6 +1150,14 @@ pub(crate) fn push_to_talk_worker(
                                         .send_event(AppEvent::Worker(WorkerEvent::IgnoredSilence));
                                     continue;
                                 }
+
+                                save_user_voice_corpus_capture_async(
+                                    runtime
+                                        .runtime_paths
+                                        .logs_dir
+                                        .join(STREAMING_RAW_CAPTURE_DIR_NAME),
+                                    audio.clone(),
+                                );
 
                                 let _ =
                                     proxy.send_event(AppEvent::Worker(WorkerEvent::Transcribing));
@@ -3092,7 +3103,7 @@ pub(crate) fn probe_streaming_live_session(
     );
     let final_text = ensure_terminal_sentence_boundary(&prepared_commit.final_text);
     let recorded = recording.stop()?;
-    let raw_capture = save_streaming_raw_capture(
+    let raw_capture = save_streaming_raw_capture_with_user_corpus(
         runtime
             .runtime_paths
             .logs_dir
@@ -6688,11 +6699,14 @@ fn current_timestamp_millis() -> u128 {
 
 #[derive(Debug, Serialize)]
 struct StreamingRawCaptureMetadata {
+    capture_kind: String,
     wav_file: String,
     sample_rate_hz: i32,
     source_channels: u16,
     saved_channels: u16,
     samples: usize,
+    source_raw_capture_wav: Option<String>,
+    retention_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -6703,21 +6717,86 @@ struct StreamingRawCaptureSaveResult {
 
 fn save_streaming_raw_capture_async(raw_capture_dir: PathBuf, audio: ainput_audio::RecordedAudio) {
     std::thread::spawn(move || {
-        if let Err(error) = save_streaming_raw_capture(raw_capture_dir, audio) {
+        if let Err(error) = save_streaming_raw_capture_with_user_corpus(raw_capture_dir, audio) {
             tracing::warn!(error = %error, "save streaming raw capture failed");
         }
     });
+}
+
+fn save_user_voice_corpus_capture_async(
+    raw_capture_dir: PathBuf,
+    audio: ainput_audio::RecordedAudio,
+) {
+    std::thread::spawn(move || {
+        if let Err(error) = save_user_voice_corpus_capture_for_raw_dir(raw_capture_dir, &audio) {
+            tracing::warn!(error = %error, "save user voice corpus capture failed");
+        }
+    });
+}
+
+pub(crate) fn save_user_voice_corpus_capture_for_raw_dir(
+    raw_capture_dir: PathBuf,
+    audio: &ainput_audio::RecordedAudio,
+) -> Result<()> {
+    if let Some(user_corpus_dir) = user_voice_corpus_dir_from_raw_capture_dir(&raw_capture_dir) {
+        save_streaming_user_voice_corpus_capture(user_corpus_dir, audio, None)?;
+    }
+    Ok(())
+}
+
+fn save_streaming_raw_capture_with_user_corpus(
+    raw_capture_dir: PathBuf,
+    audio: ainput_audio::RecordedAudio,
+) -> Result<StreamingRawCaptureSaveResult> {
+    let short_term_capture = save_streaming_raw_capture(raw_capture_dir.clone(), audio.clone())?;
+    if let Some(user_corpus_dir) = user_voice_corpus_dir_from_raw_capture_dir(&raw_capture_dir) {
+        match save_streaming_user_voice_corpus_capture(
+            user_corpus_dir,
+            &audio,
+            Some(&short_term_capture.wav_path),
+        ) {
+            Ok(Some(user_capture)) => {
+                tracing::info!(
+                    wav = %user_capture.wav_path.display(),
+                    metadata = %user_capture.json_path.display(),
+                    limit = STREAMING_USER_VOICE_CORPUS_LIMIT,
+                    "streaming user voice corpus capture saved"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "save streaming user voice corpus capture failed");
+            }
+        }
+    }
+    Ok(short_term_capture)
 }
 
 fn save_streaming_raw_capture(
     raw_capture_dir: PathBuf,
     audio: ainput_audio::RecordedAudio,
 ) -> Result<StreamingRawCaptureSaveResult> {
+    save_streaming_raw_capture_to_dir(
+        &raw_capture_dir,
+        &audio,
+        "streaming_short_term",
+        None,
+        Some(STREAMING_RAW_CAPTURE_LIMIT),
+    )
+}
+
+fn save_streaming_raw_capture_to_dir(
+    raw_capture_dir: &Path,
+    audio: &ainput_audio::RecordedAudio,
+    capture_kind: &str,
+    source_raw_capture_wav: Option<&Path>,
+    prune_limit: Option<usize>,
+) -> Result<StreamingRawCaptureSaveResult> {
     if audio.sample_rate_hz <= 0 || audio.samples.is_empty() {
         return Err(anyhow!("streaming raw capture audio was empty"));
     }
 
-    fs::create_dir_all(&raw_capture_dir).with_context(|| {
+    fs::create_dir_all(raw_capture_dir).with_context(|| {
         format!(
             "create streaming raw capture dir {}",
             raw_capture_dir.display()
@@ -6725,10 +6804,11 @@ fn save_streaming_raw_capture(
     })?;
     let stamp = current_timestamp_millis();
     let (_file_stem, wav_path, json_path) =
-        next_streaming_raw_capture_paths(&raw_capture_dir, stamp)?;
+        next_streaming_raw_capture_paths(raw_capture_dir, stamp)?;
     write_mono_i16_wav(&wav_path, audio.sample_rate_hz as u32, &audio.samples)?;
 
     let metadata = StreamingRawCaptureMetadata {
+        capture_kind: capture_kind.to_string(),
         wav_file: wav_path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -6737,6 +6817,8 @@ fn save_streaming_raw_capture(
         source_channels: audio.channels,
         saved_channels: 1,
         samples: audio.samples.len(),
+        source_raw_capture_wav: source_raw_capture_wav.map(|path| path.display().to_string()),
+        retention_limit: prune_limit,
     };
     let metadata_json = serde_json::to_vec_pretty(&metadata)?;
     fs::write(&json_path, metadata_json).with_context(|| {
@@ -6745,17 +6827,95 @@ fn save_streaming_raw_capture(
             json_path.display()
         )
     })?;
-    prune_streaming_raw_captures(&raw_capture_dir, STREAMING_RAW_CAPTURE_LIMIT)?;
+    if let Some(limit) = prune_limit {
+        prune_streaming_raw_captures(raw_capture_dir, limit)?;
+    }
     tracing::info!(
         wav = %wav_path.display(),
         metadata = %json_path.display(),
-        limit = STREAMING_RAW_CAPTURE_LIMIT,
+        limit = ?prune_limit,
+        capture_kind,
         "streaming raw capture saved"
     );
     Ok(StreamingRawCaptureSaveResult {
         wav_path,
         json_path,
     })
+}
+
+fn save_streaming_user_voice_corpus_capture(
+    user_corpus_dir: PathBuf,
+    audio: &ainput_audio::RecordedAudio,
+    source_raw_capture_wav: Option<&Path>,
+) -> Result<Option<StreamingRawCaptureSaveResult>> {
+    if audio.sample_rate_hz <= 0 || audio.samples.is_empty() {
+        return Err(anyhow!("streaming user voice corpus audio was empty"));
+    }
+
+    fs::create_dir_all(&user_corpus_dir).with_context(|| {
+        format!(
+            "create streaming user voice corpus dir {}",
+            user_corpus_dir.display()
+        )
+    })?;
+    let current_count = count_streaming_raw_capture_wavs(&user_corpus_dir)?;
+    if current_count >= STREAMING_USER_VOICE_CORPUS_LIMIT {
+        tracing::info!(
+            dir = %user_corpus_dir.display(),
+            current_count,
+            limit = STREAMING_USER_VOICE_CORPUS_LIMIT,
+            "streaming user voice corpus is full; skip saving new real recording"
+        );
+        return Ok(None);
+    }
+
+    save_streaming_raw_capture_to_dir(
+        &user_corpus_dir,
+        audio,
+        "streaming_user_voice_corpus",
+        source_raw_capture_wav,
+        None,
+    )
+    .map(Some)
+}
+
+fn count_streaming_raw_capture_wavs(raw_capture_dir: &Path) -> Result<usize> {
+    Ok(fs::read_dir(raw_capture_dir)
+        .with_context(|| format!("read raw capture dir {}", raw_capture_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| is_streaming_raw_capture_wav_path(&entry.path()))
+        .count())
+}
+
+fn is_streaming_raw_capture_wav_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("streaming-raw-") && name.ends_with(".wav"))
+}
+
+fn user_voice_corpus_dir_from_raw_capture_dir(raw_capture_dir: &Path) -> Option<PathBuf> {
+    let logs_dir = raw_capture_dir.parent()?;
+    let runtime_root = logs_dir.parent()?;
+    let project_root = if runtime_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("ainput-"))
+        && runtime_root
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("dist"))
+    {
+        runtime_root.parent()?.parent()?
+    } else {
+        runtime_root
+    };
+
+    Some(
+        project_root
+            .join(USER_VOICE_CORPUS_DIR_NAME)
+            .join(STREAMING_RAW_CAPTURE_DIR_NAME),
+    )
 }
 
 fn next_streaming_raw_capture_paths(
@@ -7314,26 +7474,28 @@ mod tests {
         AudioActivity, QwenSidecarSession, QwenStartResponse,
         STREAMING_OFFLINE_FINAL_FULL_AUDIO_MAX_MS, STREAMING_OFFLINE_FINAL_HARD_MS,
         STREAMING_OFFLINE_FINAL_TAIL_WINDOW_MS, STREAMING_RAW_CAPTURE_LIMIT,
-        SidecarStreamingWorkerMode, StreamingCommitSource, StreamingOfflineFinalScope,
-        StreamingResampler, analyze_recent_audio_activity, append_with_suffix_prefix_overlap,
-        apply_qwen_sidecar_partial_update, apply_qwen_sidecar_partial_update_with_mode,
-        apply_streaming_punctuation_cleanup, build_streaming_ai_rewrite_candidate,
-        current_ai_rewrite_tail, dedupe_streaming_punctuation,
-        effective_ai_rewrite_min_visible_chars, ensure_terminal_sentence_boundary,
-        estimate_speech_start_ms, finalize_qwen_streaming_commit_text,
-        finalize_streaming_commit_text, is_ai_rewrite_outcome_current, is_qwen_context_echo_text,
+        STREAMING_USER_VOICE_CORPUS_LIMIT, SidecarStreamingWorkerMode, StreamingCommitSource,
+        StreamingOfflineFinalScope, StreamingResampler, analyze_recent_audio_activity,
+        append_with_suffix_prefix_overlap, apply_qwen_sidecar_partial_update,
+        apply_qwen_sidecar_partial_update_with_mode, apply_streaming_punctuation_cleanup,
+        build_streaming_ai_rewrite_candidate, current_ai_rewrite_tail,
+        dedupe_streaming_punctuation, effective_ai_rewrite_min_visible_chars,
+        ensure_terminal_sentence_boundary, estimate_speech_start_ms,
+        finalize_qwen_streaming_commit_text, finalize_streaming_commit_text,
+        is_ai_rewrite_outcome_current, is_qwen_context_echo_text,
         merge_ai_rewrite_tail_into_current_display, merge_rolled_over_prefix,
         merge_streaming_offline_tail_repair, prepare_streaming_output_text,
         prepare_streaming_pause_boundary_text, prepare_streaming_preview_text,
         push_qwen_input_samples, qwen_fast_release_commit_text, qwen_session_has_partial_truth,
         resolve_streaming_rollover_commit_text, sanitize_ai_rewrite_output,
         sanitize_streaming_generated_punctuation, save_streaming_raw_capture,
+        save_streaming_raw_capture_with_user_corpus, save_streaming_user_voice_corpus_capture,
         select_streaming_commit_text, select_streaming_final_raw_text,
         select_streaming_preview_text, should_drop_low_signal_result,
         should_drop_streaming_preview_result, should_open_qwen_speech_gate,
         should_skip_streaming_preview, streaming_final_quality_failures,
         streaming_offline_final_sample_start, streaming_offline_final_scope,
-        strip_trailing_terminal_sentence_punctuation,
+        strip_trailing_terminal_sentence_punctuation, user_voice_corpus_dir_from_raw_capture_dir,
     };
     use std::fs;
     #[test]
@@ -7830,6 +7992,115 @@ mod tests {
             .count();
         assert_eq!(wav_count, STREAMING_RAW_CAPTURE_LIMIT);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_voice_corpus_saves_without_pruning_short_term_log() {
+        let root = std::env::temp_dir().join(format!(
+            "ainput-user-corpus-save-test-{}",
+            super::current_timestamp_millis()
+        ));
+        let raw_dir = root
+            .join("dist")
+            .join("ainput-1.0.0-preview.test")
+            .join("logs")
+            .join("streaming-raw-captures");
+        let user_corpus_dir = root
+            .join("user-voice-corpus")
+            .join("streaming-raw-captures");
+        save_streaming_raw_capture_with_user_corpus(
+            raw_dir,
+            ainput_audio::RecordedAudio {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                samples: vec![0.0, 0.25, -0.25, 0.0],
+            },
+        )
+        .expect("save short-term raw capture and stable user corpus");
+
+        let wav_count = fs::read_dir(&user_corpus_dir)
+            .expect("read user corpus dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == std::ffi::OsStr::new("wav"))
+            })
+            .count();
+        let json_count = fs::read_dir(&user_corpus_dir)
+            .expect("read user corpus dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == std::ffi::OsStr::new("json"))
+            })
+            .count();
+        assert_eq!(wav_count, 1);
+        assert_eq!(json_count, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn user_voice_corpus_skips_when_limit_is_reached() {
+        let dir = std::env::temp_dir().join(format!(
+            "ainput-user-corpus-limit-test-{}",
+            super::current_timestamp_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create user corpus dir");
+        for index in 0..STREAMING_USER_VOICE_CORPUS_LIMIT {
+            fs::write(
+                dir.join(format!("streaming-raw-existing-{index:04}.wav")),
+                b"existing",
+            )
+            .expect("write existing wav marker");
+        }
+
+        let result = save_streaming_user_voice_corpus_capture(
+            dir.clone(),
+            &ainput_audio::RecordedAudio {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                samples: vec![0.0, 0.25, -0.25, 0.0],
+            },
+            None,
+        )
+        .expect("skip full user corpus without failing");
+        assert!(result.is_none());
+        let wav_count = fs::read_dir(&dir)
+            .expect("read user corpus dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == std::ffi::OsStr::new("wav"))
+            })
+            .count();
+        assert_eq!(wav_count, STREAMING_USER_VOICE_CORPUS_LIMIT);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dist_raw_capture_dir_resolves_to_project_user_voice_corpus() {
+        let root = std::env::temp_dir().join(format!(
+            "ainput-user-corpus-path-test-{}",
+            super::current_timestamp_millis()
+        ));
+        let raw_dir = root
+            .join("dist")
+            .join("ainput-1.0.0-preview.test")
+            .join("logs")
+            .join("streaming-raw-captures");
+        let expected = root
+            .join("user-voice-corpus")
+            .join("streaming-raw-captures");
+        assert_eq!(
+            user_voice_corpus_dir_from_raw_capture_dir(&raw_dir).as_deref(),
+            Some(expected.as_path())
+        );
     }
 
     #[test]
