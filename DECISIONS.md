@@ -15,6 +15,7 @@
 
 - 新增第三个流式 backend：`nvidia_parakeet_online`。
 - AInput 仍走现有 sidecar session HTTP contract，临时 adapter 在 `vps-jp` 上把 HTTP session 转成 NVIDIA Riva gRPC offline recognition。
+- `preview.75` 默认使用在线 backend，`sidecar_auto_start = false`，不自动拉起本地 Qwen WSL sidecar；在线 adapter 的 `/chunk` 必须返回实时 partial，不能再只在 `/finish` 出最终文本。
 - `preview.74` 默认使用在线 backend，`sidecar_auto_start = false`，不自动拉起本地 Qwen WSL sidecar。
 
 放弃：

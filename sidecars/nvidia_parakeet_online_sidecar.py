@@ -1,4 +1,5 @@
 import os
+import queue
 import re
 import struct
 import threading
@@ -25,16 +26,33 @@ CONFIG_PATH = Path(
 )
 TIMEOUT_SEC = float(os.environ.get("PARAKEET_TIMEOUT_SEC", "30"))
 MAX_AUDIO_SEC = float(os.environ.get("PARAKEET_MAX_AUDIO_SEC", "90"))
+PARTIAL_WAIT_SEC = float(os.environ.get("PARAKEET_PARTIAL_WAIT_SEC", "0.18"))
 
 
 @dataclass
 class AsrSession:
     chunks: list[bytes] = field(default_factory=list)
+    pcm_queue: queue.Queue[bytes | None] = field(default_factory=queue.Queue)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     audio_samples: int = 0
     calls: int = 0
+    key_index: int = -1
+    latest_text: str = ""
+    final_text: str = ""
+    interim_text: str = ""
+    final_segments: list[str] = field(default_factory=list)
+    error: str = ""
+    closed: bool = False
+    responses: int = 0
+    partial_updates: int = 0
+    last_response_at: float | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+    condition: threading.Condition = field(init=False)
+    worker: threading.Thread | None = None
+
+    def __post_init__(self) -> None:
+        self.condition = threading.Condition(self.lock)
 
 
 class StartRequest(BaseModel):
@@ -128,6 +146,19 @@ def f32_chunks_to_pcm16(chunks: list[bytes]) -> bytes:
     return bytes(output)
 
 
+def f32_chunk_to_pcm16(chunk: bytes) -> bytes:
+    if len(chunk) % 4 != 0:
+        raise ValueError("chunk body must be little-endian f32 PCM")
+    output = bytearray()
+    for (sample,) in struct.iter_unpack("<f", chunk):
+        if sample > 1.0:
+            sample = 1.0
+        elif sample < -1.0:
+            sample = -1.0
+        output.extend(struct.pack("<h", int(round(sample * 32767.0))))
+    return bytes(output)
+
+
 def normalize_transcript(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", text)
@@ -141,6 +172,96 @@ def response_text(response) -> str:
         if result.alternatives:
             parts.append(result.alternatives[0].transcript)
     return normalize_transcript(" ".join(parts))
+
+
+def response_results(response) -> list[tuple[str, bool]]:
+    results: list[tuple[str, bool]] = []
+    for result in response.results:
+        if not result.alternatives:
+            continue
+        text = normalize_transcript(result.alternatives[0].transcript)
+        if text:
+            results.append((text, bool(getattr(result, "is_final", False))))
+    return results
+
+
+def merge_live_text(final_segments: list[str], interim_text: str) -> str:
+    parts = [segment for segment in final_segments if segment]
+    if interim_text:
+        parts.append(interim_text)
+    return normalize_transcript(" ".join(parts))
+
+
+def remember_final_segment(session: AsrSession, text: str) -> None:
+    if not text:
+        return
+    if session.final_segments and session.final_segments[-1] == text:
+        return
+    merged = merge_live_text(session.final_segments, "")
+    if merged and (text == merged or text in merged):
+        return
+    session.final_segments.append(text)
+
+
+def streaming_audio_chunks(session: AsrSession):
+    while True:
+        chunk = session.pcm_queue.get()
+        if chunk is None:
+            return
+        yield chunk
+
+
+def run_streaming_session(session_id: str, session: AsrSession) -> None:
+    config = riva.client.RecognitionConfig(
+        encoding=riva.client.AudioEncoding.LINEAR_PCM,
+        sample_rate_hertz=SAMPLE_RATE,
+        language_code=LANGUAGE_CODE,
+        max_alternatives=1,
+        audio_channel_count=1,
+        enable_automatic_punctuation=True,
+    )
+    streaming_config = riva.client.StreamingRecognitionConfig(
+        config=config,
+        interim_results=True,
+    )
+    key_index, api_key = next_key()
+    with session.condition:
+        session.key_index = key_index
+        session.condition.notify_all()
+    try:
+        service = make_service(api_key)
+        for response in service.streaming_response_generator(
+            streaming_audio_chunks(session),
+            streaming_config,
+        ):
+            results = response_results(response)
+            if not results:
+                continue
+            with session.condition:
+                for text, is_final in results:
+                    if is_final:
+                        remember_final_segment(session, text)
+                        session.interim_text = ""
+                    else:
+                        session.interim_text = text
+                live_text = merge_live_text(session.final_segments, session.interim_text)
+                if live_text and live_text != session.latest_text:
+                    session.latest_text = live_text
+                    session.partial_updates += 1
+                session.final_text = merge_live_text(session.final_segments, "")
+                session.responses += 1
+                session.last_response_at = time.time()
+                session.condition.notify_all()
+    except Exception as error:
+        with session.condition:
+            session.error = f"{type(error).__name__}: {error}"
+            session.condition.notify_all()
+    finally:
+        with session.condition:
+            session.closed = True
+            if not session.final_text:
+                session.final_text = session.latest_text
+            session.condition.notify_all()
 
 
 def transcribe_pcm16(pcm16: bytes) -> tuple[str, int]:
@@ -191,6 +312,7 @@ def health() -> dict:
         "sample_rate_hz": SAMPLE_RATE,
         "language": LANGUAGE_CODE,
         "key_count": key_count,
+        "streaming_partials": True,
         "uri": URI,
         "function_id": FUNCTION_ID,
     }
@@ -200,7 +322,15 @@ def health() -> dict:
 def start_session(request: StartRequest | None = None) -> StartResponse:
     _ = request
     session_id = uuid.uuid4().hex
-    sessions[session_id] = AsrSession()
+    session = AsrSession()
+    session.worker = threading.Thread(
+        target=run_streaming_session,
+        args=(session_id, session),
+        name=f"parakeet-stream-{session_id[:8]}",
+        daemon=True,
+    )
+    sessions[session_id] = session
+    session.worker.start()
     return StartResponse(session_id=session_id, sample_rate_hz=SAMPLE_RATE)
 
 
@@ -213,7 +343,13 @@ async def accept_chunk(session_id: str, request: Request) -> ChunkResponse:
     if len(body) % 4 != 0:
         raise HTTPException(status_code=400, detail="chunk body must be little-endian f32 PCM")
     samples = len(body) // 4
-    with session.lock:
+    try:
+        pcm16 = f32_chunk_to_pcm16(body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    with session.condition:
+        if session.error:
+            raise HTTPException(status_code=502, detail=session.error)
         if (session.audio_samples + samples) / SAMPLE_RATE > MAX_AUDIO_SEC:
             raise HTTPException(status_code=413, detail="audio session too long")
         session.chunks.append(body)
@@ -221,9 +357,14 @@ async def accept_chunk(session_id: str, request: Request) -> ChunkResponse:
         session.calls += 1
         session.updated_at = time.time()
         audio_ms = round(session.audio_samples / SAMPLE_RATE * 1000)
+        before_updates = session.partial_updates
+        session.pcm_queue.put(pcm16)
+        if not session.latest_text or session.partial_updates == before_updates:
+            session.condition.wait(timeout=PARTIAL_WAIT_SEC)
+        text = session.latest_text
     return ChunkResponse(
         session_id=session_id,
-        text="",
+        text=text,
         language=LANGUAGE_CODE,
         audio_ms=audio_ms,
         elapsed_ms=0.0,
@@ -236,21 +377,32 @@ def finish_session(session_id: str) -> FinishResponse:
     if session is None:
         raise HTTPException(status_code=404, detail="unknown session")
     started = time.perf_counter()
-    with session.lock:
+    session.pcm_queue.put(None)
+    if session.worker is not None:
+        session.worker.join(timeout=TIMEOUT_SEC)
+    with session.condition:
         pcm16 = f32_chunks_to_pcm16(session.chunks)
         audio_ms = round(session.audio_samples / SAMPLE_RATE * 1000)
+        stream_error = session.error
+        text = session.final_text or session.latest_text
+        key_index = session.key_index
+        partial_updates = session.partial_updates
     if not pcm16:
         text = ""
         key_index = -1
-    else:
+    elif stream_error and not text:
         try:
             text, key_index = transcribe_pcm16(pcm16)
         except Exception as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
+            raise HTTPException(
+                status_code=502,
+                detail=f"streaming failed ({stream_error}); fallback failed: {error}",
+            ) from error
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
     print(
         f"[parakeet-sidecar] finish session={session_id} audio_ms={audio_ms} "
-        f"elapsed_ms={elapsed_ms} key_index={key_index} text_chars={len(text)}",
+        f"elapsed_ms={elapsed_ms} key_index={key_index} partial_updates={partial_updates} "
+        f"text_chars={len(text)}",
         flush=True,
     )
     return FinishResponse(

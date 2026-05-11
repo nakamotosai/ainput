@@ -1,5 +1,23 @@
 # ainput OPLOG
 
+## 2026-05-11 打包 1.0.0-preview.75：在线 Parakeet HUD 实时 partial
+
+- 根因：`preview.74` 的 `/chunk` endpoint 每次只缓存音频并返回空文本，所有识别都在 `/finish` 才发生；因此 HUD 按住期间为空，松手后才一次性弹出。
+- 修复：`nvidia_parakeet_online_sidecar.py` 改成 session 创建时启动 NVIDIA streaming gRPC 后台线程，`/chunk` 把 PCM16 音频送入队列，并返回最新 partial。
+- 修复：开启 `interim_results=True`，维护 final segments + interim text，避免最终结果只靠松手后整段识别。
+- 保持：不修改 `cliproxyapi` 8317，不把 NVIDIA key 写入 Windows 包或日志；AInput 现有 sidecar HTTP contract 不变。
+
+验证：
+
+- vps-jp adapter 已重启并 active。
+- Windows `/health` 返回 `streaming_partials=true`。
+- 已知 WAV 按 240ms chunk、120ms 间隔模拟实时输入，`/finish` 前收到 32 次非空 partial；首个 partial 约 466ms 出现。
+- 最终文本仍为：`我现在的问题是所有各个口袋词发过来的消息全部留在1个框里， 所以我翻早起来特别痛苦。`
+- `scripts\package-release.ps1 -Version 1.0.0-preview.75` 已通过，产出 `dist\ainput-1.0.0-preview.75\` 与 `dist\ainput-1.0.0-preview.75.zip`。
+- Windows 交互桌面已运行 `dist\ainput-1.0.0-preview.75\ainput-desktop.exe`，`SessionId=1`。
+- 启动日志确认 backend 为 `NVIDIA Parakeet online ASR`，且出现 `local model preload skipped`。
+- vps-jp adapter 最终重启清理测试 session 后，`/health` 返回 `sessions=0` 与 `streaming_partials=true`。
+
 ## 2026-05-11 打包 1.0.0-preview.74：临时在线 NVIDIA Parakeet ASR
 
 - 背景：本机 Qwen3-ASR 0.6B 虽然模型权重约 1.88GB，但 vLLM / CUDA 运行态会把 Windows GPU 显存顶到约 5GB 以上；用户本轮要求新增在线 ASR 模式并默认绕开本地模型加载。

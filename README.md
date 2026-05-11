@@ -2,7 +2,7 @@
 
 `ainput` 是一个 Windows 本地常驻的“语音输入 + 截图 + 录屏 + 按键精灵”工具。
 
-当前预览版本：`1.0.0-preview.74`
+当前预览版本：`1.0.0-preview.75`
 
 本 README 是本项目唯一当前进度标准。
 
@@ -11,6 +11,7 @@
 - 这条版本线从 `v1.0` 预览重新开始，不再沿用旧的 `1.0.14-preview.x` HUD 补丁序列。
 - `极速语音识别` 继续保留原有 `SenseVoice` 离线整段识别链路。
 - `流式语音识别` 当前主线是 V19 单链路：`CtrlDown -> 空白 HUD -> streaming ASR -> HUD truth -> CtrlUp 停麦 -> drain -> 粘贴 HUD 文本一次 -> 关闭 HUD`。
+- `1.0.0-preview.75` 修正在线 Parakeet adapter：按住 `Ctrl` 时 `/chunk` 会返回实时 partial，HUD 不再等松手后才一次性出字。
 - `1.0.0-preview.74` 临时把默认流式主模型切到在线 `NVIDIA Parakeet CTC 0.6B zh-CN` adapter；启动不再自动加载本机 Qwen GPU 模型。
 - `1.0.0-preview.72` 保留为本机 Qwen 回滚点；`qwen3_sidecar` 与 `sherpa` 仍保留为配置回退。
 - 流式模式的官方标点模型固定为 `sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8`。
@@ -25,7 +26,7 @@
 - 托盘右键菜单现在会直接显示当前版本号。
 - AI rewrite 不属于 V19：本版流式主链路会绕开/隔离已有改写代码，改写能力移到 Roadmap / Future Work。
 - 新增 `scripts\prune-artifacts.ps1`，可以清掉历史 `dist` / `target*` 构建垃圾，同时保留当前版本和一个回滚版本。
-- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.74\` 与 `dist\ainput-1.0.0-preview.74.zip`。
+- 当前发包目录已经更新到 `dist\ainput-1.0.0-preview.75\` 与 `dist\ainput-1.0.0-preview.75.zip`。
 
 它不做系统级 IME。当前默认热路径由本地 ASR/HUD 单链路负责；AI rewrite 暂不参与 V19 语音提交链路。当前重点是把四条前台主链路做稳：
 
@@ -462,12 +463,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 当前状态
 
-- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.74\`
+- 当前可直接实测的便携版是 `dist\ainput-1.0.0-preview.75\`
 - 默认启动模式是 `流式语音识别`
 - 当前源码流式主链是：`NVIDIA Parakeet online adapter + ASR-facing mono/16k + HUD truth state + release drain + exact HUD snapshot paste`
 - 默认热路径由本地 ASR/HUD 单链路负责；V19 不跑 release-time offline final，不做 HUD/offline 尾巴合并，不在松手后二次修正 HUD 文本
 - AI rewrite 已从当前版本范围移出；V19 只保证已有改写代码不会改 HUD truth 或最终上屏文本
-- `preview.74` 默认切到在线 Parakeet adapter，`preview.72` 仍是本机 Qwen 回滚点
+- `preview.75` 默认切到实时在线 Parakeet adapter，`preview.72` 仍是本机 Qwen 回滚点
 - `preview.71` 会泄漏 Qwen context 到 HUD，不建议作为回滚点；需要回滚时优先回到最后一个已验证可接受的旧包并重新验证真实麦克风链路
 - 收口门禁脚本是 `scripts\readme_closeout_guard.py`
 
@@ -479,6 +480,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 - 未来任何 AI rewrite 都不能绕过 HUD truth 规则：上屏文本必须来自用户可见的最终 HUD 文本。
 
 ## 本轮收口验证
+
+2026-05-11 preview.75 online Parakeet realtime HUD partial:
+
+- 根因确认：`preview.74` 的 online adapter 虽然使用 NVIDIA streaming API 做最终转写，但 `/chunk` 固定返回 `text=""`，所以 HUD 按住期间始终空白，松手 `/finish` 后才一次性出字。
+- 修复：`nvidia_parakeet_online_sidecar.py` 在 session 创建时打开同一个 NVIDIA streaming gRPC 会话，`/chunk` 把音频送入队列，并返回当前最新 partial。
+- 修复：adapter 开启 `interim_results=True`，维护 final segments + interim text；`/finish` 关闭队列并返回最终文本。
+- 兼容：Windows AInput 现有 sidecar HTTP contract 不变，不需要改热键/HUD 主链路。
+- 验证：Windows 访问 `/health` 返回 `streaming_partials=true`。
+- 验证：已知 WAV 按 240ms chunk、120ms 间隔模拟实时输入，`/finish` 前收到 32 次非空 partial；首个 partial 约 466ms 出现。
+- 验证：最终文本仍为 `我现在的问题是所有各个口袋词发过来的消息全部留在1个框里， 所以我翻早起来特别痛苦。`
 
 2026-05-11 preview.74 online NVIDIA Parakeet ASR:
 
@@ -829,10 +840,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-streaming-self
 
 ## 接手提示
 
-- 当前进度：`1.0.0-preview.74` 是临时在线 ASR 实验版，默认 backend 为 `nvidia_parakeet_online`。
-- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.74\ainput-desktop.exe`。
-- 当前包：`dist\ainput-1.0.0-preview.74\` 与 `dist\ainput-1.0.0-preview.74.zip`。
-- 当前主链：流式模式按下 `Ctrl` 打开空白 HUD，按住期间先累计音频，松手后通过 `vps-jp` Parakeet adapter 转写并粘贴 HUD truth snapshot 一次。
+- 当前进度：`1.0.0-preview.75` 是临时在线 ASR 实验版，默认 backend 为 `nvidia_parakeet_online`。
+- 当前入口：`C:\Users\sai\ainput\dist\ainput-1.0.0-preview.75\ainput-desktop.exe`。
+- 当前包：`dist\ainput-1.0.0-preview.75\` 与 `dist\ainput-1.0.0-preview.75.zip`。
+- 当前主链：流式模式按下 `Ctrl` 打开 HUD，按住期间通过 `vps-jp` Parakeet adapter 持续返回 partial，松手后粘贴 HUD truth snapshot 一次。
 - 回滚点：`dist\ainput-1.0.0-preview.72\` 保留为本机 Qwen 版本，冻结参数仍是 `gpu_memory_utilization = 0.30` 与 `sidecar_idle_unload_ms = 3600000`。
 - 安全边界：NVIDIA key 只从 `vps-jp` 8317 生产配置读取，不写入 Windows 包；本轮不修改 `cliproxyapi` 8317 生产服务本体。
 ## 当前边界

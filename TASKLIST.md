@@ -5,6 +5,16 @@
 
 ---
 
+## Round 38：preview.75 在线 Parakeet HUD 实时 partial
+
+- [x] 定位 `preview.74` HUD 空白根因：adapter `/chunk` 固定返回空文本
+- [x] adapter 改为 session 级 NVIDIA streaming gRPC，chunk 入队并返回最新 partial
+- [x] `/health` 增加 `streaming_partials=true`
+- [x] 实时 WAV 模拟验证：`/finish` 前出现非空 partial
+- [x] 打包 `dist\ainput-1.0.0-preview.75`
+- [x] Windows 交互桌面运行 preview.75
+- [x] 启动日志确认仍走在线 Parakeet，且不加载本地 Qwen
+
 ## Round 37：preview.74 临时在线 Parakeet ASR
 
 - [x] 新增 Spec：`specs/ainput-online-parakeet-preview74/`
