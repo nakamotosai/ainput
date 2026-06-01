@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "projection": "github-safe",
+  "source": {
+    "host": "gitea",
+    "owner": "sai",
+    "repo": "ainput",
+    "branch": "main",
+    "sha": "f3c3daa37b8c32a2bacd45a43732b8e310a1a58f"
+  },
+  "generated_at": "2026-06-01T14:12:45Z",
+  "excluded_patterns": [
+    "models/*",
+    "models/**",
+    "user-voice-corpus/*",
+    "user-voice-corpus/**"
+  ],
+  "excluded_path_count": 0,
+  "excluded_paths_sample": [],
+  "reason": "GitHub-safe projection excludes local speech models and voice corpus artifacts; Gitea remains complete."
+}

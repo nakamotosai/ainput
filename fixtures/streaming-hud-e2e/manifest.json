@@ -1,0 +1,37 @@
+{
+  "cases": [
+    {
+      "id": "tail-final-flush-no-drop",
+      "expected_text": "喂喂喂，你好你好，显示现在是正常的。",
+      "events": [
+        { "t_ms": 0, "prepared_text": "喂喂喂" },
+        { "t_ms": 120, "prepared_text": "喂喂喂，你好你好" },
+        { "t_ms": 260, "prepared_text": "喂喂喂，你好你好，显示现在是正常" },
+        { "t_ms": 420, "prepared_text": "喂喂喂，你好你好，显示现在是正常的" },
+        { "t_ms": 620, "final_text": "喂喂喂，你好你好，显示现在是正常的。" }
+      ]
+    },
+    {
+      "id": "hud-tail-correction-stays-in-sync",
+      "expected_text": "HUD 上面显示的东西必须和最终上屏一样。",
+      "events": [
+        { "t_ms": 0, "prepared_text": "HUD 上面显示的东西" },
+        { "t_ms": 150, "prepared_text": "HUD 上面显示的东西必须" },
+        { "t_ms": 300, "prepared_text": "HUD 上面显示的东西必须和最终上屏一" },
+        { "t_ms": 460, "prepared_text": "HUD 上面显示的东西必须和最终上屏一样" },
+        { "t_ms": 680, "final_text": "HUD 上面显示的东西必须和最终上屏一样。" }
+      ]
+    },
+    {
+      "id": "mixed-english-tail",
+      "expected_text": "good 这种中英文混合也不能变得很奇怪。",
+      "events": [
+        { "t_ms": 0, "prepared_text": "good" },
+        { "t_ms": 110, "prepared_text": "good 这种中英文" },
+        { "t_ms": 260, "prepared_text": "good 这种中英文混合也不能变得" },
+        { "t_ms": 430, "prepared_text": "good 这种中英文混合也不能变得很奇怪" },
+        { "t_ms": 650, "final_text": "good 这种中英文混合也不能变得很奇怪。" }
+      ]
+    }
+  ]
+}

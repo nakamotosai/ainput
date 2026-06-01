@@ -1,0 +1,510 @@
+# ainput DECISIONS
+
+## D-028 preview.83 用 Codex 单项作为中英混合路线证明，发布门槛降为 8/10
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户明确要求先拿 `Codex` 这一条做单项回测；如果 Codex 多轮仍无法识别或修复正确，就直接放弃并汇报。
+- 用户同时要求全量门槛改成 8 条通过即可；这能避免为了追求 JSON/Gemini 这类高歧义样本而伤害已经满意的中文识别。
+- 当前模型和部署不能更换，`multi` 已被实测证明中文不可用；本轮只能在 zh-CN Parakeet 当前路径上做保守后处理。
+
+决策：
+
+- `preview.83` 保持在线 ASR 模型、function id、`language=zh-CN`、vps-jp sidecar 部署和 AI rewrite 关闭状态不变。
+- 所有实现先过 `03-codex.wav`；Codex 单项通过后才允许扩展到其他九条固定真实录音。
+- 全量验收以固定 10 条真实录音为准，至少 8 条严格内容通过且 behavior failures = 0 即可发布。
+- JSON 和 Gemini 不作为必须修到通过的发布阻塞项；高歧义文本不得用全局中文替换硬凑满分。
+- 每次发布必须验证源码 exe、打包 exe、`run-ainput.bat`、HKCU Run 和 Windows 交互桌面真实进程路径，防止用户再次测到旧版本。
+
+放弃：
+
+- 不切 `multi`、不换部署、不自建新模型链路。
+- 不启用 LLM/AI rewrite 热路径来猜用户语义。
+- 不把固定 10 条基准通过 8/10 宣称成所有自由中英混说都完全解决。
+
+---
+
+## D-027 preview.82 必须沉淀用户真实录音语料
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户已经明确后续测试要使用自己的真实声音，不能只依赖临时 raw captures、推测文本或少量手工夹具。
+- 当前 `logs\streaming-raw-captures\` 是短期调试缓存，只保留最近 `20` 组，且跟随版本目录漂移，不适合作为长期回归语料。
+- 中英混说问题只有用真实录音反复回放，才能区分“模型确实听错”和“应用层后处理/上屏链路出错”。
+
+决策：
+
+- 新增项目级真实录音语料目录：`user-voice-corpus\streaming-raw-captures\`。
+- 正式语音录制结束后写入该目录；流式热键、sidecar fast commit、极速语音热键和 `record-once` 都纳入保存范围。
+- 长期语料最多保留 `1000` 条 wav；达到上限后跳过新增，不自动删除、不滚动、不清理旧录音。
+- `logs\streaming-raw-captures\` 继续作为短期调试缓存，只保留最近 `20` 组，不承担长期语料职责。
+- 后续 raw-corpus 回归默认优先从 `user-voice-corpus\streaming-raw-captures\` 取样，并支持随机抽样。
+
+放弃：
+
+- 不把真实录音放进版本化 `dist\ainput-*` 目录。
+- 不在本轮迁移或删除既有历史录音。
+- 不借这个版本改模型、改部署、改 `language=zh-CN` 或扩大中英混说后处理范围。
+
+---
+
+## D-026 preview.81 必须以用户真实 ASR 输出作为 code-switch 回归样本
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户实测确认 `.80` “跟没改一模一样”。排查后确认 `.80` 当时确实是 live 进程，问题不是拉起旧版本，而是 `.80` 的修复样本和用户真实输出不一致。
+- `.80` 只覆盖较窄的拆分短语；真实失败输出是连写和错分词形态，例如 `因为我之前竟用猫底模型根本就不支持中文。`、`我让扣袋重新想方案。`、`Open AIAPICLI Gate Hub .`。
+- 用户已经明确不能换模型和部署，且 `multi` 模型中文不可用；修复只能继续在当前 zh-CN CTC 链路上做保守后处理。
+- `preview.78` 中文体感仍是冻结基线，任何新增修复都必须保护普通中文负例。
+
+决策：
+
+- `preview.81` 保持在线 ASR 模型、function id、`language=zh-CN`、vps-jp sidecar 部署和 preview.80 的低强度 speech context 不变。
+- 应用侧 code-switch 修复必须把用户真实 ASR 输出作为一等回归样本，而不是只凭推测词形补规则。
+- 新增 `扣袋 / 扣带 / 扣戴 -> Codex`，新增 `Open AIAPICLI Gate Hub . -> OpenAI API CLI GitHub.`，新增 `之前竟用猫底模型... -> 之前禁用 multi 模型...` 等精确上下文修复。
+- 对 `multi / Codex / OpenAI / API / CLI / GitHub` 这类术语的修复继续保持窄范围；中文普通句子和中文负例必须保持原样。
+- 每次打包必须验证 debug exe 和 dist exe，而不只跑库测试，避免“源码改了但真实 exe 没变”的误判。
+
+放弃：
+
+- 不把 `.80` 失败归因成旧进程；真实证据已经证明当时 `.80` 运行面正确。
+- 不切到 `language=multi` 或多语言 RNNT。
+- 不做广泛中文语义纠错，不让后处理猜用户所有中文意思。
+
+---
+
+## D-025 preview.80 在 zh-CN CTC 上做保守 code-switch 修复
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户已经确认 `preview.78` 中文识别速度和上屏速度都满意，后续修复不能为了英文岛而破坏中文主路径。
+- `preview.77` 的多语言 RNNT / `multi` 已经证明中文不可用；本轮不能再通过切模型或切部署解决。
+- 官方模型和 live Riva config 都指向当前可用调用方式是 `nvidia/parakeet-ctc-0_6b-zh-cn`、function id `9add5ef7-322e-47e0-ad7a-5653fb8d259b`、`language_code=zh-CN`。
+- 当前混说失败集中在短英文岛被吞掉或误听，例如 `multi`、`Codex` 和常见英文产品词；这类问题更适合低强度 speech context + 精确后处理，而不是广泛中文语义改写。
+
+决策：
+
+- `preview.80` 保持在线 ASR 模型、function id、`language=zh-CN` 和 vps-jp sidecar 部署不变。
+- sidecar 默认启用低强度 speech context，`boost=4.0`，默认词表只放 Riva 可编码短语，并通过 `/health` 暴露实际文件、启用状态、boost 值和样例。
+- 应用侧只加入精确 code-switch 修复：已观察到的 `multi` 丢失、`猫底/某体` 误听、`扣代斯` 等 Codex 误听，以及常见英文产品词大小写规范化。
+- 所有 mixed-language 修复必须带中文负例测试；普通中文不能因为包含相似字而被改写。
+- `1.0.0-preview.78` 继续作为中文体感冻结基线；用户实测 `.80` 不满意时优先回滚 `.78`，不再尝试 `multi`。
+
+放弃：
+
+- 不切到 `nvidia/parakeet-1_1b-rnnt-multilingual-asr` 或 `language=multi`。
+- 不换部署、不自建 NIM/Riva、不调整 `cliproxyapi` 8317 生产服务本体。
+- 不使用高 boost，例如 `18.0`。
+- 不做广泛中文语义纠错；只处理已经观测或高置信的英文岛场景。
+
+---
+
+## D-024 preview.78 冻结为后续修改基准
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户在真实 Windows 输入场景中确认 `preview.78` 效果很好，识别速度非常快，上屏速度也非常快。
+- 本项目已经经过多轮 ASR、HUD、release、rewrite 和模型切换修正，当前需要固定一个确定可用的基线，避免后续修改再次漂移。
+- `preview.77` 多语言 RNNT 已被证实中文实时识别不可用；本地 Qwen 仍保留为回滚能力，但不再是默认启动路径。
+
+决策：
+
+- `1.0.0-preview.78` 冻结为后续开发、排障和性能比较的基准版本。
+- 默认继续使用 `online_streaming`，模型为 `nvidia/parakeet-ctc-0_6b-zh-cn`，语言为 `zh-CN`。
+- 继续保持三模式独立：`极速语音识别 / 本地流式识别 / 在线流式识别`。
+- 继续保持在线 release 快速链路：HUD 有文本时松手即优先粘贴 HUD snapshot，远端 finish / cleanup 后台完成。
+- 后续任何改动如果影响识别速度、HUD 实时性、松手上屏速度、数字改写或默认模型，必须和 `preview.78` 的真实前台体感对比。
+
+放弃：
+
+- 不再把 `/health`、编译通过或包已生成当作 AInput 前台链路完成的充分条件。
+- 不再把多语言 auto 模式作为中文默认 ASR。
+- 不在默认在线链路启用会阻塞 partial 的 speech context 或额外 rewrite 判定。
+
+---
+
+## D-023 preview.78 在线默认回到中文 CTC，英文增强词只来自用户历史
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- `preview.77` 多语言 RNNT 的 `multi` 模式中文实时识别严重漂移，不能作为用户日常默认。
+- 用户明确要求英文词汇增强只能来自 vps-jp Codex 历史里自己发过的指令，不能凭主观猜词。
+- 在线上屏慢的主要证据指向 AInput worker 在处理释放命令前被同步 `/chunk` 调用阻塞，而不是最终粘贴或 WeChat 输入慢。
+- 中文数字改写已经误伤自然中文词，例如 `一起 / 一边 / 一个`，默认改写必须更保守。
+
+决策：
+
+- `preview.78` 默认在线模型回到 `nvidia/parakeet-ctc-0_6b-zh-cn`，`language=zh-CN`。
+- 在线 ASR speech context boost 只内置 vps-jp `~/.codex/sessions` 用户指令历史统计出的高频英文词；项目词若不在统计结果里，不进入默认 boost 列表。
+- 在线 worker 活跃录音时每 tick 最多发送 1 个远端 `/chunk`，优先保证 `CtrlUp` 释放命令响应；释放时仍完整 drain 队列。
+- 中文数字归一化只保留纯中文数字连读场景，单位表达和自然中文“一 + 量词/副词/结构词”默认保留中文。
+
+放弃：
+
+- 不继续把多语言 RNNT 作为中文默认。
+- 不用猜测的英文术语表补 boost。
+- 不改本地 Qwen / Sherpa 的模型配置、显存策略和 idle unload。
+- 不修改 `cliproxyapi` 8317 生产服务本体。
+
+---
+
+## D-022 多语言 RNNT 不再作为默认在线 ASR
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- `nvidia/parakeet-1_1b-rnnt-multilingual-asr` 的 `multi` 自动语言模式在中文实时 HUD partial 上出现严重语言漂移，无法稳定识别中文。
+- 用户中文输入是核心路径之一；中文不可用时，默认在线 ASR 必须回到中文专用模型。
+
+决策：
+
+- live 默认回滚到 `preview.76` 和 `nvidia/parakeet-ctc-0_6b-zh-cn`。
+- `preview.77` 视为失败实验包，不继续作为默认运行版本。
+- 后续 preview 应把中文、日文/英文拆成显式模式或显式语言配置，禁止再用单一 `multi` auto 模式承载三语默认输入。
+
+---
+
+## D-021 在线 ASR 默认切到 NVIDIA Parakeet 多语言 RNNT
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- 用户主要说日文、中文、英文，中文专用 `nvidia/parakeet-ctc-0_6b-zh-cn` 不适合作为长期默认在线模型。
+- NVIDIA Build 页面提供 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`，用户已明确要求替换到这个多语言版本。
+- 在线 ASR 已经在 `preview.76` 独立成第三模式，本轮只替换在线模式的远端模型，不应再影响本地 Qwen 流式模式。
+
+决策：
+
+- `preview.77` 默认在线模型为 `nvidia/parakeet-1_1b-rnnt-multilingual-asr`。
+- NVIDIA function id 使用 `71203149-d3b7-4460-8231-1be2543a1fca`。
+- 在线语言参数使用 `multi`，配置面写入 `[voice.online_streaming].language = "multi"`。
+- vps-jp adapter 和 Windows 包内 sidecar 保持同一模型 / function id / language 默认值。
+
+放弃：
+
+- 不删除中文 CTC 在线回滚包 `preview.76`。
+- 不改本地 Qwen / Sherpa 配置和显存策略。
+- 不把 NVIDIA key 写入 Windows 包、repo、dist 或日志。
+
+---
+
+## D-020 在线 ASR 必须是独立语音模式
+
+- 日期：2026-05-11
+- 状态：accepted
+
+原因：
+
+- `preview.74` / `preview.75` 把在线 Parakeet 暂时塞进 `[voice.streaming]`，导致托盘仍只显示“极速 / 流式”，用户无法区分本地 Qwen 流式和在线流式。
+- 本地 Qwen 仍需要保留为可回退能力，不能因为在线试验覆盖它的配置、显存策略和启动行为。
+- 在线 ASR 的上屏策略应更简单：HUD partial 已经是用户可见真相，松手时不应再被本地 Qwen 的 context echo guard、age gate、AI rewrite 或 final HUD ack 阻塞。
+
+决策：
+
+- 新增独立模式 `online_streaming`，配置为 `[voice.online_streaming]`，默认启动走该模式。
+- `[voice.streaming]` 重新代表本地流式模式，默认回到 `qwen3_sidecar`、本地 `127.0.0.1:8765`、WSL auto-start、`gpu_memory_utilization = 0.30` 与 `gpu_enabled = true`。
+- 在线模式复用 sidecar HTTP contract，但 worker kind、托盘菜单、生命周期状态和配置面独立。
+- 在线松手时，如果 HUD 已有文本，先直接粘贴 HUD snapshot；远端 finish/session cleanup/raw capture 保存后台完成。
+
+放弃：
+
+- 不把在线 ASR 继续伪装成本地流式 backend。
+- 不删除本地 Qwen / Sherpa 路径。
+- 不在本轮修改 `cliproxyapi` 8317 或 NVIDIA key pool。
+
+---
+
+## D-019 临时引入 NVIDIA Parakeet 在线 ASR adapter
+
+- 日期：2026-05-11
+- 状态：temporary
+
+原因：
+
+- 本机 Qwen3-ASR 0.6B 在 Windows GPU 上显存占用过高，且近期真实热键链路不稳定。
+- NVIDIA Parakeet CTC zh-CN 在线 API 已通过试用验证效果可用，但它是 Riva gRPC/NVCF，不是 OpenAI 兼容音频转写接口。
+- 现有 `vps-jp` `cliproxyapi` 8317 生产配置已经持有 5 个 NVIDIA key；临时 adapter 可读取该 key pool，避免把 key 写入 Windows 包。
+
+决策：
+
+- 新增第三个流式 backend：`nvidia_parakeet_online`。
+- AInput 仍走现有 sidecar session HTTP contract，临时 adapter 在 `vps-jp` 上把 HTTP session 转成 NVIDIA Riva gRPC offline recognition。
+- `preview.75` 默认使用在线 backend，`sidecar_auto_start = false`，不自动拉起本地 Qwen WSL sidecar；在线 adapter 的 `/chunk` 必须返回实时 partial，不能再只在 `/finish` 出最终文本。
+- `preview.74` 默认使用在线 backend，`sidecar_auto_start = false`，不自动拉起本地 Qwen WSL sidecar。
+
+放弃：
+
+- 不修改 `cliproxyapi` 8317 生产服务本体。
+- 不在 Rust 主程序里直接实现 Riva gRPC。
+- 不把 NVIDIA key 放进 TOML、dist 或 git。
+
+---
+
+## D-001 选用 Rust 作为主语言
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 项目是 Windows 常驻本地工具
+- 目标是轻、快、稳、长期自用
+- Rust 更适合热键、状态机、音频、托盘、系统集成
+
+放弃：
+
+- 纯 Python 主程序
+- Python 作为最终运行时主壳
+
+---
+
+## D-002 ASR 采用 SenseVoiceSmall
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 推理延迟低
+- 支持中文、粤语、英语、日语、韩语
+- 与当前场景高度匹配
+
+来源：
+
+- Hugging Face README_zh
+- sherpa-onnx SenseVoice 文档
+
+---
+
+## D-003 ASR 运行时采用 sherpa-onnx
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 与 SenseVoiceSmall 路线匹配
+- 有 Rust API 和 C API 可选
+- 更适合 Rust 主程序集成
+
+---
+
+## D-004 最终运行时默认不引入 Python
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 减少常驻体积和复杂度
+- 保持运行时一致性
+- 降低打包与部署负担
+
+说明：
+
+- Python 允许作为开发辅助脚本存在
+- Python 不进入最终常驻主链路
+
+---
+
+## D-005 产品不是系统级 IME
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 目标是高效自用工具，而非平台级输入法产品
+- TSF/IME 路线复杂度过高
+- 当前主流程更适合“热键录音 + 输出注入”
+
+---
+
+## D-006 UI 保持极简
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 自用工具优先效率，不优先视觉
+- 首版尽量把复杂度让给主流程，而不是外观
+
+---
+
+## D-007 首版目标收敛到“按住说话后直接贴入”
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 当前真正刚需是语音识别输入，不是自动生成提示词
+- 先把主链路做通，才能验证这类工具是否值得长期自用
+- 术语增强、提示词转换、模板账本都属于后续增强，不应阻塞首版交付
+
+首版验收口径：
+
+- 按住语音热键开始录音
+- 松开后触发离线识别
+- 识别结果直接贴到当前输入区域
+- 自动粘贴失败时按配置降级到剪贴板
+
+---
+
+## D-008 首版 ASR 实现先落 sherpa-onnx Rust API
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 当前官方 `sherpa-onnx` crate 已可直接完成 SenseVoice 离线识别
+- 已在本机验证 `wav -> 文本` 与 `麦克风 -> 文本` 最小闭环
+- 先用官方 Rust API 能减少首版 FFI 包装成本
+
+说明：
+
+- C API 继续保留为兜底方案
+- 只有在 Rust API 后续暴露稳定性或打包问题时才回退
+
+---
+
+## D-009 首版模型目录约定
+
+- 日期：2026-03-25
+- 状态：accepted
+
+约定：
+
+- 配置中的 `asr.model_dir` 默认指向 `models/sense-voice`
+- 若该目录下直接存在 `model.int8.onnx` / `tokens.txt`，则直接使用
+- 若该目录下存在子目录模型包，则自动发现第一套可用 SenseVoice bundle
+
+原因：
+
+- 便于开发阶段直接解压官方模型包
+- 兼容后续你替换不同版本模型时的目录差异
+
+---
+
+## D-010 Windows 安装包先采用 IExpress
+
+- 日期：2026-03-25
+- 状态：accepted
+
+原因：
+
+- 当前机器已自带 `IExpress`
+- 不需要额外安装 NSIS / Inno Setup / WiX
+- 对当前“单用户、自用、快速收口”的发布诉求足够
+
+约定：
+
+- 继续保留 zip 便携包
+- 额外产出一个 `setup.exe` 安装包
+- 安装目录先固定为当前用户的 `LocalAppData\\Programs\\ainput`
+
+---
+
+## D-011 截图能力采用 Rust + Windows GDI/窗口 API
+
+- 日期：2026-03-26
+- 状态：accepted
+
+原因：
+
+- 当前需求是 Windows 本地常驻截图，不需要跨平台抽象
+- 单次截图更适合直接走 Windows 原生屏幕采集与顶层窗口交互
+- 能与现有低层热键、托盘、主事件循环自然集成
+
+约定：
+
+- 截图热键默认采用可配置方案，当前默认值为 `Alt+X`
+- 首版截图结果默认写入剪贴板
+- 托盘可选开启“额外自动保存到桌面”
+- 自动保存文件格式固定为 PNG
+
+---
+
+## D-012 配置升级到 TOML 并保留 JSON 迁移入口
+
+- 日期：2026-03-26
+- 状态：accepted
+
+原因：
+
+- 现有 JSON 配置不适合长期维护，也不利于人工编辑
+- 热键、语音、截图、学习、日志已经变成多段结构，TOML 更适合承载
+- 仍需兼容历史安装和旧工作目录里的 `ainput.config.json`
+
+约定：
+
+- 正式配置文件改为 `config\ainput.toml`
+- 启动时若没有 TOML 但存在旧 JSON，则自动迁移
+- 旧 JSON 只作为迁移输入，不再作为正式配置口径
+
+---
+
+## D-013 前台主链路优先，后台维护动作默认不打扰
+
+- 日期：2026-03-26
+- 状态：accepted
+
+原因：
+
+- 语音识别和截图是产品主链路，日志、历史、学习状态落盘都只是维护动作
+- 后台维护动作不应该阻塞前台输出或截图完成
+
+约定：
+
+- 最近结果和语音历史落盘统一走独立维护线程
+- 周期性资源心跳从默认运行改为移除
+- 前台链路不等待历史落盘完成再返回结果
+
+---
+
+## D-014 句尾 emoji 触发先落“上下文感知输出规则”，不直接塞进纯文本归一化
+
+- 日期：2026-03-26
+- 状态：accepted
+
+原因：
+
+- “笑死”替换为 `[破涕为笑]` 依赖当前光标是否在末尾，不是纯文本清洗
+- 现有 `ainput-rewrite::normalize_transcription()` 不知道前台输入框上下文，直接塞进去会导致句中误替换
+- 首版应依赖输出层的光标上下文判断，而不是基于应用类型做特判
+
+约定：
+
+- 首版 emoji 触发规则只在 `EditableAtEnd` 命中时生效
+- 首版只支持句尾口述 `笑死` -> `[破涕为笑]`
+- `EditableWithContentOnRight` 与 `Unknown` 默认不触发
+- 规则执行顺序固定为：
+  - 文本归一化
+  - 输出上下文判断
+  - emoji 触发替换
+  - 句号策略处理
+- 若后续语音触发规则增多，再单独抽成可扩展的 “voice actions” 层

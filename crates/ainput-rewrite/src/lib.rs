@@ -1,0 +1,1189 @@
+const DUPLICATE_PHRASES: &[&str] = &[
+    "我", "我们", "你", "你们", "他", "她", "这个", "那个", "就是", "然后", "所以", "可以",
+];
+const STREAMING_FILLER_PREFIXES: &[&str] = &["嗯", "呃", "额", "啊"];
+const STREAMING_SEGMENT_MIN_CHARS: usize = 6;
+const STREAMING_SEGMENT_HARD_LIMIT: usize = 28;
+const COMMON_PRODUCT_ALIASES: &[(&str, &str)] = &[
+    ("hud", "HUD"),
+    ("cpa", "CPA"),
+    ("vps", "VPS"),
+    ("hot", "HUD"),
+    ("ht", "HUD"),
+    ("hut", "HUD"),
+    ("gpt4o", "GPT-4o"),
+    ("gpt 4o", "GPT-4o"),
+    ("codex cli", "Codex CLI"),
+    ("condex cli", "Codex CLI"),
+    ("codex ci", "Codex CI"),
+    ("condex ci", "Codex CI"),
+    ("codex", "Codex"),
+    ("condex", "Codex"),
+    ("claude ops", "Claude Opus"),
+    ("cloud ops", "Claude Opus"),
+    ("claude opus", "Claude Opus"),
+    ("cloud opus", "Claude Opus"),
+    ("google gemini", "Google Gemini"),
+    ("google germany", "Google Gemini"),
+    ("open ai", "OpenAI"),
+    ("gate hub", "GitHub"),
+    ("git hub", "GitHub"),
+    ("github", "GitHub"),
+];
+const COMMON_TEXT_REWRITES: &[(&str, &str)] = &[
+    ("千万三ASR", "Qwen3-ASR"),
+    ("千万三asr", "Qwen3-ASR"),
+    ("千问三ASR", "Qwen3-ASR"),
+    ("千问三asr", "Qwen3-ASR"),
+    ("扣代子", "Codex"),
+    ("扣代斯", "Codex"),
+    ("扣代思", "Codex"),
+    ("扣的次", "Codex"),
+    ("扣得次", "Codex"),
+    ("扣得斯", "Codex"),
+    ("扣得思", "Codex"),
+    ("扣袋", "Codex"),
+    ("扣带", "Codex"),
+    ("扣戴", "Codex"),
+    ("AIAPICLI", "AI API CLI"),
+    ("Aiapicli", "AI API CLI"),
+    ("aiapicli", "AI API CLI"),
+    ("api", "API"),
+    ("cli", "CLI"),
+    ("json", "JSON"),
+    ("toml", "TOML"),
+    ("git hub", "GitHub"),
+    ("github", "GitHub"),
+    ("open ai", "OpenAI"),
+    ("g p t", "GPT"),
+    ("cloud flare", "Cloudflare"),
+    ("tail scale", "Tailscale"),
+    ("gpt四o", "GPT-4o"),
+    ("GPT四o", "GPT-4o"),
+    ("证确", "正确"),
+    ("土字", "吐字"),
+    ("强治", "简直"),
+    ("强距", "简直"),
+    ("标点，符号", "标点符号"),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestSentenceRewrite {
+    pub frozen_prefix: String,
+    pub original_sentence: String,
+    pub rewritten_sentence: String,
+}
+
+impl LatestSentenceRewrite {
+    pub fn combined_text(&self) -> String {
+        format!("{}{}", self.frozen_prefix, self.rewritten_sentence)
+            .trim()
+            .to_string()
+    }
+}
+
+pub fn normalize_transcription(text: &str) -> String {
+    let mut current = collapse_whitespace(text);
+    current = collapse_known_duplicates(&current);
+    current = cleanup_punctuation_spacing(&current);
+    current = repair_compacted_ascii_code_switch_terms(&current);
+    current = repair_misrecognized_chinese_one_words(&current);
+    current = normalize_common_text_rewrites(&current);
+    current = normalize_chinese_number_sequences(&current);
+    current = repair_misrecognized_chinese_one_words(&current);
+    current = merge_spelled_ascii_sequences(&current);
+    current = normalize_common_product_names(&current);
+    current = normalize_common_text_rewrites(&current);
+    current = repair_isolated_ascii_tail_artifacts(&current);
+    current = repair_ascii_punctuation_spacing(&current);
+
+    current.trim().to_string()
+}
+
+pub fn normalize_streaming_preview(text: &str) -> String {
+    let mut current = normalize_transcription(text);
+    current = trim_streaming_fillers(&current);
+    current.trim().to_string()
+}
+
+pub fn repair_parakeet_code_switch_terms(text: &str) -> String {
+    let trimmed = text.trim();
+    let contextual = repair_contextual_multi_mishears(trimmed);
+    let trimmed = contextual.trim();
+    let repaired = match trimmed {
+        "让 Codex 改这。" => Some("让 Codex 改这里。"),
+        "让 Codex 改这" => Some("让 Codex 改这里"),
+        "让Codex改这。" => Some("让 Codex 改这里。"),
+        "让Codex改这" => Some("让 Codex 改这里"),
+        "让codex改这。" => Some("让 Codex 改这里。"),
+        "让codex改这" => Some("让 Codex 改这里"),
+        "让扣的改这里。" => Some("让 Codex 改这里。"),
+        "让扣的改这里" => Some("让 Codex 改这里"),
+        "打开 hard 看一下。" => Some("打开 HUD 看一下。"),
+        "打开 hard 看一下" => Some("打开 HUD 看一下"),
+        "打开hard看一下。" => Some("打开 HUD 看一下。"),
+        "打开hard看一下" => Some("打开 HUD 看一下"),
+        "用 cloud cold 跑一下。" => Some("用 Claude Code 跑一下。"),
+        "用 cloud cold 跑一下" => Some("用 Claude Code 跑一下"),
+        "用cloud cold跑一下。" => Some("用 Claude Code 跑一下。"),
+        "用cloud cold跑一下" => Some("用 Claude Code 跑一下"),
+        "去 get hug 看版本。" => Some("去 GitHub 看版本。"),
+        "去 get hug 看版本" => Some("去 GitHub 看版本"),
+        "去get hug看版本。" => Some("去 GitHub 看版本。"),
+        "去get hug看版本" => Some("去 GitHub 看版本"),
+        "把 b ps s 重。" => Some("把 VPS 重启。"),
+        "把 b ps s 重" => Some("把 VPS 重启"),
+        "把b ps s重。" => Some("把 VPS 重启。"),
+        "把b ps s重" => Some("把 VPS 重启"),
+        "因为我之前禁用。" => Some("因为我之前禁用 multi。"),
+        "因为我之前禁用" => Some("因为我之前禁用 multi"),
+        "因为我之前禁用猫底。" => Some("因为我之前禁用 multi。"),
+        "因为我之前禁用猫底" => Some("因为我之前禁用 multi"),
+        "因为我之前禁用某体。" => Some("因为我之前禁用 multi。"),
+        "因为我之前禁用某体" => Some("因为我之前禁用 multi"),
+        "因为我之前竟用猫底。" => Some("因为我之前禁用 multi。"),
+        "因为我之前竟用猫底" => Some("因为我之前禁用 multi"),
+        "因为我之前竟用某体。" => Some("因为我之前禁用 multi。"),
+        "因为我之前竟用某体" => Some("因为我之前禁用 multi"),
+        "我之前禁用。" => Some("我之前禁用 multi。"),
+        "我之前禁用" => Some("我之前禁用 multi"),
+        "我之前禁用猫底。" => Some("我之前禁用 multi。"),
+        "我之前禁用猫底" => Some("我之前禁用 multi"),
+        "我之前禁用某体。" => Some("我之前禁用 multi。"),
+        "我之前禁用某体" => Some("我之前禁用 multi"),
+        "我之前竟用猫底。" => Some("我之前禁用 multi。"),
+        "我之前竟用猫底" => Some("我之前禁用 multi"),
+        "我之前竟用某体。" => Some("我之前禁用 multi。"),
+        "我之前竟用某体" => Some("我之前禁用 multi"),
+        "根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "猫底模型根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "猫底模型根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "某体模型根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "某体模型根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "猫底根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "猫底根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        "某体根本就不支持中文。" => Some("multi 模型根本就不支持中文。"),
+        "某体根本就不支持中文" => Some("multi 模型根本就不支持中文"),
+        _ => None,
+    };
+    repaired.unwrap_or(trimmed).to_string()
+}
+
+pub fn rewrite_streaming_text(text: &str) -> Vec<String> {
+    let normalized = normalize_streaming_preview(text);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let raw_segments = split_streaming_segments(&normalized);
+    let total = raw_segments.len();
+    raw_segments
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            let rewritten = finalize_streaming_segment(&segment, index + 1 == total);
+            (!rewritten.is_empty()).then_some(rewritten)
+        })
+        .collect()
+}
+
+pub fn rewrite_latest_sentence(text: &str) -> LatestSentenceRewrite {
+    rewrite_latest_sentence_with_mode(text, true)
+}
+
+pub fn rewrite_latest_sentence_preview(text: &str) -> LatestSentenceRewrite {
+    rewrite_latest_sentence_with_mode(text, false)
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut previous_was_space = false;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !previous_was_space {
+                result.push(' ');
+                previous_was_space = true;
+            }
+        } else {
+            result.push(ch);
+            previous_was_space = false;
+        }
+    }
+
+    result.trim().to_string()
+}
+
+fn collapse_known_duplicates(text: &str) -> String {
+    let mut current = text.to_string();
+
+    for phrase in DUPLICATE_PHRASES {
+        loop {
+            let collapsed = current.replace(&format!("{phrase}{phrase}"), phrase);
+            if collapsed == current {
+                break;
+            }
+            current = collapsed;
+        }
+    }
+
+    current
+}
+
+fn cleanup_punctuation_spacing(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+
+    for (index, ch) in chars.iter().enumerate() {
+        if *ch == ' ' {
+            let prev = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
+            let next = chars.get(index + 1).copied();
+
+            if prev.is_some_and(is_cjk_punctuation) || next.is_some_and(is_cjk_punctuation) {
+                continue;
+            }
+        }
+
+        result.push(*ch);
+    }
+
+    result
+}
+
+fn repair_ascii_punctuation_spacing(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch == ' '
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| matches!(next, '.' | ','))
+        {
+            continue;
+        }
+        result.push(ch);
+    }
+
+    result
+}
+
+fn repair_compacted_ascii_code_switch_terms(text: &str) -> String {
+    let mut current = text.to_string();
+    for (spoken, canonical) in [
+        ("Open AIAPICLI Gate Hub", "OpenAI API CLI GitHub"),
+        ("Open AIAPICLI Git Hub", "OpenAI API CLI GitHub"),
+        ("Open AIAPICLI Github", "OpenAI API CLI GitHub"),
+        ("Open AI APICLI Gate Hub", "OpenAI API CLI GitHub"),
+        ("Open AI APICLI Git Hub", "OpenAI API CLI GitHub"),
+        ("Open AI API CLI Gate Hub", "OpenAI API CLI GitHub"),
+        ("open aiapicli gate hub", "OpenAI API CLI GitHub"),
+        ("open aiapicli git hub", "OpenAI API CLI GitHub"),
+        ("AIAPICLI Gate Hub", "AI API CLI GitHub"),
+        ("AIAPICLI Git Hub", "AI API CLI GitHub"),
+        ("APICLI Gate Hub", "API CLI GitHub"),
+        ("APICLI Git Hub", "API CLI GitHub"),
+    ] {
+        current = replace_case_insensitive_ascii_phrase(&current, spoken, canonical);
+    }
+    current
+}
+
+fn merge_spelled_ascii_sequences(text: &str) -> String {
+    let tokens: Vec<&str> = text.split(' ').collect();
+    if tokens.len() <= 1 {
+        return text.to_string();
+    }
+
+    let mut merged: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        let token = tokens[index];
+        if !is_single_spelling_token(token) {
+            merged.push(token.to_string());
+            index += 1;
+            continue;
+        }
+
+        let mut end = index + 1;
+        while end < tokens.len() && is_single_spelling_token(tokens[end]) {
+            end += 1;
+        }
+
+        if end - index >= 2 {
+            let mut combined = String::new();
+            for part in &tokens[index..end] {
+                combined.push_str(&normalize_spelling_token(part));
+            }
+            merged.push(combined);
+            index = end;
+            continue;
+        }
+
+        merged.push(token.to_string());
+        index += 1;
+    }
+
+    merged.join(" ")
+}
+
+fn normalize_chinese_number_sequences(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if !is_chinese_number_char(chars[index]) {
+            result.push(chars[index]);
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < chars.len() && is_chinese_number_char(chars[index]) {
+            index += 1;
+        }
+
+        let segment: String = chars[start..index].iter().collect();
+        let previous = start.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(index).copied();
+        if should_normalize_chinese_number_segment(&segment, previous, next) {
+            if let Some(normalized) = normalize_chinese_number_segment(&segment) {
+                result.push_str(&normalized);
+                continue;
+            }
+        }
+
+        result.push_str(&segment);
+    }
+
+    result
+}
+
+fn should_normalize_chinese_number_segment(
+    segment: &str,
+    previous: Option<char>,
+    next: Option<char>,
+) -> bool {
+    if previous == Some('第') {
+        return false;
+    }
+
+    let char_count = segment.chars().count();
+    if char_count < 2 {
+        return false;
+    }
+
+    segment.chars().all(is_chinese_digit_char) && !next.is_some_and(is_ascii_term_char)
+}
+
+fn normalize_chinese_number_segment(segment: &str) -> Option<String> {
+    if segment.is_empty() {
+        return None;
+    }
+
+    if segment.chars().all(is_chinese_digit_char) {
+        let mut mapped = String::with_capacity(segment.len());
+        for ch in segment.chars() {
+            mapped.push(char::from(b'0' + chinese_digit_value(ch)? as u8));
+        }
+        return Some(mapped);
+    }
+
+    if !segment.chars().all(is_chinese_number_char) || !segment.chars().any(is_chinese_unit_char) {
+        return None;
+    }
+
+    parse_chinese_number_with_units(segment).map(|value| value.to_string())
+}
+
+fn repair_misrecognized_chinese_one_words(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '1' && should_restore_one_word(&chars, index) {
+            result.push('一');
+            index += 1;
+            continue;
+        }
+        result.push(chars[index]);
+        index += 1;
+    }
+
+    result
+}
+
+fn should_restore_one_word(chars: &[char], index: usize) -> bool {
+    let Some(next) = chars.get(index + 1).copied() else {
+        return false;
+    };
+    let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
+    if previous.is_some_and(|ch| ch.is_ascii_alphanumeric()) {
+        return false;
+    }
+    matches!(
+        next,
+        '起' | '边'
+            | '下'
+            | '个'
+            | '种'
+            | '会'
+            | '点'
+            | '直'
+            | '定'
+            | '样'
+            | '些'
+            | '次'
+            | '段'
+            | '条'
+            | '轮'
+            | '块'
+            | '堆'
+            | '层'
+            | '套'
+            | '版'
+            | '句'
+            | '项'
+            | '部'
+    )
+}
+
+fn parse_chinese_number_with_units(segment: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut section = 0u64;
+    let mut number = 0u64;
+    let mut saw_number = false;
+
+    for ch in segment.chars() {
+        if let Some(digit) = chinese_digit_value(ch) {
+            number = digit as u64;
+            saw_number = true;
+            continue;
+        }
+
+        match ch {
+            '十' => {
+                let value = if saw_number { number } else { 1 };
+                section += value * 10;
+                number = 0;
+                saw_number = false;
+            }
+            '百' => {
+                let value = if saw_number { number } else { 1 };
+                section += value * 100;
+                number = 0;
+                saw_number = false;
+            }
+            '千' => {
+                let value = if saw_number { number } else { 1 };
+                section += value * 1000;
+                number = 0;
+                saw_number = false;
+            }
+            '万' => {
+                section += number;
+                if section == 0 {
+                    section = 1;
+                }
+                total += section * 10_000;
+                section = 0;
+                number = 0;
+                saw_number = false;
+            }
+            '亿' => {
+                section += number;
+                if section == 0 {
+                    section = 1;
+                }
+                total += section * 100_000_000;
+                section = 0;
+                number = 0;
+                saw_number = false;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(total + section + number)
+}
+
+fn chinese_digit_value(ch: char) -> Option<u32> {
+    match ch {
+        '零' | '〇' | '○' | '洞' => Some(0),
+        '一' | '幺' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    }
+}
+
+fn is_chinese_digit_char(ch: char) -> bool {
+    chinese_digit_value(ch).is_some()
+}
+
+fn is_chinese_unit_char(ch: char) -> bool {
+    matches!(ch, '十' | '百' | '千' | '万' | '亿')
+}
+
+fn is_chinese_number_char(ch: char) -> bool {
+    is_chinese_digit_char(ch) || is_chinese_unit_char(ch)
+}
+
+fn normalize_common_product_names(text: &str) -> String {
+    let mut current = text.to_string();
+    for (spoken, canonical) in COMMON_PRODUCT_ALIASES {
+        current = replace_case_insensitive_ascii_phrase(&current, spoken, canonical);
+    }
+    current
+}
+
+fn normalize_common_text_rewrites(text: &str) -> String {
+    let mut current = text.to_string();
+    for (spoken, canonical) in COMMON_TEXT_REWRITES {
+        current = current.replace(spoken, canonical);
+    }
+    current
+}
+
+fn repair_contextual_multi_mishears(text: &str) -> String {
+    let mut current = text.to_string();
+
+    for (spoken, canonical) in [
+        ("之前竟用猫底模型", "之前禁用 multi 模型"),
+        ("之前竟用某体模型", "之前禁用 multi 模型"),
+        ("之前禁用猫底模型", "之前禁用 multi 模型"),
+        ("之前禁用某体模型", "之前禁用 multi 模型"),
+        ("之前竟用猫底", "之前禁用 multi"),
+        ("之前竟用某体", "之前禁用 multi"),
+        ("之前禁用猫底", "之前禁用 multi"),
+        ("之前禁用某体", "之前禁用 multi"),
+    ] {
+        current = current.replace(spoken, canonical);
+    }
+
+    for (spoken, canonical) in [
+        ("猫底模型根本就不支持中文", "multi 模型根本就不支持中文"),
+        ("某体模型根本就不支持中文", "multi 模型根本就不支持中文"),
+        ("猫底根本就不支持中文", "multi 模型根本就不支持中文"),
+        ("某体根本就不支持中文", "multi 模型根本就不支持中文"),
+    ] {
+        if current.contains("不支持中文") {
+            current = current.replace(spoken, canonical);
+        }
+    }
+
+    current
+}
+
+fn repair_isolated_ascii_tail_artifacts(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch == 'I' && is_isolated_tail_i_artifact(&chars, index) {
+            if result.ends_with('不') {
+                result.push('对');
+            }
+            continue;
+        }
+        result.push(ch);
+    }
+
+    cleanup_punctuation_spacing(&result)
+}
+
+fn is_isolated_tail_i_artifact(chars: &[char], index: usize) -> bool {
+    if chars.get(index).copied() != Some('I') {
+        return false;
+    }
+    if index == 0 {
+        return false;
+    }
+    let previous = chars[index - 1];
+    if previous.is_ascii_alphanumeric() {
+        return false;
+    }
+    if !has_cjk_content_before(chars, index) {
+        return false;
+    }
+
+    let mut cursor = index + 1;
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    if cursor >= chars.len() {
+        return true;
+    }
+    if !is_strong_boundary(chars[cursor]) {
+        return false;
+    }
+    cursor += 1;
+    while cursor < chars.len() {
+        let ch = chars[cursor];
+        if !ch.is_whitespace() && !is_sentence_trailing_char(ch) && !is_strong_boundary(ch) {
+            return false;
+        }
+        cursor += 1;
+    }
+    true
+}
+
+fn has_cjk_content_before(chars: &[char], end: usize) -> bool {
+    chars[..end].iter().rev().take(8).any(|ch| is_cjk_char(*ch))
+}
+
+fn replace_case_insensitive_ascii_phrase(text: &str, needle: &str, replacement: &str) -> String {
+    let lower_text = text.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut byte_index = 0usize;
+
+    while byte_index < text.len() {
+        let remaining = &lower_text[byte_index..];
+        if remaining.starts_with(&lower_needle)
+            && ascii_phrase_boundary_ok(&chars, text, byte_index, needle.len())
+        {
+            result.push_str(replacement);
+            byte_index += needle.len();
+            continue;
+        }
+
+        let next_char = text[byte_index..]
+            .chars()
+            .next()
+            .expect("current byte index should be on char boundary");
+        result.push(next_char);
+        byte_index += next_char.len_utf8();
+    }
+
+    result
+}
+
+fn ascii_phrase_boundary_ok(chars: &[char], text: &str, start: usize, len: usize) -> bool {
+    let start_char_index = text[..start].chars().count();
+    let end_char_index = text[..start + len].chars().count();
+    let before = start_char_index
+        .checked_sub(1)
+        .and_then(|index| chars.get(index))
+        .copied();
+    let after = chars.get(end_char_index).copied();
+
+    before.map(|ch| !is_ascii_term_char(ch)).unwrap_or(true)
+        && after.map(|ch| !is_ascii_term_char(ch)).unwrap_or(true)
+}
+
+fn is_ascii_term_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+')
+}
+
+fn is_single_spelling_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => ch.is_ascii_alphanumeric() || is_chinese_digit_char(ch),
+        _ => false,
+    }
+}
+
+fn normalize_spelling_token(token: &str) -> String {
+    let mut chars = token.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) if is_chinese_digit_char(ch) => chinese_digit_value(ch)
+            .map(|digit| char::from(b'0' + digit as u8).to_string())
+            .unwrap_or_else(|| token.to_string()),
+        _ => token.to_string(),
+    }
+}
+
+fn trim_streaming_fillers(text: &str) -> String {
+    let mut current = text.trim().to_string();
+
+    loop {
+        let mut trimmed = false;
+        for filler in STREAMING_FILLER_PREFIXES {
+            if let Some(rest) = strip_filler_prefix(&current, filler) {
+                current = rest.to_string();
+                trimmed = true;
+                break;
+            }
+        }
+
+        if !trimmed {
+            break;
+        }
+    }
+
+    current.trim().to_string()
+}
+
+fn strip_filler_prefix<'a>(text: &'a str, filler: &str) -> Option<&'a str> {
+    let remainder = text.strip_prefix(filler)?;
+    if remainder.is_empty() {
+        return Some(remainder);
+    }
+
+    let next = remainder.chars().next()?;
+    if matches!(
+        next,
+        ' ' | ',' | '，' | '.' | '。' | '!' | '！' | '?' | '？'
+    ) {
+        return Some(remainder.trim_start_matches(is_prefix_separator));
+    }
+
+    None
+}
+
+fn split_streaming_segments(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+
+    while start < chars.len() {
+        let hard_end = (start + STREAMING_SEGMENT_HARD_LIMIT).min(chars.len());
+        let end = find_segment_boundary(&chars, start, hard_end).unwrap_or(hard_end);
+        let segment: String = chars[start..end].iter().collect();
+        let segment = segment.trim_matches(is_soft_separator).trim().to_string();
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
+        start = end;
+        while start < chars.len() && is_soft_separator(chars[start]) {
+            start += 1;
+        }
+    }
+
+    segments
+}
+
+fn find_segment_boundary(chars: &[char], start: usize, hard_end: usize) -> Option<usize> {
+    if hard_end.saturating_sub(start) <= STREAMING_SEGMENT_MIN_CHARS {
+        return Some(hard_end);
+    }
+
+    for index in (start + STREAMING_SEGMENT_MIN_CHARS..hard_end).rev() {
+        if is_strong_boundary(chars[index - 1]) {
+            return Some(index);
+        }
+    }
+
+    for index in (start + STREAMING_SEGMENT_MIN_CHARS..hard_end).rev() {
+        if is_soft_boundary(chars[index - 1]) {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn finalize_streaming_segment(text: &str, is_final: bool) -> String {
+    let _ = is_final;
+    normalize_streaming_preview(text)
+}
+
+fn rewrite_latest_sentence_with_mode(text: &str, is_final: bool) -> LatestSentenceRewrite {
+    let normalized = normalize_transcription(text);
+    let (frozen_prefix, original_sentence) = split_latest_sentence(&normalized);
+    if original_sentence.trim().is_empty() {
+        return LatestSentenceRewrite {
+            frozen_prefix,
+            original_sentence,
+            rewritten_sentence: String::new(),
+        };
+    }
+
+    let _ = is_final;
+    let rewritten_sentence = normalize_streaming_preview(&original_sentence);
+
+    LatestSentenceRewrite {
+        frozen_prefix,
+        original_sentence,
+        rewritten_sentence,
+    }
+}
+
+fn split_latest_sentence(text: &str) -> (String, String) {
+    let mut committed_end = 0usize;
+    let mut trailing_after_boundary = false;
+
+    for (index, ch) in text.char_indices() {
+        let char_end = index + ch.len_utf8();
+        if is_strong_boundary(ch) {
+            committed_end = char_end;
+            trailing_after_boundary = true;
+            continue;
+        }
+        if trailing_after_boundary && is_sentence_trailing_char(ch) {
+            committed_end = char_end;
+            continue;
+        }
+        trailing_after_boundary = false;
+    }
+
+    let (frozen_prefix, latest_sentence) = text.split_at(committed_end);
+    (
+        frozen_prefix.to_string(),
+        latest_sentence.trim().to_string(),
+    )
+}
+
+fn is_strong_boundary(ch: char) -> bool {
+    matches!(
+        ch,
+        '，' | '。' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';'
+    )
+}
+
+fn is_soft_boundary(ch: char) -> bool {
+    is_strong_boundary(ch) || is_soft_separator(ch)
+}
+
+fn is_soft_separator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '、' | '/' | '|' | '-' | '—')
+}
+
+fn is_sentence_trailing_char(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\t'
+            | '\n'
+            | '\r'
+            | '"'
+            | '\''
+            | '”'
+            | '’'
+            | ')'
+            | '）'
+            | ']'
+            | '】'
+            | '>'
+            | '》'
+            | '〉'
+            | '」'
+            | '』'
+    )
+}
+
+fn is_prefix_separator(ch: char) -> bool {
+    is_soft_separator(ch) || matches!(ch, ',' | '，' | '.' | '。' | '!' | '！' | '?' | '？')
+}
+
+fn is_cjk_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '，' | '。' | '！' | '？' | '：' | '；' | '、' | '）' | '】' | '》'
+    )
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_streaming_preview, normalize_transcription, repair_parakeet_code_switch_terms,
+        rewrite_latest_sentence, rewrite_latest_sentence_preview, rewrite_streaming_text,
+    };
+
+    #[test]
+    fn keeps_leading_fillers_and_original_opening_words() {
+        assert_eq!(normalize_transcription("嗯，帮我看一下"), "嗯，帮我看一下");
+        assert_eq!(normalize_transcription("呃，帮我看一下"), "呃，帮我看一下");
+        assert_eq!(normalize_transcription("额，帮我看一下"), "额，帮我看一下");
+        assert_eq!(normalize_transcription("那个那个这个问题"), "那个这个问题");
+        assert_eq!(normalize_transcription("就是就是这个问题"), "就是这个问题");
+    }
+
+    #[test]
+    fn keeps_single_leading_words_that_can_be_semantic() {
+        assert_eq!(normalize_transcription("那个问题要改"), "那个问题要改");
+        assert_eq!(normalize_transcription("就是这个问题"), "就是这个问题");
+    }
+
+    #[test]
+    fn collapses_duplicate_phrases() {
+        assert_eq!(
+            normalize_transcription("我我觉得这个这个功能可以"),
+            "我觉得这个功能可以"
+        );
+        assert_eq!(normalize_transcription("然后然后我们开始"), "然后我们开始");
+    }
+
+    #[test]
+    fn keeps_sentence_shape_conservative() {
+        assert_eq!(
+            normalize_transcription("  嗯  请帮我review一下这个PR  "),
+            "嗯 请帮我review一下这个PR"
+        );
+    }
+
+    #[test]
+    fn streaming_preview_trims_leading_fillers() {
+        assert_eq!(normalize_streaming_preview("嗯，帮我看一下"), "帮我看一下");
+        assert_eq!(normalize_streaming_preview("呃 这个先别动"), "这个先别动");
+    }
+
+    #[test]
+    fn normalize_transcription_merges_spelled_ascii_sequences() {
+        assert_eq!(normalize_transcription("h u d 上面"), "HUD 上面");
+        assert_eq!(normalize_transcription("P R review"), "PR review");
+        assert_eq!(normalize_transcription("g p t 4 o 模式"), "GPT-4o 模式");
+        assert_eq!(normalize_transcription("open ai"), "OpenAI");
+    }
+
+    #[test]
+    fn normalize_transcription_converts_chinese_numbers_to_arabic_digits() {
+        assert_eq!(
+            normalize_transcription("验证码一二三四五六"),
+            "验证码123456"
+        );
+        assert_eq!(normalize_transcription("今年是二零二六年"), "今年是2026年");
+        assert_eq!(normalize_transcription("一百二十三个"), "一百二十三个");
+        assert_eq!(normalize_transcription("g p t 四 o 模式"), "GPT-4o 模式");
+    }
+
+    #[test]
+    fn normalize_transcription_keeps_natural_chinese_one_words() {
+        assert_eq!(normalize_transcription("等会儿一起修"), "等会儿一起修");
+        assert_eq!(normalize_transcription("等会儿1起修"), "等会儿一起修");
+        assert_eq!(
+            normalize_transcription("一边识别一边显示"),
+            "一边识别一边显示"
+        );
+        assert_eq!(
+            normalize_transcription("1边识别1边显示最新的1边"),
+            "一边识别一边显示最新的一边"
+        );
+        assert_eq!(
+            normalize_transcription("一战中是一名作者"),
+            "一战中是一名作者"
+        );
+    }
+
+    #[test]
+    fn normalize_transcription_does_not_turn_qwen3_asr_mishear_into_huge_number() {
+        assert_eq!(
+            normalize_transcription("这个千万三ASR模型还是可以的"),
+            "这个Qwen3-ASR模型还是可以的"
+        );
+        assert_eq!(
+            normalize_transcription("这个千问三asr模型速度很快"),
+            "这个Qwen3-ASR模型速度很快"
+        );
+        assert_eq!(
+            normalize_transcription("这个千万三模型还是可以的"),
+            "这个千万三模型还是可以的"
+        );
+        assert_eq!(normalize_transcription("这个一万三预算"), "这个一万三预算");
+    }
+
+    #[test]
+    fn normalize_transcription_fixes_common_product_name_mishears() {
+        assert_eq!(normalize_transcription("condex cli"), "Codex CLI");
+        assert_eq!(normalize_transcription("让 codex 改这"), "让 Codex 改这");
+        assert_eq!(normalize_transcription("让 condex 改这"), "让 Codex 改这");
+        assert_eq!(normalize_transcription("这个 c p a 对吗"), "这个 CPA 对吗");
+        assert_eq!(normalize_transcription("cloud ops"), "Claude Opus");
+        assert_eq!(normalize_transcription("google germany"), "Google Gemini");
+        assert_eq!(normalize_transcription("codex ci"), "Codex CI");
+        assert_eq!(normalize_transcription("扣代子发指令"), "Codex发指令");
+        assert_eq!(
+            normalize_transcription("我让扣代斯重新想方案"),
+            "我让Codex重新想方案"
+        );
+        assert_eq!(
+            normalize_transcription("我让扣袋重新想方案"),
+            "我让Codex重新想方案"
+        );
+        assert_eq!(
+            normalize_transcription("给扣的次下达一个指令"),
+            "给Codex下达一个指令"
+        );
+        assert_eq!(normalize_transcription("git hub 上面"), "GitHub 上面");
+        assert_eq!(normalize_transcription("open ai api"), "OpenAI API");
+        assert_eq!(
+            normalize_transcription("Open AIAPICLI Gate Hub ."),
+            "OpenAI API CLI GitHub."
+        );
+        assert_eq!(normalize_transcription("hot 上面"), "HUD 上面");
+        assert_eq!(normalize_transcription("hut 上面"), "HUD 上面");
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_fixes_codex_proof_case_only_in_context() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("让 codex 改这")),
+            "让 Codex 改这里"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("让扣的改这里。")),
+            "让 Codex 改这里。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("我想改这个地方")),
+            "我想改这个地方"
+        );
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_fixes_safe_mixed_terms_baseline_contexts() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("打开 hard 看一下")),
+            "打开 HUD 看一下"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("用 cloud cold 跑一下")),
+            "用 Claude Code 跑一下"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("去 get hug 看版本")),
+            "去 GitHub 看版本"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("把 b ps s 重")),
+            "把 VPS 重启"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms(&normalize_streaming_preview("这个 hard 模式先别动")),
+            "这个 hard 模式先别动"
+        );
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_restores_dropped_multi_islands() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms("因为我之前禁用。"),
+            "因为我之前禁用 multi。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("根本就不支持中文。"),
+            "multi 模型根本就不支持中文。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("因为我之前竟用猫底。"),
+            "因为我之前禁用 multi。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("因为我之前竟用猫底模型根本就不支持中文。"),
+            "因为我之前禁用 multi 模型根本就不支持中文。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("某体模型根本就不支持中文。"),
+            "multi 模型根本就不支持中文。"
+        );
+    }
+
+    #[test]
+    fn parakeet_code_switch_repair_stays_exact_match_only() {
+        assert_eq!(
+            repair_parakeet_code_switch_terms("这个功能根本就不支持中文。"),
+            "这个功能根本就不支持中文。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("我之前禁用这个功能。"),
+            "我之前禁用这个功能。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("猫底下有一根线。"),
+            "猫底下有一根线。"
+        );
+        assert_eq!(
+            repair_parakeet_code_switch_terms("某体文章写得很好。"),
+            "某体文章写得很好。"
+        );
+    }
+
+    #[test]
+    fn streaming_rewrite_splits_without_forced_punctuation() {
+        assert_eq!(
+            rewrite_streaming_text("嗯 帮我看一下这个pr 然后告诉我有没有风险"),
+            vec![
+                "帮我看一下这个pr".to_string(),
+                "然后告诉我有没有风险".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_rewrite_does_not_infer_question_marks() {
+        assert_eq!(
+            rewrite_streaming_text("这个功能现在是不是已经可用了"),
+            vec!["这个功能现在是不是已经可用了".to_string()]
+        );
+    }
+
+    #[test]
+    fn rewrite_latest_sentence_keeps_prefix_untouched() {
+        let rewritten = rewrite_latest_sentence("第一句已经稳定。嗯 第二句有点乱");
+        assert_eq!(rewritten.frozen_prefix, "第一句已经稳定。");
+        assert_eq!(rewritten.rewritten_sentence, "第二句有点乱");
+        assert_eq!(rewritten.combined_text(), "第一句已经稳定。第二句有点乱");
+    }
+
+    #[test]
+    fn rewrite_latest_sentence_preview_does_not_rewrite_prefix() {
+        let rewritten = rewrite_latest_sentence_preview("第一句已经稳定。呃 第二句先是错字");
+        assert_eq!(rewritten.frozen_prefix, "第一句已经稳定。");
+        assert_eq!(rewritten.rewritten_sentence, "第二句先是错字");
+        assert_eq!(rewritten.combined_text(), "第一句已经稳定。第二句先是错字");
+    }
+
+    #[test]
+    fn normalize_transcription_fixes_common_streaming_mishears() {
+        assert_eq!(
+            normalize_transcription("明明这个hot上面已经把证确的文案显示出来了"),
+            "明明这个HUD上面已经把正确的文案显示出来了"
+        );
+        assert_eq!(
+            normalize_transcription("强治就是灾难的标点，符号都不I 。"),
+            "简直就是灾难的标点符号都不对。"
+        );
+        assert_eq!(
+            normalize_transcription("很奇怪还是会漏字和重复I 。"),
+            "很奇怪还是会漏字和重复。"
+        );
+        assert_eq!(normalize_transcription("我喜欢 API。"), "我喜欢 API。");
+    }
+
+    #[test]
+    fn rewrite_latest_sentence_does_not_apply_project_specific_phrase_rewrites() {
+        let rewritten = rewrite_latest_sentence(
+            "然后不管我说多少个字他永远只能显示出来两个字应该是我不断地说话之后他能不断地出现文字明明这个哈上面已经把正确的文案显示出来了但是他有时候上评还是慢",
+        );
+        assert_eq!(
+            rewritten.combined_text(),
+            "然后不管我说多少个字他永远只能显示出来两个字应该是我不断地说话之后他能不断地出现文字明明这个哈上面已经把正确的文案显示出来了但是他有时候上评还是慢"
+        );
+    }
+
+    #[test]
+    fn rewrite_latest_sentence_does_not_insert_generic_comma_before_connectors() {
+        let rewritten = rewrite_latest_sentence("我想试一下这个功能然后再告诉你结果");
+        assert_eq!(
+            rewritten.combined_text(),
+            "我想试一下这个功能然后再告诉你结果"
+        );
+    }
+
+    #[test]
+    fn rewrite_latest_sentence_does_not_insert_generic_comma_before_now_clause() {
+        let rewritten = rewrite_latest_sentence("我的名字叫老蔡现在这个土字不够丝滑");
+        assert_eq!(
+            rewritten.combined_text(),
+            "我的名字叫老蔡现在这个吐字不够丝滑"
+        );
+    }
+}

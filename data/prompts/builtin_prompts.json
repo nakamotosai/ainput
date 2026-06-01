@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "templates": [
+    {
+      "id": "debug_root_cause",
+      "label": "定位根因",
+      "tags": ["debug"],
+      "template": "先阅读相关代码和错误上下文，定位根因，暂时不要修改代码。输出可能原因、复现路径和最小修复建议。"
+    },
+    {
+      "id": "fix_minimal",
+      "label": "最小修复",
+      "tags": ["fix"],
+      "template": "请做最小必要修改修复当前问题，避免无关重构。修改后说明原因并给出验证结果。"
+    }
+  ]
+}

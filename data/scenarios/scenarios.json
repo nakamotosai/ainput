@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "modes": ["raw", "terms", "prompt", "command"],
+  "scenarios": [
+    "debug_root_cause",
+    "fix_minimal",
+    "review_code",
+    "refactor_safely",
+    "write_tests",
+    "explain_code",
+    "spec_first",
+    "command_only"
+  ]
+}

@@ -1,0 +1,353 @@
+# ainput 配置文件
+# 说明：
+# 1. 这是 ainput 的正式配置文件，按 TOML 格式读取。
+# 2. `#` 开头的内容是中文注释，不会影响程序运行。
+# 3. 修改后通常重启 ainput 即可生效。
+# 4. 流式语音 HUD 的字体、颜色、大小、位置等参数，统一在 config\hud-overlay.toml 里调整。
+
+[hotkeys]
+# 极速模式下按住说话的主热键。
+# 流式模式固定使用 Ctrl，避免普通输入时被 Alt 组合键干扰。
+# 当前极速默认：Alt+Z
+voice_input = "Alt+Z"
+
+# 触发截图的主热键。
+# 当前默认：Alt+X
+screen_capture = "Alt+X"
+
+# 是否启用“鼠标中键长按录音”。
+# true = 启用，false = 关闭
+mouse_middle_hold_enabled = false
+
+[voice]
+# 是否启用语音输入主功能。
+enabled = true
+
+# 当前语音模式。
+# fast = 极速语音识别
+# streaming = 本地流式语音识别
+# online_streaming = 在线流式语音识别
+mode = "online_streaming"
+
+# 是否优先尝试“直接粘贴到当前输入框”。
+# true = 先写剪贴板再模拟 Ctrl+V
+# false = 不做直贴，只走剪贴板
+prefer_direct_paste = true
+
+# 当直接粘贴失败时，是否退回到“仅写入剪贴板”。
+fallback_to_clipboard = true
+
+# 句尾 emoji 语音触发说明：
+# 1. 当前为内置固定规则，不通过 TOML 单独开关或自定义。
+# 2. 只有当程序判断“光标位于末尾”时才会触发。
+# 3. 若光标在句中、右侧仍有内容、或上下文未知，则不触发。
+# 4. 当前支持的句尾触发词如下：
+#    - 笑死 -> [破涕为笑]
+#    - 偷笑 -> [偷笑]
+#    - 哭死 -> [流泪]
+#    - 震惊 -> [震惊]
+#    - 点赞 -> [强]
+#    - 抱拳 -> [抱拳]
+#    - 狗头 -> [狗头]
+#    - 捂脸 -> [捂脸]
+
+# 语音历史文件名。
+# 一行一条，滚动保留最近 history_limit 条。
+history_file_name = "voice-history.log"
+
+# 语音历史最多保留多少条。
+history_limit = 500
+
+[voice.post_commit_rewrite]
+# 实验性：每次语音文本上屏后，后台调用 AI 改写，并尝试原位替换已上屏文本。
+# 第一版用于激进测试改写能力：中文、英文、中英混合、标点都会送去改写。
+enabled = true
+
+# OpenAI 兼容改写服务地址。默认走 vps-jp cliproxyapi 8317。
+endpoint_url = "http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions"
+
+# 改写模型名称。
+model = "qwen/qwen3.5-122b-a10b"
+
+# API key 环境变量名；key 不写入 TOML。
+api_key_env = "AINPUT_CLIPROXYAPI_8317_KEY"
+
+# 单次后台改写超时（毫秒）。
+timeout_ms = 3500
+
+# 上屏后等待多久再发起后台改写（毫秒），给目标输入框一点落字时间。
+delay_ms = 160
+
+# 发送给模型的光标上下文最大字符数。
+max_context_chars = 240
+
+# 允许模型返回的改写文本最大字符数。
+max_output_chars = 512
+
+# 超过这个年龄的替换票据直接放弃，避免迟到改写误伤后续输入。
+max_age_ms = 12000
+
+# 后台最多同时进行多少个改写请求。
+max_inflight = 3
+
+# true = 只允许 Win32/原生控件原位替换；不使用退格、删除、剪贴板或二次粘贴。
+require_native_replace = true
+
+[voice.streaming]
+# 是否启用流式语音识别模式。
+enabled = true
+
+# 本地流式 ASR 后端
+# qwen3_sidecar = 本机 Windows GPU / WSL2 原版 Qwen3-ASR-0.6B
+# sherpa = 旧的本地 sherpa-onnx streaming paraformer 回退路径
+backend = "qwen3_sidecar"
+
+# 流式 ASR 模型目录。
+model_dir = "models/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
+
+# 本地 Qwen3-ASR sidecar 地址
+sidecar_url = "http://127.0.0.1:8765"
+
+# sidecar 不在时，是否自动通过 WSL 拉起
+sidecar_auto_start = true
+
+# sidecar 空闲多久后自动退出并释放显存（毫秒）
+# Preview.69 默认 1 小时；下次按热键时会自动重新拉起
+sidecar_idle_unload_ms = 3600000
+
+# Qwen3-ASR sidecar 的 WSL 位置；模型和 venv 保持在 WSL Linux 磁盘，避免占满 C 盘
+sidecar_wsl_distro = "Ubuntu"
+sidecar_wsl_workdir = "/home/sai/ainput-qwen3-asr"
+
+# 是否显示流式语音面板。
+panel_enabled = true
+
+# 是否启用流式本地短句整理。
+rewrite_enabled = true
+
+# 流式标点模型目录。
+punctuation_model_dir = "models/punctuation/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
+
+# 流式标点模型线程数。
+punctuation_num_threads = 1
+
+# 流式音频块时长（毫秒）。
+# Preview.68 进一步收紧到 120ms，优先让首个 partial 和松手收尾更跟手。
+chunk_ms = 120
+
+[voice.streaming.qwen3]
+# Qwen3-ASR context；只作用于 qwen3_sidecar 流式后端。
+context = """这是 Windows 语音输入法的实时转写场景。用户主要说中文，但经常中英文混杂，包含模型名、版本号、路径、快捷键、代码词、参数名和聊天软件输入内容。请输出用户最可能真正想输入的文字，可以把明显口语化、重复、同音错字、近音错字整理成正式、通顺、无错字的表达，但不能改变原意或添加新信息。不要因为短暂停顿就强行结束句子；不要机械插入逗号、句号或问号；只有语气和语义都明确时才保留合适标点。不要重复已经识别过的内容。中文按中文输出，英文、数字、路径、参数名、快捷键和专有名词尽量原样保留。不要解释。"""
+
+# Qwen3-ASR 官方流式参数。
+chunk_size_sec = 0.18
+unfixed_chunk_num = 4
+unfixed_token_num = 5
+
+# vLLM / Qwen3-ASR 启动参数。
+max_new_tokens = 64
+enforce_eager = false
+gpu_memory_utilization = 0.30
+max_model_len = 2048
+dtype = "float16"
+
+[voice.streaming.endpoint]
+# 是否启用按住期间的停顿收尾。开启后只刷新 HUD 和稳定前缀，不会提前上屏。
+enabled = true
+
+# 暂停超过多少毫秒后，flush 当前片段尾音并刷新 HUD；停顿本身不代表句末。
+pause_ms = 560
+
+# 按住期间 HUD 尾部追帧等待。只刷新 HUD，不上屏、不强制句末标点。
+soft_flush_ms = 240
+
+# 太短的片段不自动滚动，避免一个词就被切开。
+min_segment_ms = 900
+
+# 单个流式片段最长持续时间，超过后会强制滚动。
+max_segment_ms = 16000
+
+# 停顿尾音 flush 和松开 final decode 前补的静音尾巴长度。
+tail_padding_ms = 320
+
+# 按下热键时从常驻录音缓冲里回带的开头音频长度。
+preroll_ms = 180
+
+[voice.streaming.stability]
+# 连续多少次 hypothesis 前缀一致后，才把尾巴提升为稳定文本。
+min_agreement = 2
+
+# 已稳定尾巴允许被回滚的最大字符数；超过则拒绝这次前缀改写。
+max_rollback_chars = 8
+
+[voice.streaming.finalize]
+# 松开 Ctrl 后至少等待多少毫秒，让最后的尾音进入录音缓冲。
+release_drain_min_ms = 80
+
+# 松开后最近一段持续静音达到多少毫秒，就结束尾音等待。
+release_drain_idle_settle_ms = 80
+
+# 松开后尾音等待常规上限。超过后必须 fallback，不能无限等最后一个字。
+release_drain_max_ms = 220
+
+# final decode 预算。超时策略是使用 HUD 当前文本做 fallback。
+final_decode_timeout_ms = 900
+
+# 从松开 Ctrl 到发起上屏的硬门禁。
+release_to_commit_hard_ms = 1200
+
+# final repair 超预算时允许使用 HUD 文本兜底。
+allow_display_fallback_on_timeout = true
+
+[voice.streaming.performance]
+# 流式 ASR 线程数；0 表示沿用 [asr].num_threads。
+asr_num_threads = 6
+
+# 标点模型线程数。
+punctuation_num_threads = 1
+
+# 松手后的 final repair 线程数；0 表示沿用 [asr].num_threads。
+final_num_threads = 8
+
+# 后台写 raw capture / trace 的线程预算。
+background_writer_threads = 1
+
+# 本地 Qwen 流式可使用 Windows 本机 GPU。
+gpu_enabled = true
+
+[voice.streaming.commit]
+# 每轮松手只允许创建一个最终上屏 envelope。
+single_commit_envelope = true
+
+# HUD final flush 之后，迟到的 partial/final 不允许再改本轮文本。
+reject_post_hud_flush_mutations = true
+
+# 必须先把最终文本 flush 到 HUD，再发起 clipboard + Ctrl+V 上屏。
+require_hud_flush_before_commit = true
+
+[voice.streaming.ai_rewrite]
+# 是否启用实验性 AI 尾巴改写。
+# 按住 Ctrl 时可逐步改写 HUD 当前尾巴；松开后立即停止参与本轮提交。
+# 只允许改当前还在变化的尾巴；HUD 显示什么，最终就提交什么。
+enabled = false
+
+# 可选：OpenAI 兼容改写服务地址。
+# 默认走 vps-jp 上的 cliproxyapi 8317。
+endpoint_url = "http://vps-jp.tail4b5213.ts.net:8317/v1/chat/completions"
+
+# 改写模型名称。
+model = "qwen/qwen3.5-122b-a10b"
+
+# 可选：鉴权环境变量名。
+# API key 只放 Windows 用户环境变量，不写入 TOML。
+api_key_env = "AINPUT_CLIPROXYAPI_8317_KEY"
+
+# 单次 AI 改写超时（毫秒）。
+timeout_ms = 1200
+
+# 两次改写之间的最短间隔（毫秒）。
+debounce_ms = 220
+
+# 至少累计多少个可见字，才触发 AI 改写。
+min_visible_chars = 6
+
+# 发送给模型的冻结前缀最大字符数。
+max_context_chars = 160
+
+# 允许模型返回的尾巴最大字符数。
+max_output_chars = 128
+
+[voice.online_streaming]
+# 第三个独立在线流式 ASR 模式；不加载本地 Qwen/SenseVoice 模型。
+enabled = true
+backend = "nvidia_parakeet_online"
+sidecar_url = "http://vps-jp.tail4b5213.ts.net:18765"
+chunk_ms = 100
+release_grace_ms = 180
+finish_in_background = true
+language = "zh-CN"
+automatic_punctuation = true
+panel_enabled = true
+
+[capture]
+# 是否启用截图主功能。
+enabled = true
+
+# 截图完成后，是否额外自动保存 PNG 到桌面。
+auto_save_to_desktop = false
+
+[automation]
+# 按键精灵默认回放轮数。
+# 托盘里切换后会立即生效，并在下次启动时继续沿用。
+repeat_count = 1
+
+[recording]
+# 是否启用录屏主功能。
+enabled = true
+
+# 是否录制系统播放音频。
+record_audio = true
+
+# 是否录制鼠标移动。
+capture_mouse = true
+
+# 录屏帧率预设，只支持 30 / 60 / 90 / 144。
+fps = 60
+
+# 录屏画质预设。
+# low = CRF 28，medium = CRF 20，high = CRF 15
+quality = "medium"
+
+[recording.watermark]
+# 是否启用录屏水印。
+enabled = true
+
+# 水印文本。
+text = "saaaai.com"
+
+# 水印位置。
+# 支持：left_top / right_top / left_bottom / right_bottom / moving_flash / random_walk
+position = "right_bottom"
+
+[startup]
+# 是否在 Windows 登录后自动启动 ainput。
+launch_at_login = true
+
+[asr]
+# 语音识别模型目录。
+# 默认是项目根目录下的 models/sense-voice
+model_dir = "models/sense-voice"
+
+# 推理后端。
+# 当前一般保持 cpu 即可。
+provider = "cpu"
+
+# 录音采样率。
+# 默认 16000，不建议随便改。
+sample_rate_hz = 16000
+
+# 识别语言。
+# auto = 自动判断
+language = "auto"
+
+# 是否启用 ITN（Inverse Text Normalization）。
+# 一般保持 true。
+use_itn = true
+
+# ASR 推理线程数。
+# 线程越多不一定越快，默认 4。
+num_threads = 4
+
+[learning]
+# 自动学习从“候选”变成“正式生效”所需的最小次数。
+# 例如 2 表示同一纠错出现两次后自动激活。
+auto_activate_threshold = 2
+
+[logging]
+# 日志级别。
+# 常用：info / debug / warn / error
+level = "info"
+
+# 主日志文件名。
+file_name = "ainput.log"
+
