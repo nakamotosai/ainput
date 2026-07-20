@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "cliproxyapi": {
+    "base_url": "",
+    "api_key_env": "AINPUT_API_KEY",
+    "api_key": "",
+    "chat_completions_path": "/v1/chat/completions",
+    "embeddings_path": "/v1/embeddings",
+    "models_path": "/v1/models"
+  },
+  "rewrite": {
+    "model": "",
+    "fallback_models": []
+  },
+  "embedding": {
+    "base_url": "",
+    "api_key_env": "AINPUT_API_KEY",
+    "api_key": "",
+    "model": "",
+    "fallback_models": []
+  },
+  "whisper": {
+    "model": ""
+  },
+  "asr_sidecar": {
+    "base_url": "",
+    "api_key_env": "AINPUT_API_KEY",
+    "api_key": ""
+  },
+  "setup_checks": {
+    "warn_if_missing_models": false,
+    "required_models": []
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "openai_compatible": {
+    "base_url": "",
+    "api_key": "",
+    "chat_completions_path": "/v1/chat/completions",
+    "models_path": "/v1/models"
+  },
+  "rewrite": {
+    "enabled": false,
+    "model": "",
+    "fallback_models": [],
+    "timeout_ms": 5000,
+    "temperature": 0.1,
+    "max_output_chars": 256
+  }
+}

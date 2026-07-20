@@ -1,0 +1,175 @@
+[mode]
+# Public product: local SenseVoice non-streaming only.
+# streaming_asr / whisper_zh remain parseable but disabled.
+default = "local_nonstreaming"
+
+[hotkey]
+voice_input = "CapsLock"
+poll_ms = 8
+activation_delay_ms = 200
+
+[profiles.streaming]
+enabled = false
+mode = "streaming_asr"
+hotkey = "Ctrl"
+activation_delay_ms = 200
+suppress_key = false
+
+[profiles.whisper]
+enabled = false
+mode = "whisper_zh"
+hotkey = "Alt+Z"
+activation_delay_ms = 250
+suppress_key = true
+
+[profiles.local_nonstreaming]
+enabled = true
+mode = "local_nonstreaming"
+hotkey = "CapsLock"
+activation_delay_ms = 220
+suppress_key = true
+
+[asr]
+endpoint_url = ""
+chunk_ms = 100
+release_grace_ms = 0
+pre_roll_ms = 160
+audio_ring_ms = 600
+language = "zh-CN"
+request_timeout_ms = 8000
+
+[whisper]
+endpoint_url = ""
+sample_rate_hz = 16000
+release_grace_ms = 0
+min_audio_ms = 1800
+min_rms_dbfs = -56.0
+request_timeout_ms = 8000
+
+[local_nonstreaming]
+model_dir = "models/sense-voice"
+provider = "cpu"
+sample_rate_hz = 16000
+language = "auto"
+use_itn = true
+num_threads = 4
+release_grace_ms = 80
+min_audio_ms = 800
+min_rms_dbfs = -56.0
+
+[rewrite]
+enabled = false
+streaming_enabled = false
+dynamic_budget_enabled = true
+compact_prompt_enabled = true
+streaming_prewrite_enabled = false
+prewrite_min_chars = 8
+prewrite_stable_ms = 700
+prewrite_debounce_ms = 900
+prewrite_max_inflight = 1
+mode = "after_release"
+output_language = "chinese"
+endpoint_url = ""
+model = ""
+fallback_models = []
+api_key_env = "AINPUT_API_KEY"
+api_key = ""
+timeout_ms = 3000
+debounce_ms = 260
+min_chars = 4
+max_output_chars = 256
+temperature = 0.1
+fallback_cooldown_ms = 60000
+
+[prompt_studio]
+enabled = false
+mode = "during_hold"
+endpoint_url = ""
+model = ""
+fallback_models = []
+api_key_env = "AINPUT_API_KEY"
+api_key = ""
+timeout_ms = 8000
+debounce_ms = 260
+min_chars = 2
+max_output_chars = 512
+temperature = 0.1
+fallback_cooldown_ms = 60000
+
+[suspect_terms]
+enabled = false
+endpoint_url = ""
+model = ""
+fallback_models = []
+api_key_env = "AINPUT_API_KEY"
+api_key = ""
+interval_ms = 300000
+startup_delay_ms = 300000
+history_limit = 80
+min_records = 1
+max_suggestions = 12
+timeout_ms = 12000
+temperature = 0.1
+max_output_chars = 2048
+
+[term_embeddings]
+enabled = false
+endpoint_url = ""
+model = ""
+fallback_models = []
+api_key_env = "AINPUT_API_KEY"
+api_key = ""
+interval_ms = 300000
+startup_delay_ms = 20000
+history_limit = 120
+max_items_per_run = 24
+max_context_chars = 480
+timeout_ms = 12000
+prune_inactive_cache = true
+family_min_variants = 2
+family_similarity_threshold = 0.72
+max_hotword_terms = 256
+
+[output]
+prefer_direct_paste = true
+paste_stabilize_ms = 25
+clipboard_policy = "retain_transcript"
+clipboard_retry_count = 3
+clipboard_retry_backoff_ms = 35
+paste_preflight_recheck = true
+replacement_preflight_recheck = true
+
+[hud]
+style = "floating_text"
+animation_theme = "minimal_pulse"
+anchor = "taskbar_center"
+expand_origin = "center"
+offset_x_px = 0
+offset_y_px = -6
+width_px = 620
+height_px = 46
+min_width_px = 48
+min_height_px = 46
+min_text_width_px = 1
+padding_x_px = 18
+padding_y_px = 7
+font_height_px = 26
+auto_font_fit = true
+font_weight = 600
+font_family = "Microsoft YaHei UI"
+text_align = "center"
+text_color = "#FFFFFF"
+text_alpha = 255
+text_effect = "solid"
+shadow_enabled = false
+shadow_color = "#000000"
+shadow_alpha = 160
+shadow_offset_x_px = 1
+shadow_offset_y_px = 1
+rainbow_saturation_percent = 45
+rainbow_lightness_percent = 78
+rainbow_step_degree = 28
+background_color = "#071014"
+background_alpha = 230
+corner_radius_px = 16
+display_hold_ms = 650

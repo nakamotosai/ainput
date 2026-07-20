@@ -1,0 +1,25 @@
+# Third-Party Notices — ainput
+
+This product bundles or links against third-party components.
+
+## SenseVoice (speech recognition model)
+
+- Bundle path: `models/sense-voice/`
+- Upstream: FunASR / SenseVoice (Alibaba)
+- See `models/sense-voice/**/LICENSE` and model README shipped with the weights.
+- Redistribution must retain model name and license text.
+
+## sherpa-onnx
+
+- Rust crate `sherpa-onnx` (pinned in Cargo.toml)
+- Used for offline SenseVoice inference
+- See https://github.com/k2-fsa/sherpa-onnx for upstream license (typically Apache-2.0)
+
+## Other Rust dependencies
+
+See `Cargo.lock` and each crate's license on crates.io.
+
+## Note
+
+ainput application source is MIT (see `LICENSE`).
+Model weights are under their own licenses — not re-licensed as MIT.

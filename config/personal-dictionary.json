@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "description": "AInput personal dictionary. Enabled entries feed formal cloud ASR speech contexts. 0.3.36 keeps only user-spoken English terms to avoid short-acronym boost drift.",
+  "entries": [
+    {
+      "canonical": "AI",
+      "spoken_aliases": ["A I"],
+      "category": "acronym",
+      "enabled": true,
+      "scope": "global",
+      "source": "user-spoken-0.3.36"
+    },
+    {
+      "canonical": "Codex",
+      "spoken_aliases": ["Code X", "code x"],
+      "category": "product",
+      "enabled": true,
+      "scope": "global",
+      "source": "user-spoken-0.3.36"
+    },
+    {
+      "canonical": "VPS",
+      "spoken_aliases": ["V P S"],
+      "category": "acronym",
+      "enabled": true,
+      "scope": "global",
+      "source": "user-spoken-0.3.36"
+    }
+  ]
+}
