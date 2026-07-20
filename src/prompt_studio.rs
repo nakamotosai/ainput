@@ -167,7 +167,7 @@ unsafe fn register_prompt_class(instance: HINSTANCE) -> Result<()> {
     let class = WNDCLASSW {
         lpfnWndProc: Some(prompt_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_prompt_studio"),
+        lpszClassName: w!("ainput_prompt_studio"),
         hCursor: cursor,
         ..Default::default()
     };
@@ -177,13 +177,13 @@ unsafe fn register_prompt_class(instance: HINSTANCE) -> Result<()> {
 
 unsafe fn create_prompt_window(instance: HINSTANCE) -> Result<HWND> {
     let title = HSTRING::from(format!(
-        "ainput2 Prompt Studio {}",
+        "ainput Prompt Studio {}",
         env!("CARGO_PKG_VERSION")
     ));
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("ainput2_prompt_studio"),
+            w!("ainput_prompt_studio"),
             PCWSTR(title.as_ptr()),
             WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
             120,

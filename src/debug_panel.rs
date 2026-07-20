@@ -254,7 +254,7 @@ unsafe fn register_debug_panel_class(instance: HINSTANCE) -> Result<()> {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(debug_panel_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_debug_panel"),
+        lpszClassName: w!("ainput_debug_panel"),
         hCursor: cursor,
         hbrBackground: unsafe { GetSysColorBrush(COLOR_BTNFACE) },
         ..Default::default()
@@ -269,7 +269,7 @@ unsafe fn register_debug_scroll_class(instance: HINSTANCE) -> Result<()> {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(debug_scroll_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_debug_scroll"),
+        lpszClassName: w!("ainput_debug_scroll"),
         hCursor: cursor,
         hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
         ..Default::default()
@@ -284,7 +284,7 @@ unsafe fn register_debug_content_class(instance: HINSTANCE) -> Result<()> {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(debug_content_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_debug_content"),
+        lpszClassName: w!("ainput_debug_content"),
         hCursor: cursor,
         hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
         ..Default::default()
@@ -294,12 +294,12 @@ unsafe fn register_debug_content_class(instance: HINSTANCE) -> Result<()> {
 }
 
 unsafe fn create_debug_panel_window(instance: HINSTANCE) -> Result<HWND> {
-    let title = HSTRING::from(format!("ainput2 调试面板 {}", env!("CARGO_PKG_VERSION")));
+    let title = HSTRING::from(format!("ainput 调试面板 {}", env!("CARGO_PKG_VERSION")));
     let dpi = unsafe { GetDpiForSystem() }.max(BASE_DPI);
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("ainput2_debug_panel"),
+            w!("ainput_debug_panel"),
             PCWSTR(title.as_ptr()),
             WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
             scale_px(100, dpi),
@@ -379,7 +379,7 @@ unsafe fn create_debug_panel_controls(
     let params_viewport_hwnd = unsafe {
         create_control(
             hwnd,
-            "ainput2_debug_scroll",
+            "ainput_debug_scroll",
             "",
             TOP_MARGIN,
             255,
@@ -398,7 +398,7 @@ unsafe fn create_debug_panel_controls(
     let params_content_hwnd = unsafe {
         create_control(
             params_viewport_hwnd,
-            "ainput2_debug_content",
+            "ainput_debug_content",
             "",
             0,
             0,

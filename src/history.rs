@@ -149,7 +149,7 @@ pub fn clear(path: &Path) -> Result<()> {
 
 pub fn render_history(records: &[HistoryRecord]) -> String {
     let mut out = String::new();
-    out.push_str("ainput2 历史 / 对比\r\n\r\n");
+    out.push_str("ainput 历史 / 对比\r\n\r\n");
     if records.is_empty() {
         out.push_str("暂无记录。\r\n");
         return out;
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn appends_and_loads_jsonl_records() {
         let path =
-            std::env::temp_dir().join(format!("ainput2-history-test-{}.jsonl", std::process::id()));
+            std::env::temp_dir().join(format!("ainput-history-test-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut record = HistoryRecord::new("utt-jsonl", "streaming_default", "streaming_asr");
         record.pasted_text = "历史测试".to_string();

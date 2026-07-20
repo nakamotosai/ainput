@@ -1038,7 +1038,7 @@ unsafe fn register_hud_class(instance: HINSTANCE, brush: HBRUSH) -> Result<()> {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(hud_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_hud_surface"),
+        lpszClassName: w!("ainput_hud_surface"),
         hbrBackground: brush,
         ..Default::default()
     };
@@ -1057,7 +1057,7 @@ unsafe fn create_hud_window(
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("ainput2_hud_surface"),
+            w!("ainput_hud_surface"),
             w!(""),
             WINDOW_STYLE(WS_POPUP.0),
             0,
@@ -1079,7 +1079,7 @@ unsafe fn create_hud_window(
     let text_hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("ainput2_hud_surface"),
+            w!("ainput_hud_surface"),
             w!(""),
             WINDOW_STYLE(WS_POPUP.0),
             0,

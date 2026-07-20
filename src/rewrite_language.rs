@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn controller_persists_enabled_and_language_together() {
         let dir =
-            std::env::temp_dir().join(format!("ainput2-rewrite-controller-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ainput-rewrite-controller-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("rewrite-user.toml");
         let controller = RewriteLanguageController::new(

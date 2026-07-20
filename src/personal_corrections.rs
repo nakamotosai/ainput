@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn applies_persisted_correction_rule() {
         let path = std::env::temp_dir().join(format!(
-            "ainput2-personal-corrections-{}.json",
+            "ainput-personal-corrections-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn one_character_correction_is_not_applied_globally() {
         let path = std::env::temp_dir().join(format!(
-            "ainput2-one-char-correction-{}.json",
+            "ainput-one-char-correction-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn can_disable_matching_correction_rule() {
         let path = std::env::temp_dir().join(format!(
-            "ainput2-personal-corrections-disable-{}.json",
+            "ainput-personal-corrections-disable-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn protected_replacement_blocks_specific_ai_rewrite() {
         let path = std::env::temp_dir().join(format!(
-            "ainput2-protected-rewrite-{}.json",
+            "ainput-protected-rewrite-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn protected_replacement_disables_conflicting_personal_correction() {
         let path = std::env::temp_dir().join(format!(
-            "ainput2-protected-disables-correction-{}.json",
+            "ainput-protected-disables-correction-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn cannot_reenable_correction_that_conflicts_with_enabled_protection() {
         let path = std::env::temp_dir().join(format!(
-            "ainput2-protected-rejects-correction-{}.json",
+            "ainput-protected-rejects-correction-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn protected_replacement_does_not_change_real_forbidden_word() {
         let path = std::env::temp_dir().join(format!(
-            "ainput2-protected-rewrite-allowed-{}.json",
+            "ainput-protected-rewrite-allowed-{}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

@@ -57,9 +57,17 @@ $AssetsDist = Join-Path $Dist "assets"
 New-Item -ItemType Directory -Force $AssetsDist | Out-Null
 Copy-Item "$Root\assets\*" $AssetsDist -Recurse -Force
 
+# Never ship runtime state (logs/keys/history) inside the green package.
+$StateDist = Join-Path $Dist "state"
+if (Test-Path $StateDist) {
+  Remove-Item -Recurse -Force $StateDist
+}
+
 $Zip = Join-Path $Root "dist\ainput-$Version-win64.zip"
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
+# Wrap as ainput-<ver>-win64\... so unpack keeps one folder.
 Compress-Archive -Path $Dist -DestinationPath $Zip -Force
 
 Write-Host "Packaged folder: $Dist"
 Write-Host "Packaged zip:    $Zip"
+Write-Host "SenseVoice model: $($ModelFile.FullName) ($([math]::Round($ModelFile.Length/1MB,1)) MB)"

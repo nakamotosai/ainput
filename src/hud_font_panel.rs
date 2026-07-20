@@ -253,7 +253,7 @@ unsafe fn register_panel_class(instance: HINSTANCE) -> Result<()> {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(panel_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_hud_font_panel"),
+        lpszClassName: w!("ainput_hud_font_panel"),
         hCursor: cursor,
         hbrBackground: unsafe {
             windows::Win32::Graphics::Gdi::GetSysColorBrush(
@@ -272,7 +272,7 @@ unsafe fn register_preview_class(instance: HINSTANCE) -> Result<()> {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(preview_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_hud_font_preview"),
+        lpszClassName: w!("ainput_hud_font_preview"),
         hCursor: cursor,
         hbrBackground: unsafe {
             windows::Win32::Graphics::Gdi::GetSysColorBrush(
@@ -287,14 +287,14 @@ unsafe fn register_preview_class(instance: HINSTANCE) -> Result<()> {
 
 unsafe fn create_panel_window(instance: HINSTANCE) -> Result<HWND> {
     let title = HSTRING::from(format!(
-        "ainput2 HUD 字体面板 {}",
+        "ainput HUD 字体面板 {}",
         env!("CARGO_PKG_VERSION")
     ));
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("ainput2_hud_font_panel"),
+            w!("ainput_hud_font_panel"),
             PCWSTR(title.as_ptr()),
             WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
             scale_px(140, dpi),
@@ -427,7 +427,7 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
     let preview_hwnd = unsafe {
         create_control(
             hwnd,
-            "ainput2_hud_font_preview",
+            "ainput_hud_font_preview",
             "",
             MARGIN,
             MARGIN,

@@ -884,7 +884,7 @@ fn extract_json_array(content: &str) -> Option<&str> {
 #[cfg(test)]
 fn render_book_items(items: &[SuspectTermItem]) -> String {
     let mut out = String::new();
-    out.push_str("ainput2 疑似错词\r\n\r\n");
+    out.push_str("ainput 疑似错词\r\n\r\n");
     if items.is_empty() {
         out.push_str("暂无建议。后台会定期分析最近语音历史，也可以点“立即分析”。\r\n");
         return out;
@@ -1107,8 +1107,8 @@ mod tests {
     fn merges_and_applies_first_pending_suggestion() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
-        let corrections_path = dir.join(format!("ainput2-corrections-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
+        let corrections_path = dir.join(format!("ainput-corrections-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         let _ = std::fs::remove_file(&corrections_path);
         merge_suggestions(
@@ -1137,7 +1137,7 @@ mod tests {
     fn merge_counts_only_new_suggestions_and_keeps_existing_pending() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect-incremental");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         let first = merge_suggestions(
             &suspect_path,
@@ -1179,7 +1179,7 @@ mod tests {
     fn can_dismiss_first_pending_suggestion() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect-dismiss");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         merge_suggestions(
             &suspect_path,
@@ -1205,8 +1205,8 @@ mod tests {
     fn can_apply_first_pending_with_manual_correction() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect-manual");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
-        let corrections_path = dir.join(format!("ainput2-corrections-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
+        let corrections_path = dir.join(format!("ainput-corrections-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         let _ = std::fs::remove_file(&corrections_path);
         merge_suggestions(
@@ -1240,8 +1240,8 @@ mod tests {
     fn can_apply_and_dismiss_selected_pending_suggestions() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect-selected");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
-        let corrections_path = dir.join(format!("ainput2-corrections-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
+        let corrections_path = dir.join(format!("ainput-corrections-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         let _ = std::fs::remove_file(&corrections_path);
         merge_suggestions(
@@ -1311,8 +1311,8 @@ mod tests {
     fn can_apply_selected_item_with_manual_correction() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect-selected-manual");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
-        let corrections_path = dir.join(format!("ainput2-corrections-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
+        let corrections_path = dir.join(format!("ainput-corrections-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         let _ = std::fs::remove_file(&corrections_path);
         merge_suggestions(
@@ -1342,8 +1342,8 @@ mod tests {
     fn dismissing_applied_item_disables_matching_correction() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect-dismiss-applied");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
-        let corrections_path = dir.join(format!("ainput2-corrections-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
+        let corrections_path = dir.join(format!("ainput-corrections-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         let _ = std::fs::remove_file(&corrections_path);
         merge_suggestions(
@@ -1374,8 +1374,8 @@ mod tests {
     fn can_apply_review_batch_with_edits_and_dismissals() {
         let dir = std::env::temp_dir();
         let suffix = format!("{}-{}", std::process::id(), "suspect-review-batch");
-        let suspect_path = dir.join(format!("ainput2-suspect-{suffix}.json"));
-        let corrections_path = dir.join(format!("ainput2-corrections-{suffix}.json"));
+        let suspect_path = dir.join(format!("ainput-suspect-{suffix}.json"));
+        let corrections_path = dir.join(format!("ainput-corrections-{suffix}.json"));
         let _ = std::fs::remove_file(&suspect_path);
         let _ = std::fs::remove_file(&corrections_path);
         merge_suggestions(

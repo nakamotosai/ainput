@@ -184,7 +184,7 @@ fn prepare_runtime_bundle(model_bundle: SenseVoiceModelBundle) -> Result<SenseVo
     let cache_root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("ainput2")
+        .join("ainput")
         .join("asr-cache");
     let bundle_name = model_bundle
         .root_dir

@@ -162,7 +162,7 @@ unsafe fn register_history_class(instance: HINSTANCE) -> Result<()> {
     let class = WNDCLASSW {
         lpfnWndProc: Some(history_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput2_history_panel"),
+        lpszClassName: w!("ainput_history_panel"),
         hCursor: cursor,
         ..Default::default()
     };
@@ -171,11 +171,11 @@ unsafe fn register_history_class(instance: HINSTANCE) -> Result<()> {
 }
 
 unsafe fn create_history_window(instance: HINSTANCE) -> Result<HWND> {
-    let title = HSTRING::from(format!("ainput2 历史 / 对比 {}", env!("CARGO_PKG_VERSION")));
+    let title = HSTRING::from(format!("ainput 历史 / 对比 {}", env!("CARGO_PKG_VERSION")));
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("ainput2_history_panel"),
+            w!("ainput_history_panel"),
             PCWSTR(title.as_ptr()),
             WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0),
             140,
