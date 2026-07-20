@@ -380,22 +380,16 @@ fn resolve_install_root() -> Result<PathBuf> {
 }
 
 fn resolve_state_root(install_root: &std::path::Path) -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("AINPUT2_STATE_ROOT") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
+    // Public green package: state lives under install_root/state (never project-level dist parent).
+    for env_name in ["AINPUT_STATE_ROOT", "AINPUT2_STATE_ROOT"] {
+        if let Ok(value) = std::env::var(env_name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed));
+            }
         }
     }
-    if install_root
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .is_some_and(|name| name.eq_ignore_ascii_case("dist"))
-    {
-        if let Some(project_root) = install_root.parent().and_then(|dist| dist.parent()) {
-            return Ok(project_root.join("state"));
-        }
-    }
-    Ok(install_root.to_path_buf())
+    Ok(install_root.join("state"))
 }
 
 fn migrate_state_root(install_root: &std::path::Path, state_root: &std::path::Path) -> Result<()> {
