@@ -59,7 +59,7 @@ impl SuspectTermsPanelController {
         prompt_config: RewriteConfig,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").context("bind ainput2 web console")?;
+        let listener = TcpListener::bind("127.0.0.1:0").context("bind ainput web console")?;
         listener
             .set_nonblocking(true)
             .context("set web console listener nonblocking")?;
@@ -102,17 +102,17 @@ impl SuspectTermsPanelController {
             };
             let result = run_web_console(listener, state, shutdown);
             if let Err(error) = result {
-                warn!(error = %error, "ainput2 web console failed");
+                warn!(error = %error, "ainput web console failed");
             }
         });
         ready_tx
             .send(Ok(()))
-            .map_err(|error| anyhow!("signal ainput2 web console ready failed: {error}"))?;
+            .map_err(|error| anyhow!("signal ainput web console ready failed: {error}"))?;
         ready_rx
             .recv_timeout(Duration::from_millis(100))
             .unwrap_or(Ok(()))
             .map_err(|error| anyhow!(error))?;
-        info!(url = %worker_url, "ainput2 web console started");
+        info!(url = %worker_url, "ainput web console started");
         Ok(Self { url })
     }
 
@@ -127,7 +127,7 @@ impl SuspectTermsPanelController {
     fn open_path(&self, path: &str) {
         let url = format!("{}{}", self.url, path.trim_start_matches('/'));
         if let Err(error) = open_url(&url) {
-            warn!(error = %error, url, "open ainput2 web console failed");
+            warn!(error = %error, url, "open ainput web console failed");
         }
     }
 }
@@ -141,7 +141,7 @@ fn run_web_console(
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Err(error) = handle_connection(stream, &state) {
-                    warn!(error = %error, "ainput2 web console request failed");
+                    warn!(error = %error, "ainput web console request failed");
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -159,7 +159,7 @@ fn handle_connection(mut stream: TcpStream, state: &ConsoleState) -> Result<()> 
         .context("set web console read timeout")?;
     if let Err(error) = handle_request(&mut stream, state) {
         let message = error.to_string();
-        warn!(error = %message, "ainput2 web console request failed");
+        warn!(error = %message, "ainput web console request failed");
         write_error_json(&mut stream, 500, &message)?;
     }
     Ok(())
