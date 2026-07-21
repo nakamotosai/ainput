@@ -1,7 +1,7 @@
 {
   "version": 1,
   "cliproxyapi": {
-    "base_url": "",
+    "base_url": "https://integrate.api.nvidia.com/v1",
     "api_key_env": "AINPUT_API_KEY",
     "api_key": "",
     "chat_completions_path": "/v1/chat/completions",
@@ -10,7 +10,8 @@
   },
   "rewrite": {
     "model": "",
-    "fallback_models": []
+    "fallback_models": [],
+    "timeout_ms": 5000
   },
   "embedding": {
     "base_url": "",

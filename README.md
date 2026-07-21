@@ -16,7 +16,7 @@
 
 - **CapsLock hold-to-talk** → local non-streaming transcription
 - Optional **AI rewrite** (non-streaming HTTP) when you configure an API
-- Tray icon, HUD feedback, local web console (loopback only)
+- Tray icon + HUD feedback
 - Personal correction rules (local)
 - No cloud ASR, no screen recording, no built-in vendor API key
 
@@ -26,15 +26,22 @@
 2. Unpack anywhere.
 3. Run `ainput.exe` or `run-ainput.bat`.
 4. Hold **CapsLock**, speak, release — text pastes into the focused window.
-5. (Optional) Tray right-click → **API / 改写设置…** → fill Base URL / API Key / Model → enable rewrite → Save.
+5. (Optional) Tray → **API / 改写设置…** → fill Key → **拉取模型** → pick model → set timeout → enable rewrite → Save.
 
 Runtime state is stored next to the executable under `state/` (config, logs, history).
 
 ## Configure AI rewrite
 
-Use the **native settings panel** (tray → `API / 改写设置…`). Values are saved to `state/config/api-connections.json` and hot-reloaded (no restart).
+Use the **native settings panel** (tray → `API / 改写设置…`):
 
-Empty Base URL keeps pure local dictation (rewrite off).
+| Field | Default / notes |
+|---|---|
+| Base URL | Prefilled `https://integrate.api.nvidia.com/v1` (any OpenAI-compatible endpoint works) |
+| API Key | You provide; stored only in local `state/config/` |
+| Model | Type manually, or click **拉取模型** after Key is filled |
+| Timeout (ms) | Default `5000` — used for rewrite and model list pull fallback |
+
+Values hot-reload on Save (no restart). Disable rewrite to keep pure local dictation.
 
 ## Build from source
 

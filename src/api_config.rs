@@ -41,6 +41,13 @@ pub struct CliproxyApiConfig {
 pub struct RewriteApiConfig {
     pub model: String,
     pub fallback_models: Vec<String>,
+    /// HTTP timeout for rewrite chat/completions (milliseconds).
+    #[serde(default = "default_rewrite_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_rewrite_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -414,13 +421,23 @@ pub fn setup_warning_message(status: &ApiSetupStatus) -> Option<String> {
         .map(|error| format!("cliproxyapi 模型检查失败：{error}"))
 }
 
-fn join_url(base: &str, path: &str) -> String {
+/// Join OpenAI-compatible base + path without producing `/v1/v1/...`.
+pub fn join_url(base: &str, path: &str) -> String {
     let base = base.trim().trim_end_matches('/');
     let path = path.trim();
     if path.is_empty() {
         return base.to_string();
     }
-    format!("{}/{}", base, path.trim_start_matches('/'))
+    let path = path.trim_start_matches('/');
+    // base=…/v1 + path=v1/models → …/v1/models
+    if base.ends_with("/v1") && (path == "v1" || path.starts_with("v1/")) {
+        let rest = path.trim_start_matches("v1").trim_start_matches('/');
+        if rest.is_empty() {
+            return base.to_string();
+        }
+        return format!("{base}/{rest}");
+    }
+    format!("{base}/{path}")
 }
 
 fn json_at_path<'a>(raw: Option<&'a Value>, path: &[&str]) -> Option<&'a Value> {
@@ -589,7 +606,8 @@ impl Default for ApiConnectionsConfig {
 impl Default for CliproxyApiConfig {
     fn default() -> Self {
         Self {
-            base_url: String::new(),
+            // Public product preset: NVIDIA hosted OpenAI-compatible NIM API.
+            base_url: "https://integrate.api.nvidia.com/v1".to_string(),
             api_key_env: "AINPUT_API_KEY".to_string(),
             api_key: String::new(),
             chat_completions_path: "/v1/chat/completions".to_string(),
@@ -604,8 +622,61 @@ impl Default for RewriteApiConfig {
         Self {
             model: String::new(),
             fallback_models: Vec::new(),
+            timeout_ms: default_rewrite_timeout_ms(),
         }
     }
+}
+
+/// List model ids from an OpenAI-compatible `/v1/models` endpoint.
+pub fn list_models(
+    base_url: &str,
+    api_key: &str,
+    models_path: &str,
+    timeout_ms: u64,
+) -> Result<Vec<String>> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        anyhow::bail!("Base URL 为空");
+    }
+    let path = if models_path.trim().is_empty() {
+        "/v1/models"
+    } else {
+        models_path.trim()
+    };
+    let url = join_url(base, path);
+    let timeout = Duration::from_millis(timeout_ms.clamp(500, 60_000));
+    let client = Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .no_proxy()
+        .build()
+        .context("build models list client")?;
+    let mut request = client.get(&url);
+    let key = api_key.trim();
+    if !key.is_empty() {
+        request = request.bearer_auth(key);
+    } else if let Some(env_key) = read_api_key("AINPUT_API_KEY") {
+        request = request.bearer_auth(env_key);
+    }
+    let response = request
+        .send()
+        .and_then(|response| response.error_for_status())
+        .with_context(|| format!("GET {url} 失败（超时 {timeout_ms} ms 或网络错误）"))?;
+    let body = response
+        .json::<ModelsResponse>()
+        .context("解析 /v1/models 响应失败")?;
+    let mut models = body
+        .data
+        .into_iter()
+        .map(|entry| entry.id)
+        .filter(|id| !id.trim().is_empty())
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    if models.is_empty() {
+        anyhow::bail!("上游返回了空模型列表");
+    }
+    Ok(models)
 }
 
 impl Default for EmbeddingApiConfig {

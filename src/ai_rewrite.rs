@@ -52,6 +52,7 @@ impl SharedRewriter {
         api_key: &str,
         model: &str,
         chat_path: &str,
+        timeout_ms: u64,
     ) -> Result<()> {
         let mut config = self
             .config
@@ -67,11 +68,12 @@ impl SharedRewriter {
         config.endpoint_url = if base.is_empty() {
             String::new()
         } else {
-            format!("{base}/{}", path.trim_start_matches('/'))
+            crate::api_config::join_url(base, path)
         };
         config.api_key = api_key.trim().to_string();
         config.api_key_env = "AINPUT_API_KEY".to_string();
         config.model = model.trim().to_string();
+        config.timeout_ms = timeout_ms.clamp(500, 120_000);
         self.replace_config(config)
     }
 
