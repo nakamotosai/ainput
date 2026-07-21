@@ -21,6 +21,10 @@
 - Personal correction rules (local)
 - No cloud ASR, no screen recording, no built-in vendor API key
 
+## Official site
+
+https://input.saaaai.com/
+
 ## Quick start
 
 1. Download the release zip (or build from source).
@@ -84,3 +88,4 @@ See `THIRD_PARTY_NOTICES` and the license files under `models/sense-voice/`.
 ## Contributing
 
 Issues and PRs welcome. Keep the product local-first; do not add cloud ASR or hard-coded third-party keys.
+
