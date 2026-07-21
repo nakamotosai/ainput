@@ -55,6 +55,18 @@ impl AsrSessionPool {
         pool
     }
 
+    pub fn new_without_preheat(asr: CloudAsrClient) -> Self {
+        Self {
+            asr,
+            ready: Arc::new(Mutex::new(None)),
+            preheating: Arc::new(AtomicBool::new(false)),
+            preheat_enabled: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+        // Intentionally no preheat_next — public product has streaming disabled.
+    }
+
+
     pub fn acquire(&self) -> Result<AcquiredAsrSession> {
         let started_at = Instant::now();
         if let Some(session) = self.take_ready() {

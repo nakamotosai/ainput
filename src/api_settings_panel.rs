@@ -618,7 +618,9 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
 
 unsafe fn show_panel() {
     PANEL_STATE.with(|cell| {
-        let borrow = cell.borrow();
+        let Ok(borrow) = cell.try_borrow() else {
+            return;
+        };
         let Some(state) = borrow.as_ref() else {
             return;
         };
@@ -761,6 +763,23 @@ fn is_fetching() -> bool {
     })
 }
 
+
+fn load_models_path_for_fetch() -> Option<String> {
+    let path = PANEL_STATE.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|b| b.as_ref().map(|s| s.api_path.clone()))
+    })?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("cliproxyapi")
+        .and_then(|v| v.get("models_path"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn start_fetch_models() {
     let Some(ui) = panel_ui_handles() else {
         return;
@@ -780,17 +799,18 @@ fn start_fetch_models() {
         set_status_hwnd(ui.status, "请先填写 API Key 再拉取模型");
         return;
     }
+    let models_path = load_models_path_for_fetch().unwrap_or_else(|| "/v1/models".to_string());
     set_fetching(true);
     set_status_hwnd(
         ui.status,
         &format!("正在拉取模型列表…（超时 {timeout_ms} ms）"),
     );
-    info!(timeout_ms, base = %base, "API panel model fetch started");
+    info!(timeout_ms, base = %base, models_path = %models_path, "API panel model fetch started");
     let hwnd_raw = ui.hwnd.0 as isize;
     thread::spawn(move || {
         // Never panic across the thread boundary — always post a result.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            api_config::list_models(&base, &key, "/v1/models", timeout_ms)
+            api_config::list_models(&base, &key, &models_path, timeout_ms)
         }))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("拉取线程内部 panic")))
         .map_err(|error| format!("{error:#}"));

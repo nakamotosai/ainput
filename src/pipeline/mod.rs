@@ -600,6 +600,7 @@ impl VoiceWorker {
             record.audio_ms = sent_audio_ms;
             record.total_elapsed_ms = started_at.elapsed().as_millis();
             record.skipped_reason = "empty_hud_snapshot".to_string();
+            stamp_rewrite_session(&mut record, streaming_rewrite_enabled);
             self.history.record(record);
             if self.debug_panel.is_enabled() {
                 self.debug_panel.display_result(
@@ -643,6 +644,7 @@ impl VoiceWorker {
             } else {
                 "debug_raw_display_rewrite_disabled".to_string()
             };
+            stamp_rewrite_session(&mut record, streaming_rewrite_enabled);
             self.history.record(record);
             self.hud.show_text(paste_snapshot, false, false);
             if streaming_rewrite_enabled {
@@ -1042,6 +1044,7 @@ impl VoiceWorker {
             record.asr_elapsed_ms = asr_elapsed_ms;
             record.total_elapsed_ms = started_at.elapsed().as_millis();
             record.skipped_reason = format!("empty_or_skipped:{}", response.skipped);
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             if self.debug_panel.is_enabled() {
                 self.debug_panel.display_result(
@@ -1079,6 +1082,7 @@ impl VoiceWorker {
             } else {
                 "debug_raw_display_rewrite_disabled".to_string()
             };
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             self.hud.show_text(raw_text_for_paste, false, false);
             if !rewrite_enabled {
@@ -1171,6 +1175,7 @@ impl VoiceWorker {
                     record.asr_elapsed_ms = asr_elapsed_ms;
                     record.total_elapsed_ms = started_at.elapsed().as_millis();
                     record.error = format!("paste failed: {error}");
+                    stamp_rewrite_session(&mut record, rewrite_enabled);
                     self.history.record(record);
                     self.hud.show_text("已复制", false, false);
                     return Err(error.context("paste Whisper zh text"));
@@ -1204,6 +1209,7 @@ impl VoiceWorker {
                 record.total_elapsed_ms,
             );
             record.skipped_reason = "rewrite_disabled_raw_paste".to_string();
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             self.hud.clear();
             info!(
@@ -1243,6 +1249,7 @@ impl VoiceWorker {
             record.asr_elapsed_ms = asr_elapsed_ms;
             record.total_elapsed_ms = started_at.elapsed().as_millis();
             record.skipped_reason = "hud_first_before_async_rewrite".to_string();
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             self.hud.show_text(raw_text_for_paste, true, false);
             self.spawn_hud_first_whisper_rewrite(HudFirstWhisperRewriteJob {
@@ -1300,6 +1307,7 @@ impl VoiceWorker {
                 record.asr_elapsed_ms = asr_elapsed_ms;
                 record.total_elapsed_ms = started_at.elapsed().as_millis();
                 record.error = format!("paste failed: {error}");
+                stamp_rewrite_session(&mut record, rewrite_enabled);
                 self.history.record(record);
                 self.hud.show_text("已复制", false, false);
                 return Err(error.context("paste Whisper zh text"));
@@ -1334,6 +1342,7 @@ impl VoiceWorker {
         );
         self.hud.show_text("已上屏，改写中...", true, false);
         record.skipped_reason = "raw_paste_before_async_rewrite".to_string();
+        stamp_rewrite_session(&mut record, rewrite_enabled);
         self.history.record(record);
         self.spawn_async_whisper_rewrite(AsyncWhisperRewriteJob {
             utterance_id: utterance_id.clone(),
@@ -1474,6 +1483,7 @@ impl VoiceWorker {
             record.asr_elapsed_ms = asr_elapsed_ms;
             record.total_elapsed_ms = started_at.elapsed().as_millis();
             record.skipped_reason = "empty_result".to_string();
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             info!(
                 utterance_id,
@@ -1501,6 +1511,7 @@ impl VoiceWorker {
             } else {
                 "debug_raw_display_rewrite_disabled".to_string()
             };
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             self.hud.show_text(raw_text_for_paste, false, false);
             if !rewrite_enabled {
@@ -1569,6 +1580,7 @@ impl VoiceWorker {
                     record.asr_elapsed_ms = asr_elapsed_ms;
                     record.total_elapsed_ms = started_at.elapsed().as_millis();
                     record.error = format!("paste failed: {error}");
+                    stamp_rewrite_session(&mut record, rewrite_enabled);
                     self.history.record(record);
                     // B′: no "已复制" chip — just fade meter.
                     self.hud.clear();
@@ -1604,6 +1616,7 @@ impl VoiceWorker {
                 record.total_elapsed_ms,
             );
             record.skipped_reason = "rewrite_disabled_raw_paste".to_string();
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             self.hud.clear();
             info!(
@@ -1640,6 +1653,7 @@ impl VoiceWorker {
             record.asr_elapsed_ms = asr_elapsed_ms;
             record.total_elapsed_ms = started_at.elapsed().as_millis();
             record.skipped_reason = "hud_first_before_async_rewrite".to_string();
+            stamp_rewrite_session(&mut record, rewrite_enabled);
             self.history.record(record);
             // B′: no raw text on HUD — keep soft particles while rewrite runs.
             self.hud.show_meter_busy();
@@ -1696,6 +1710,7 @@ impl VoiceWorker {
                 record.asr_elapsed_ms = asr_elapsed_ms;
                 record.total_elapsed_ms = started_at.elapsed().as_millis();
                 record.error = format!("paste failed: {error}");
+                stamp_rewrite_session(&mut record, rewrite_enabled);
                 self.history.record(record);
                 self.hud.clear();
                 return Err(error.context("paste local non-streaming text"));
@@ -1731,6 +1746,7 @@ impl VoiceWorker {
         );
         self.hud.show_meter_busy();
         record.skipped_reason = "raw_paste_before_async_rewrite".to_string();
+        stamp_rewrite_session(&mut record, rewrite_enabled);
         self.history.record(record);
         self.spawn_async_nonstreaming_rewrite(
             AsyncWhisperRewriteJob {
@@ -1807,6 +1823,7 @@ impl VoiceWorker {
             let candidate = finalized.text.as_str();
             let mut record = HistoryRecord::new(&job.utterance_id, &job.profile_id, history_mode);
             record.raw_text = job.raw_text.clone();
+            stamp_rewrite_session(&mut record, job.rewrite_enabled);
             apply_rewrite_trace_to_record(&mut record, &trace);
             record.finalized_text = finalized.text.clone();
             record.finalizer_actions = finalized.actions.clone();
@@ -1834,6 +1851,7 @@ impl VoiceWorker {
                 Some(trace.elapsed_ms),
                 record.total_elapsed_ms,
             );
+            stamp_rewrite_session(&mut record, job.rewrite_enabled);
             history.record(record);
 
             if silent {
@@ -2012,6 +2030,7 @@ impl VoiceWorker {
 
             let mut record = HistoryRecord::new(&job.utterance_id, &job.profile_id, history_mode);
             record.raw_text = job.raw_text.clone();
+            stamp_rewrite_session(&mut record, job.rewrite_enabled);
             apply_rewrite_trace_to_record(&mut record, &trace);
             record.finalized_text = final_text.clone();
             record.finalizer_actions = finalizer_actions;
@@ -2298,6 +2317,7 @@ impl VoiceWorker {
                 "streaming_asr_async_rewrite",
             );
             record.raw_text = job.raw_text.clone();
+            stamp_rewrite_session(&mut record, job.rewrite_enabled);
             apply_rewrite_trace_to_record(&mut record, &trace);
             record.finalized_text = finalized.text.clone();
             record.finalizer_actions = finalized.actions.clone();
@@ -2334,6 +2354,7 @@ impl VoiceWorker {
                 replacement_age_ms,
                 record.total_elapsed_ms,
             );
+            stamp_rewrite_session(&mut record, job.rewrite_enabled);
             history.record(record);
 
             if replacement_outcome.applied {
@@ -2489,6 +2510,7 @@ impl VoiceWorker {
                 "streaming_asr_hud_fallback_rewrite",
             );
             record.raw_text = job.raw_text.clone();
+            stamp_rewrite_session(&mut record, job.rewrite_enabled);
             apply_rewrite_trace_to_record(&mut record, &trace);
             record.finalized_text = final_text.clone();
             record.finalizer_actions = finalizer_actions;
@@ -3083,7 +3105,19 @@ fn apply_whisper_rewrite_with(
     silent_hud: bool,
 ) -> RewriteTrace {
     let Some(rewriter) = rewriter else {
-        return RewriteTrace::default();
+        return RewriteTrace {
+            enabled: rewrite_enabled,
+            attempts: if rewrite_enabled {
+                vec![RewriteAttempt {
+                    model: String::new(),
+                    error: "rewriter_unavailable".to_string(),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
     };
     let text_chars = raw_text.trim().chars().count();
     if !rewrite_enabled || text_chars == 0 {
@@ -3796,12 +3830,17 @@ fn short_text(text: &str, max_chars: usize) -> String {
 }
 
 fn apply_rewrite_trace_to_record(record: &mut HistoryRecord, trace: &RewriteTrace) {
-    record.rewrite_enabled = trace.enabled;
+    // Prefer true if either session stamp or this trace enabled rewrite.
+    record.rewrite_enabled = trace.enabled || record.rewrite_enabled;
     record.rewrite_model = trace.selected_model.clone();
     record.rewrite_attempts = format_rewrite_attempts(trace);
     record.rewrite_elapsed_ms = trace.elapsed_ms;
     record.rewrite_error = format_rewrite_errors(trace);
     record.rewrite_text = trace.output.clone().unwrap_or_default();
+}
+
+fn stamp_rewrite_session(record: &mut HistoryRecord, rewrite_enabled: bool) {
+    record.rewrite_enabled = rewrite_enabled;
 }
 
 #[cfg(test)]

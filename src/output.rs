@@ -40,7 +40,7 @@ const VK_SHIFT: VIRTUAL_KEY = VIRTUAL_KEY(0x10);
 const VK_ALT: VIRTUAL_KEY = VIRTUAL_KEY(0x12);
 const VK_LWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5B);
 const VK_RWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5C);
-const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_millis(160);
+const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_millis(350);
 const MODIFIER_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const TARGET_TEXT_TIMEOUT_MS: u32 = 25;
 const TARGET_TEXT_MAX_U16: usize = 32_768;
@@ -573,6 +573,7 @@ pub fn paste_text_to_target_with_trace(
     let modifiers_released = wait_for_paste_modifiers_released();
     let input_before_sendinput = InputStateSnapshot::capture();
     if !modifiers_released {
+        append_action(&mut prepared.actions, "copy_only_modifier_still_down");
         warn!(
             utterance_id,
             text_chars = prepared.text.chars().count(),
@@ -600,11 +601,15 @@ pub fn paste_text_to_target_with_trace(
             clipboard_set_retries = clipboard_report.set_retries,
             clipboard_retained = clipboard_report.clipboard_retained(),
             output_action = "copy_only_modifier_still_down",
-            "paste blocked because modifier key is still down"
-        );
-        return Err(anyhow!(
             "paste blocked because modifier key is still down; text retained in clipboard"
-        ));
+        );
+        return Ok(PasteOutcome {
+            text: prepared.text,
+            target_context: target.context.clone(),
+            target_summary: target.summary.clone(),
+            target_fingerprint: target.fingerprint.clone(),
+            text_actions: prepared.actions,
+        });
     }
     thread::sleep(Duration::from_millis(config.paste_stabilize_ms));
     let input_after_stabilize = InputStateSnapshot::capture();
@@ -636,11 +641,15 @@ pub fn paste_text_to_target_with_trace(
                 clipboard_set_retries = clipboard_report.set_retries,
                 clipboard_retained = clipboard_report.clipboard_retained(),
                 output_action = "copy_only_preflight_blocked",
-                "paste skipped after clipboard write because input preflight failed"
+                "paste skipped after clipboard write because input preflight failed; text retained in clipboard"
             );
-            return Err(anyhow!(
-                "paste skipped because {reason}; text retained in clipboard"
-            ));
+            return Ok(PasteOutcome {
+                text: prepared.text,
+                target_context: target.context.clone(),
+                target_summary: target.summary.clone(),
+                target_fingerprint: target.fingerprint.clone(),
+                text_actions: prepared.actions,
+            });
         }
     }
     let paste_result = send_ctrl_v();

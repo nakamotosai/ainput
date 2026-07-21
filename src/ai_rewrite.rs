@@ -78,10 +78,17 @@ impl SharedRewriter {
     }
 
     pub fn replace_config(&self, config: RewriteConfig) -> Result<()> {
-        let rewriter = match AiRewriter::new(config.clone()) {
+        let rebuild = AiRewriter::new(config.clone());
+        let needs_client = !config.endpoint_url.trim().is_empty()
+            || !config.api_key.trim().is_empty()
+            || !config.model.trim().is_empty();
+        let rewriter = match rebuild {
             Ok(rewriter) => Some(rewriter),
             Err(error) => {
                 warn!(error = %error, "AI rewrite client rebuild failed");
+                if needs_client {
+                    return Err(error.context("rebuild AI rewrite client from settings"));
+                }
                 None
             }
         };

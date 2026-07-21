@@ -41,9 +41,22 @@ use windows::Win32::UI::HiDpi::{
     PROCESS_SYSTEM_DPI_AWARE, SetProcessDpiAwareness, SetProcessDpiAwarenessContext,
 };
 #[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, SetProcessDPIAware, MB_ICONERROR, MB_OK};
+#[cfg(windows)]
+use windows::core::PCWSTR;
 
-fn main() -> Result<()> {
+fn main() {
+    install_panic_hook();
+    if let Err(error) = run_app() {
+        let message = format!("{error:#}");
+        eprintln!("ainput failed: {message}");
+        error!(error = %message, "ainput exited with error");
+        show_startup_error(&message);
+        std::process::exit(1);
+    }
+}
+
+fn run_app() -> Result<()> {
     let dpi_awareness = configure_process_dpi_awareness();
     let install_root = resolve_install_root().context("resolve install root")?;
     let state_root = resolve_state_root(&install_root).context("resolve state root")?;
@@ -137,7 +150,12 @@ fn main() -> Result<()> {
     } else {
         info!("cloud streaming ASR profile disabled; skip health probe");
     }
-    let asr_sessions = asr_pool::AsrSessionPool::new(asr.clone());
+    // Public product keeps streaming off: construct pool without auto-preheat noise.
+    let asr_sessions = if config.profiles.streaming.enabled {
+        asr_pool::AsrSessionPool::new(asr.clone())
+    } else {
+        asr_pool::AsrSessionPool::new_without_preheat(asr.clone())
+    };
     if !config.profiles.streaming.enabled {
         asr_sessions.set_preheat_enabled(false, "streaming_profile_disabled");
     }
@@ -243,6 +261,63 @@ fn main() -> Result<()> {
     let result = worker.run(hotkey_rx);
     hotkey_monitor.stop();
     result
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = format!("ainput panic at {location}: {payload}");
+        eprintln!("{message}");
+        error!(%message, "ainput panic");
+        show_startup_error(&message);
+        default_hook(info);
+    }));
+}
+
+fn show_startup_error(message: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let title: Vec<u16> = std::ffi::OsStr::new("ainput 启动失败")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let body_src = if message.chars().count() > 900 {
+            format!(
+                "{}…\n\n完整错误已写入 state\\logs\\ainput.log（若日志已初始化）。",
+                message.chars().take(900).collect::<String>()
+            )
+        } else {
+            format!("{message}\n\n若仍无法启动，请查看 state\\logs\\ainput.log。")
+        };
+        let body: Vec<u16> = std::ffi::OsStr::new(&body_src)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                PCWSTR(body.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = message;
+    }
 }
 
 fn spawn_api_setup_probe(

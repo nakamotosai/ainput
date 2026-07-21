@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -119,6 +119,25 @@ pub fn load_recent(path: &Path, limit: usize) -> Result<Vec<HistoryRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    // Prefer reading from the end of the file so large JSONL histories stay snappy.
+    let records = match load_recent_from_tail(path, limit) {
+        Ok(records) => records,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %path.display(),
+                "history tail read failed; falling back to full scan"
+            );
+            load_recent_full_scan(path, limit)?
+        }
+    };
+    Ok(records)
+}
+
+fn load_recent_full_scan(path: &Path, limit: usize) -> Result<Vec<HistoryRecord>> {
     let file = File::open(path).with_context(|| format!("open history {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut records = Vec::new();
@@ -135,6 +154,43 @@ pub fn load_recent(path: &Path, limit: usize) -> Result<Vec<HistoryRecord>> {
     if records.len() > limit {
         records.drain(0..records.len() - limit);
     }
+    Ok(records)
+}
+
+fn load_recent_from_tail(path: &Path, limit: usize) -> Result<Vec<HistoryRecord>> {
+    let mut file = File::open(path).with_context(|| format!("open history {}", path.display()))?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    // Read a trailing window large enough for ~limit JSONL rows of typical size.
+    // Cap window to 4 MiB to bound memory.
+    let window = std::cmp::min(len, 4 * 1024 * 1024);
+    file.seek(SeekFrom::End(-(window as i64)))?;
+    let mut buf = Vec::with_capacity(window as usize);
+    file.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // If we started mid-line, drop the first partial line unless we read the whole file.
+    if window < len && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let mut records = Vec::new();
+    for line in lines.into_iter().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<HistoryRecord>(line) {
+            Ok(record) => {
+                records.push(record);
+                if records.len() >= limit {
+                    break;
+                }
+            }
+            Err(error) => warn!(error = %error, "skip malformed history record"),
+        }
+    }
+    records.reverse();
     Ok(records)
 }
 

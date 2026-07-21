@@ -67,7 +67,9 @@ Package a portable folder + zip:
 
 - Microphone audio is processed **on device** for ASR.
 - Rewrite (if enabled) sends text only to the endpoint **you** configured.
-- No default SaaS gateway. Keys stay in local `state/config/`.
+- No default SaaS gateway. Keys stay in local `state/config/` (plain JSON on disk).
+- Dictation history is local-only at `state/logs/history.jsonl`. Each line may include full raw/rewrite text plus target process name and window title. **Do not share your `state/` folder** (keys + history). Delete `history.jsonl` or the whole `state/` tree to wipe local archives.
+- Green release zips never include `state/`.
 
 ## Model attribution
 
@@ -76,7 +78,7 @@ See `THIRD_PARTY_NOTICES` and the license files under `models/sense-voice/`.
 
 ## Related
 
-- Private prototype lineage: ainput2 (not this public tree)
+- Private prototype lineage (not this public tree)
 - Archive of a previous same-name repo: [ainput-archive-20260721](https://github.com/nakamotosai/ainput-archive-20260721)
 
 ## Contributing

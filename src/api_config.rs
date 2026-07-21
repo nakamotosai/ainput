@@ -863,4 +863,27 @@ mod tests {
 
         assert!(!config.normalize_missing_defaults(Some(&raw)));
     }
+
+    #[test]
+    fn join_url_avoids_double_v1() {
+        use super::join_url;
+        assert_eq!(
+            join_url("https://integrate.api.nvidia.com/v1", "/v1/models"),
+            "https://integrate.api.nvidia.com/v1/models"
+        );
+        assert_eq!(
+            join_url("https://integrate.api.nvidia.com/v1", "v1/chat/completions"),
+            "https://integrate.api.nvidia.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url("https://api.example.com", "/v1/models"),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1/", "models"),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(join_url("https://api.example.com/v1", ""), "https://api.example.com/v1");
+        assert_eq!(join_url("https://api.example.com/v1", "v1"), "https://api.example.com/v1");
+    }
 }
