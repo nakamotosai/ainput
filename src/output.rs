@@ -19,7 +19,7 @@ use windows::Win32::UI::Accessibility::{
     TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, TextUnit_Character,
     UIA_TextPattern2Id, UIA_TextPatternId,
 };
-use windows::Win32::UI::Controls::EM_GETSEL;
+use windows::Win32::UI::Controls::{EM_GETSEL, EM_SETSEL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_TYPE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
@@ -45,6 +45,11 @@ const MODIFIER_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const TARGET_TEXT_TIMEOUT_MS: u32 = 25;
 const TARGET_TEXT_MAX_U16: usize = 32_768;
 const MAX_SAFE_REPLACEMENT_CHARS: usize = 1000;
+/// Chromium / Electron often drop tail events when one SendInput floods Shift+Left.
+/// Keep each keyboard batch small and pause between batches so the caret can catch up.
+const SHIFT_LEFT_CHUNK_SIZE: usize = 4;
+const SHIFT_LEFT_CHUNK_GAP: Duration = Duration::from_millis(10);
+const SELECTION_SETTLE_MS: u64 = 12;
 
 thread_local! {
     static COM_INIT_ATTEMPTED: Cell<bool> = const { Cell::new(false) };
@@ -916,16 +921,63 @@ pub fn replace_recent_paste_with_trace(
             return ReplacementOutcome::skipped(reason);
         }
     }
-    if let Err(error) = send_shift_left_repeated(raw_char_count) {
-        warn!(
-            utterance_id,
-            error = %error,
-            raw_chars = raw_char_count,
-            "async rewrite replacement skipped because selection failed"
-        );
-        return ReplacementOutcome::skipped("selection_send_failed");
+    // Prefer UIA/EM_SETSEL exact selection. Keyboard Shift+Left is only a last resort
+    // and must be chunked — bulk SendInput is the root of partial-select duplicates
+    // (e.g. leftover "你可" + full rewrite → "你可你可以…") in Claude/Chromium.
+    let selection_method = match select_raw_text_for_replacement(
+        &current_target,
+        raw_pasted_text,
+        raw_char_count,
+    ) {
+        Ok(method) => method,
+        Err(reason) => {
+            log_replacement_skip(
+                utterance_id,
+                reason,
+                raw_pasted_text,
+                replacement,
+                Some(&current_target),
+            );
+            return ReplacementOutcome::skipped(reason);
+        }
+    };
+    thread::sleep(Duration::from_millis(
+        config.paste_stabilize_ms.max(SELECTION_SETTLE_MS),
+    ));
+    match selection_covers_raw(raw_pasted_text, raw_char_count) {
+        SelectionCoverage::Full => {}
+        SelectionCoverage::Partial | SelectionCoverage::Empty => {
+            // Do not paste into a partial selection — that leaves raw prefix and looks like stutter.
+            log_replacement_skip(
+                utterance_id,
+                "selection_incomplete",
+                raw_pasted_text,
+                replacement,
+                Some(&current_target),
+            );
+            warn!(
+                utterance_id,
+                raw_chars = raw_char_count,
+                selection_method,
+                "async rewrite replacement skipped because selection did not cover full raw paste"
+            );
+            return ReplacementOutcome::skipped("selection_incomplete");
+        }
+        SelectionCoverage::Unknown => {
+            // Electron sometimes hides selection from UIA after keyboard select.
+            // Only allow unknown when we used exact UIA/edit methods; keyboard alone is too risky.
+            if selection_method == "keyboard_shift_left" {
+                log_replacement_skip(
+                    utterance_id,
+                    "selection_unverified",
+                    raw_pasted_text,
+                    replacement,
+                    Some(&current_target),
+                );
+                return ReplacementOutcome::skipped("selection_unverified");
+            }
+        }
     }
-    thread::sleep(Duration::from_millis(config.paste_stabilize_ms));
     if config.replacement_preflight_recheck {
         if let Some(reason) = current_input_preflight_block_reason(
             "modifier_still_down_before_replacement_paste",
@@ -956,6 +1008,7 @@ pub fn replace_recent_paste_with_trace(
                 target_class = %current_target.class_name.as_deref().unwrap_or("unknown"),
                 target_title = %current_target.title.as_deref().unwrap_or(""),
                 context_source,
+                selection_method,
                 clipboard_policy = clipboard_report.policy.as_str(),
                 clipboard_set_attempts = clipboard_report.set_attempts,
                 clipboard_set_retries = clipboard_report.set_retries,
@@ -977,6 +1030,7 @@ pub fn replace_recent_paste_with_trace(
                 raw_chars = raw_char_count,
                 replacement_chars = replacement.chars().count(),
                 context_source,
+                selection_method,
                 "async rewrite replacement paste failed"
             );
             ReplacementOutcome::skipped("replacement_paste_failed")
@@ -1786,20 +1840,324 @@ fn any_mouse_button_down() -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionCoverage {
+    Full,
+    Partial,
+    Empty,
+    Unknown,
+}
+
+/// Select the just-pasted raw text so Ctrl+V can overwrite it with the rewrite.
+/// Order: UIA TextRange::Select → standard EM_SETSEL → chunked Shift+Left keyboard.
+fn select_raw_text_for_replacement(
+    target: &ForegroundWindowSnapshot,
+    raw_pasted_text: &str,
+    raw_char_count: usize,
+) -> std::result::Result<&'static str, &'static str> {
+    if raw_char_count == 0 {
+        return Err("raw_text_empty");
+    }
+    if try_select_raw_via_uia(raw_pasted_text, raw_char_count) {
+        return Ok("uia_text_select");
+    }
+    if try_select_raw_via_edit_control(target, raw_pasted_text, raw_char_count) {
+        return Ok("standard_edit_setsel");
+    }
+    send_shift_left_repeated(raw_char_count).map_err(|_| "selection_send_failed")?;
+    Ok("keyboard_shift_left")
+}
+
+fn try_select_raw_via_uia(raw_pasted_text: &str, raw_char_count: usize) -> bool {
+    ensure_com_initialized();
+    unsafe {
+        let Ok(automation) = CoCreateInstance::<_, IUIAutomation>(
+            &CUIAutomation,
+            None::<&IUnknown>,
+            CLSCTX_INPROC_SERVER,
+        ) else {
+            return false;
+        };
+        let Ok(element) = automation.GetFocusedElement() else {
+            return false;
+        };
+        let pattern: IUIAutomationTextPattern = if let Ok(pattern2) =
+            element.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+        {
+            // TextPattern2 also implements TextPattern methods via cast path: use caret range then Select.
+            let mut is_active = BOOL(0);
+            if let Ok(caret) = pattern2.GetCaretRange(&mut is_active) {
+                return select_uia_left_range(&caret, raw_pasted_text, raw_char_count);
+            }
+            match element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
+                Ok(p) => p,
+                Err(_) => return false,
+            }
+        } else {
+            match element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
+                Ok(p) => p,
+                Err(_) => return false,
+            }
+        };
+        let Ok(selection) = pattern.GetSelection() else {
+            return false;
+        };
+        if selection.Length().ok().unwrap_or_default() <= 0 {
+            return false;
+        }
+        let Ok(selected_range) = selection.GetElement(0) else {
+            return false;
+        };
+        select_uia_left_range(&selected_range, raw_pasted_text, raw_char_count)
+    }
+}
+
+fn select_uia_left_range(
+    caret_or_selection: &windows::Win32::UI::Accessibility::IUIAutomationTextRange,
+    raw_pasted_text: &str,
+    raw_char_count: usize,
+) -> bool {
+    unsafe {
+        let Ok(compare) = caret_or_selection.CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            caret_or_selection,
+            TextPatternRangeEndpoint_End,
+        ) else {
+            return false;
+        };
+        // Collapse active selection to its end (caret) before expanding left over raw paste.
+        let Ok(range) = caret_or_selection.Clone() else {
+            return false;
+        };
+        if compare != 0 {
+            let _ = range.MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                caret_or_selection,
+                TextPatternRangeEndpoint_End,
+            );
+        }
+        if range
+            .MoveEndpointByUnit(
+                TextPatternRangeEndpoint_Start,
+                TextUnit_Character,
+                -(raw_char_count as i32),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(text) = range.GetText((raw_char_count + 8) as i32) else {
+            return false;
+        };
+        let got = text.to_string();
+        // Must match the raw paste exactly (or ends_with with same char length after left expand).
+        if got != raw_pasted_text
+            && !(got.ends_with(raw_pasted_text) && got.chars().count() == raw_char_count)
+        {
+            return false;
+        }
+        range.Select().is_ok()
+    }
+}
+
+fn try_select_raw_via_edit_control(
+    target: &ForegroundWindowSnapshot,
+    raw_pasted_text: &str,
+    raw_char_count: usize,
+) -> bool {
+    let Some(foreground_hwnd) = target.hwnd else {
+        return false;
+    };
+    unsafe {
+        let thread_id = GetWindowThreadProcessId(foreground_hwnd, None);
+        if thread_id == 0 {
+            return false;
+        }
+        let mut gui = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(thread_id, &mut gui).is_err() {
+            return false;
+        }
+        let focus_hwnd = if gui.hwndFocus.0.is_null() {
+            foreground_hwnd
+        } else {
+            gui.hwndFocus
+        };
+        let focus_class = window_class_name(focus_hwnd);
+        if !is_standard_text_control_class(&focus_class) {
+            return false;
+        }
+        let Some((selection_start, selection_end)) = edit_selection(focus_hwnd) else {
+            return false;
+        };
+        if selection_start != selection_end {
+            return false;
+        }
+        let caret = selection_end as usize;
+        let Some(text_len) = control_text_len(focus_hwnd) else {
+            return false;
+        };
+        let Some(text) = control_text_u16(focus_hwnd, text_len.min(TARGET_TEXT_MAX_U16)) else {
+            return false;
+        };
+        if caret > text.len() {
+            return false;
+        }
+        let left = String::from_utf16_lossy(&text[..caret]);
+        if !left.ends_with(raw_pasted_text) {
+            return false;
+        }
+        // EM_SETSEL uses UTF-16 code units, not Unicode scalar chars.
+        let raw_utf16_len = raw_pasted_text.encode_utf16().count();
+        if raw_utf16_len == 0 || caret < raw_utf16_len {
+            return false;
+        }
+        let start = (caret - raw_utf16_len) as u32;
+        let end = caret as u32;
+        let mut message_result = 0usize;
+        let status = SendMessageTimeoutW(
+            focus_hwnd,
+            EM_SETSEL,
+            WPARAM(start as usize),
+            LPARAM(end as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            TARGET_TEXT_TIMEOUT_MS,
+            Some(&mut message_result),
+        );
+        if status.0 == 0 {
+            return false;
+        }
+        // Confirm selection length.
+        if let Some((s, e)) = edit_selection(focus_hwnd) {
+            return e.saturating_sub(s) as usize == raw_utf16_len && e as usize == caret;
+        }
+        let _ = raw_char_count;
+        true
+    }
+}
+
+fn selection_covers_raw(raw_pasted_text: &str, raw_char_count: usize) -> SelectionCoverage {
+    if let Some(selected) = read_uia_selected_text() {
+        if selected == raw_pasted_text {
+            return SelectionCoverage::Full;
+        }
+        if !selected.is_empty() {
+            let selected_chars = selected.chars().count();
+            if selected_chars < raw_char_count {
+                // Classic partial Shift+Left: only a prefix of the raw paste is selected.
+                return SelectionCoverage::Partial;
+            }
+            if selected_chars == raw_char_count && selected != raw_pasted_text {
+                return SelectionCoverage::Partial;
+            }
+            if selected_chars > raw_char_count {
+                // Over-selected; paste would destroy extra user text.
+                return SelectionCoverage::Partial;
+            }
+            return SelectionCoverage::Partial;
+        }
+        // Empty selection string: caret collapsed or host hides selection. Fall through.
+    }
+
+    // If caret is still immediately after the raw paste, selection never took.
+    match capture_uia_text_left_context(raw_pasted_text) {
+        UiaLeftContext::Matches => SelectionCoverage::Empty,
+        UiaLeftContext::SelectionActive => {
+            // Selection exists but GetText path failed earlier; refuse blind paste.
+            SelectionCoverage::Unknown
+        }
+        UiaLeftContext::Mismatch => SelectionCoverage::Unknown,
+        UiaLeftContext::Unavailable => SelectionCoverage::Unknown,
+    }
+}
+
+fn read_uia_selected_text() -> Option<String> {
+    ensure_com_initialized();
+    unsafe {
+        let automation = CoCreateInstance::<_, IUIAutomation>(
+            &CUIAutomation,
+            None::<&IUnknown>,
+            CLSCTX_INPROC_SERVER,
+        )
+        .ok()?;
+        let element = automation.GetFocusedElement().ok()?;
+        let pattern = element
+            .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+            .ok()
+            .or_else(|| {
+                // Some hosts only expose TextPattern2; still try TextPattern id after probe.
+                let _ = element
+                    .GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+                    .ok()?;
+                element
+                    .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                    .ok()
+            })?;
+        let selection = pattern.GetSelection().ok()?;
+        if selection.Length().ok().unwrap_or_default() <= 0 {
+            return Some(String::new());
+        }
+        let range = selection.GetElement(0).ok()?;
+        let Ok(compare) = range.CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            &range,
+            TextPatternRangeEndpoint_End,
+        ) else {
+            return None;
+        };
+        if compare == 0 {
+            return Some(String::new());
+        }
+        let text = range.GetText(-1).ok()?.to_string();
+        Some(text)
+    }
+}
+
+/// Chunked Shift+Left so Chromium/Electron can apply each batch (bulk SendInput drops tail keys).
 fn send_shift_left_repeated(count: usize) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
-    let mut inputs = Vec::with_capacity(count.saturating_mul(2).saturating_add(2));
-    inputs.push(key_input(VK_SHIFT, KEYBD_EVENT_FLAGS(0)));
-    for _ in 0..count {
-        inputs.push(key_input(VK_LEFT, KEYBD_EVENT_FLAGS(0)));
-        inputs.push(key_input(VK_LEFT, KEYEVENTF_KEYUP));
+    // Hold Shift for the whole selection; release only at the end.
+    let shift_down = [key_input(VK_SHIFT, KEYBD_EVENT_FLAGS(0))];
+    let sent = unsafe { SendInput(&shift_down, std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        return Err(anyhow!("SendInput shift-down sent {sent}/1 events"));
     }
-    inputs.push(key_input(VK_SHIFT, KEYEVENTF_KEYUP));
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent != inputs.len() as u32 {
-        return Err(anyhow!("SendInput sent {sent}/{} events", inputs.len()));
+
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(SHIFT_LEFT_CHUNK_SIZE);
+        let mut inputs = Vec::with_capacity(chunk.saturating_mul(2));
+        for _ in 0..chunk {
+            inputs.push(key_input(VK_LEFT, KEYBD_EVENT_FLAGS(0)));
+            inputs.push(key_input(VK_LEFT, KEYEVENTF_KEYUP));
+        }
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent != inputs.len() as u32 {
+            let _ = unsafe {
+                SendInput(
+                    &[key_input(VK_SHIFT, KEYEVENTF_KEYUP)],
+                    std::mem::size_of::<INPUT>() as i32,
+                )
+            };
+            return Err(anyhow!(
+                "SendInput left chunk sent {sent}/{} events (remaining={remaining})",
+                inputs.len()
+            ));
+        }
+        remaining -= chunk;
+        if remaining > 0 {
+            thread::sleep(SHIFT_LEFT_CHUNK_GAP);
+        }
+    }
+
+    let shift_up = [key_input(VK_SHIFT, KEYEVENTF_KEYUP)];
+    let sent = unsafe { SendInput(&shift_up, std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        return Err(anyhow!("SendInput shift-up sent {sent}/1 events"));
     }
     Ok(())
 }
@@ -1952,8 +2310,8 @@ fn short_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RewriteOutputRoute, TargetFingerprint, TargetInsertionContext, TargetRightContext,
-        apply_target_punctuation_rule, classify_rewrite_output_route,
+        SHIFT_LEFT_CHUNK_SIZE, RewriteOutputRoute, TargetFingerprint, TargetInsertionContext,
+        TargetRightContext, apply_target_punctuation_rule, classify_rewrite_output_route,
         contains_terminal_mouse_escape, direct_output_disabled_reason,
         input_preflight_block_reason, is_standard_text_control_class, parse_wezterm_panes,
         replacement_candidate_char_count, retry_with_backoff, same_window_identity, short_text,
@@ -1966,6 +2324,26 @@ mod tests {
     fn text_hash_is_stable_for_same_text() {
         assert_eq!(stable_text_hash("hello"), stable_text_hash("hello"));
         assert_ne!(stable_text_hash("hello"), stable_text_hash("hello!"));
+    }
+
+    #[test]
+    fn shift_left_chunks_are_small_to_avoid_chromium_drop() {
+        // Guard against regressions that re-flood SendInput with dozens of Left keys.
+        assert!(SHIFT_LEFT_CHUNK_SIZE <= 8);
+        assert!(SHIFT_LEFT_CHUNK_SIZE >= 1);
+    }
+
+    #[test]
+    fn partial_raw_prefix_stutter_example() {
+        // Documented user failure: bulk Shift+Left selected only "你可" then paste rewrite.
+        let raw = "你可以去调查一下后台记录";
+        let rewrite = "你可以去调查一下后台记录";
+        let partial = "你可";
+        let stutter = format!("{partial}{rewrite}");
+        assert!(stutter.starts_with(partial));
+        assert_ne!(stutter, rewrite);
+        assert!(raw.starts_with(partial));
+        assert!(partial.chars().count() < raw.chars().count());
     }
 
     #[test]
