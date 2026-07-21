@@ -1,5 +1,5 @@
 //! Dark native settings panel for OpenAI-compatible rewrite credentials.
-//! Spacious layout, NVIDIA preset base URL, model list pull, timeout.
+//! Client-area sized via AdjustWindowRectEx + ClearType YaHei UI fonts.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -15,15 +15,16 @@ use anyhow::{Context, Result, anyhow};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DEFAULT_GUI_FONT, FillRect, GetStockObject, HBRUSH, SetBkColor, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FillRect, HBRUSH, HFONT, HGDIOBJ, OUT_OUTLINE_PRECIS,
+    SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CBS_DROPDOWN, CBS_HASSTRINGS, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_LEFT, ES_NUMBER,
-    ES_PASSWORD, GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU,
+    AdjustWindowRectEx, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CBS_DROPDOWN, CBS_HASSTRINGS,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_LEFT,
+    ES_NUMBER, ES_PASSWORD, GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU,
     IDC_ARROW, LoadCursorW, MSG, PostMessageW, PostThreadMessageW, RegisterClassW, SW_HIDE,
     SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow,
     TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
@@ -41,15 +42,20 @@ const PANEL_THREAD_QUIT: u32 = WM_APP + 121;
 const PANEL_OPEN: u32 = WM_APP + 122;
 const PANEL_MODELS_DONE: u32 = WM_APP + 123;
 
-const PANEL_WIDTH: i32 = 560;
-const PANEL_HEIGHT: i32 = 640;
-const MARGIN: i32 = 28;
-const FIELD_W: i32 = 500;
-const FIELD_H: i32 = 36;
-const LABEL_H: i32 = 22;
-const GAP_AFTER_LABEL: i32 = 8;
-const GAP_AFTER_FIELD: i32 = 22;
-const HINT_H: i32 = 40;
+/// Desired **client** area (content). Outer window size is derived via AdjustWindowRectEx.
+const CLIENT_W: i32 = 720;
+const CLIENT_H: i32 = 860;
+const MARGIN: i32 = 40;
+const FIELD_W: i32 = 640;
+const FIELD_H: i32 = 44;
+const LABEL_H: i32 = 30;
+const GAP_AFTER_LABEL: i32 = 10;
+const GAP_AFTER_FIELD: i32 = 30;
+const HINT_H: i32 = 58;
+const BUTTON_H: i32 = 48;
+const BUTTON_W: i32 = 160;
+const FONT_PX: i32 = 20;
+const TITLE_FONT_PX: i32 = 26;
 
 const ID_BASE_URL: i32 = 4001;
 const ID_API_KEY: i32 = 4002;
@@ -86,6 +92,7 @@ const BUTTON_BG: COLORREF = COLORREF(0x00_32_2A_2A);
 
 const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const PANEL_FONT_FAMILY: &str = "Microsoft YaHei UI";
 
 static FETCH_RESULT: OnceLock<Mutex<Option<Result<Vec<String>, String>>>> = OnceLock::new();
 
@@ -153,6 +160,8 @@ struct PanelState {
     brush_bg: HBRUSH,
     brush_input: HBRUSH,
     brush_button: HBRUSH,
+    font: HFONT,
+    title_font: HFONT,
     fetching: bool,
 }
 
@@ -176,6 +185,8 @@ impl PanelState {
             brush_bg: HBRUSH::default(),
             brush_input: HBRUSH::default(),
             brush_button: HBRUSH::default(),
+            font: HFONT::default(),
+            title_font: HFONT::default(),
             fetching: false,
         }
     }
@@ -185,6 +196,44 @@ thread_local! {
     static PANEL_READY: RefCell<Option<mpsc::Sender<Result<u32, String>>>> =
         const { RefCell::new(None) };
     static PANEL_STATE: RefCell<Option<PanelState>> = const { RefCell::new(None) };
+}
+
+unsafe fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
+    let family = HSTRING::from(PANEL_FONT_FAMILY);
+    unsafe {
+        CreateFontW(
+            -height_px.abs(),
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_OUTLINE_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY,
+            u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
+            PCWSTR(family.as_ptr()),
+        )
+    }
+}
+
+fn outer_size_for_client(style: WINDOW_STYLE) -> (i32, i32) {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: CLIENT_W,
+        bottom: CLIENT_H,
+    };
+    // AdjustWindowRectEx expands rect from client → outer (includes caption/borders).
+    let ok = unsafe { AdjustWindowRectEx(&mut rect, style, false, WINDOW_EX_STYLE(0)) };
+    if ok.is_err() {
+        // Fallback: typical caption+border padding so content is never clipped.
+        return (CLIENT_W + 16, CLIENT_H + 40);
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
 }
 
 unsafe fn run_panel_thread(shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -204,7 +253,7 @@ unsafe fn run_panel_thread(shutdown: Arc<AtomicBool>) -> Result<()> {
             let _ = sender.send(Ok(thread_id));
         }
     });
-    info!(thread_id, "API settings panel thread started");
+    info!(thread_id, client_w = CLIENT_W, client_h = CLIENT_H, "API settings panel thread started");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -244,7 +293,7 @@ unsafe fn register_panel_class(instance: HINSTANCE) -> Result<()> {
     let class = WNDCLASSW {
         lpfnWndProc: Some(panel_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput_api_settings"),
+        lpszClassName: w!("ainput_api_settings_v3"),
         hCursor: cursor,
         hbrBackground: unsafe { CreateSolidBrush(BG) },
         ..Default::default()
@@ -258,16 +307,17 @@ unsafe fn create_panel_window(instance: HINSTANCE) -> Result<HWND> {
     let style = WINDOW_STYLE(
         WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0,
     );
+    let (outer_w, outer_h) = outer_size_for_client(style);
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("ainput_api_settings"),
+            w!("ainput_api_settings_v3"),
             PCWSTR(title.as_ptr()),
             style,
-            160,
-            80,
-            PANEL_WIDTH,
-            PANEL_HEIGHT,
+            120,
+            40,
+            outer_w,
+            outer_h,
             None,
             None,
             Some(instance),
@@ -284,12 +334,19 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             return Err(anyhow!("panel state missing"));
         };
 
-        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+        state.font = unsafe { create_ui_font(FONT_PX, 400) };
+        state.title_font = unsafe { create_ui_font(TITLE_FONT_PX, 600) };
+        if state.font.is_invalid() || state.title_font.is_invalid() {
+            return Err(anyhow!("create panel UI font failed (Microsoft YaHei UI)"));
+        }
         state.brush_bg = unsafe { CreateSolidBrush(BG) };
         state.brush_input = unsafe { CreateSolidBrush(INPUT_BG) };
         state.brush_button = unsafe { CreateSolidBrush(BUTTON_BG) };
 
         let instance = unsafe { GetModuleHandleW(None) }.unwrap_or_default();
+        let body_font = state.font;
+        let title_font = state.title_font;
+
         let child = |class: PCWSTR,
                      text: &str,
                      style: WINDOW_STYLE,
@@ -297,7 +354,8 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
                      y: i32,
                      w: i32,
                      h: i32,
-                     id: i32|
+                     id: i32,
+                     use_title_font: bool|
          -> Result<HWND> {
             let text = HSTRING::from(text);
             let child_hwnd = unsafe {
@@ -317,6 +375,11 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
                 )
             }
             .map_err(|error| anyhow!("create child {id}: {error}"))?;
+            let font = if use_title_font {
+                title_font
+            } else {
+                body_font
+            };
             unsafe {
                 SendMessageW(
                     child_hwnd,
@@ -328,7 +391,7 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             Ok(child_hwnd)
         };
 
-        let mut y = 24i32;
+        let mut y = 28i32;
 
         let _title = child(
             w!("STATIC"),
@@ -337,21 +400,23 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             MARGIN,
             y,
             FIELD_W,
-            26,
+            34,
             ID_TITLE,
+            true,
         )?;
-        y += 32;
+        y += 42;
         let _hint = child(
             w!("STATIC"),
-            "填写 OpenAI 兼容接口。默认已预填 NVIDIA。Key 只保存在本机。",
+            "填写 OpenAI 兼容接口。默认已预填 NVIDIA。\r\nAPI Key 只保存在本机，不会上传到 ainput 服务器。",
             WINDOW_STYLE(0),
             MARGIN,
             y,
             FIELD_W,
             HINT_H,
             ID_HINT,
+            false,
         )?;
-        y += HINT_H + 12;
+        y += HINT_H + 18;
 
         let _lbl_url = child(
             w!("STATIC"),
@@ -362,6 +427,7 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             FIELD_W,
             LABEL_H,
             ID_LBL_URL,
+            false,
         )?;
         y += LABEL_H + GAP_AFTER_LABEL;
         state.base_url = child(
@@ -373,6 +439,7 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             FIELD_W,
             FIELD_H,
             ID_BASE_URL,
+            false,
         )?;
         y += FIELD_H + GAP_AFTER_FIELD;
 
@@ -385,6 +452,7 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             FIELD_W,
             LABEL_H,
             ID_LBL_KEY,
+            false,
         )?;
         y += LABEL_H + GAP_AFTER_LABEL;
         state.api_key = child(
@@ -402,20 +470,23 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             FIELD_W,
             FIELD_H,
             ID_API_KEY,
+            false,
         )?;
         y += FIELD_H + GAP_AFTER_FIELD;
 
         let _lbl_model = child(
             w!("STATIC"),
-            "Model（可手填，或点「拉取模型」后下拉选择）",
+            "模型（可手填，或填 Key 后点右侧「拉取模型」）",
             WINDOW_STYLE(0),
             MARGIN,
             y,
             FIELD_W,
             LABEL_H,
             ID_LBL_MODEL,
+            false,
         )?;
         y += LABEL_H + GAP_AFTER_LABEL;
+        let model_w = FIELD_W - 150;
         state.model = child(
             w!("COMBOBOX"),
             "",
@@ -428,31 +499,34 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             ),
             MARGIN,
             y,
-            FIELD_W - 130,
-            220,
+            model_w,
+            280,
             ID_MODEL,
+            false,
         )?;
         let _fetch = child(
             w!("BUTTON"),
             "拉取模型",
             WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-            MARGIN + FIELD_W - 120,
+            MARGIN + model_w + 12,
             y,
-            120,
+            138,
             FIELD_H,
             ID_FETCH,
+            false,
         )?;
         y += FIELD_H + GAP_AFTER_FIELD;
 
         let _lbl_timeout = child(
             w!("STATIC"),
-            "超时（毫秒，连不上时的兜底）",
+            "超时毫秒（连不上时的兜底，默认 5000）",
             WINDOW_STYLE(0),
             MARGIN,
             y,
             FIELD_W,
             LABEL_H,
             ID_LBL_TIMEOUT,
+            false,
         )?;
         y += LABEL_H + GAP_AFTER_LABEL;
         state.timeout = child(
@@ -461,9 +535,10 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32 | ES_NUMBER as u32 | WS_TABSTOP.0),
             MARGIN,
             y,
-            160,
+            200,
             FIELD_H,
             ID_TIMEOUT,
+            false,
         )?;
         y += FIELD_H + GAP_AFTER_FIELD;
 
@@ -474,10 +549,11 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             MARGIN,
             y,
             FIELD_W,
-            28,
+            36,
             ID_REWRITE,
+            false,
         )?;
-        y += 36;
+        y += 48;
 
         state.status = child(
             w!("STATIC"),
@@ -486,31 +562,46 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             MARGIN,
             y,
             FIELD_W,
-            40,
+            48,
             ID_STATUS,
+            false,
         )?;
-        y += 48;
+        y += 60;
 
+        // Bottom action row — must stay inside CLIENT_H.
         let _save = child(
             w!("BUTTON"),
             "保存",
             WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
             MARGIN,
             y,
-            130,
-            40,
+            BUTTON_W,
+            BUTTON_H,
             ID_SAVE,
+            false,
         )?;
         let _cancel = child(
             w!("BUTTON"),
             "取消",
             WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-            MARGIN + 150,
+            MARGIN + BUTTON_W + 24,
             y,
-            130,
-            40,
+            BUTTON_W,
+            BUTTON_H,
             ID_CANCEL,
+            false,
         )?;
+
+        let bottom = y + BUTTON_H + MARGIN;
+        if bottom > CLIENT_H {
+            warn!(
+                bottom,
+                client_h = CLIENT_H,
+                "API panel layout exceeds client height — enlarge CLIENT_H"
+            );
+        } else {
+            info!(bottom, client_h = CLIENT_H, "API panel layout fits client area");
+        }
         Ok(())
     })
 }
@@ -670,12 +761,12 @@ fn handle_fetch_result() {
                 set_status(state, &format!("已拉取 {count} 个模型，请下拉选择"));
             }
             Some(Err(error)) => {
-                let short = if error.chars().count() > 140 {
-                    format!("{}…", error.chars().take(140).collect::<String>())
+                let short = if error.chars().count() > 160 {
+                    format!("{}…", error.chars().take(160).collect::<String>())
                 } else {
                     error
                 };
-                set_status(state, &format!("拉取失败（可手填 Model）：{short}"));
+                set_status(state, &format!("拉取失败（可手填模型）：{short}"));
             }
             None => set_status(state, "拉取结果丢失，请重试"),
         }
@@ -729,7 +820,7 @@ fn save_fields(state: &PanelState) {
         return;
     }
     if enable_rewrite && model.trim().is_empty() {
-        set_status(state, "启用改写前请先填写或选择 Model");
+        set_status(state, "启用改写前请先填写或选择模型");
         return;
     }
     if enable_rewrite && key.trim().is_empty() {
@@ -954,7 +1045,25 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        WM_DESTROY => LRESULT(0),
+        WM_DESTROY => {
+            PANEL_STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    if !state.font.is_invalid() {
+                        unsafe {
+                            let _ = DeleteObject(HGDIOBJ(state.font.0));
+                        }
+                        state.font = HFONT::default();
+                    }
+                    if !state.title_font.is_invalid() {
+                        unsafe {
+                            let _ = DeleteObject(HGDIOBJ(state.title_font.0));
+                        }
+                        state.title_font = HFONT::default();
+                    }
+                }
+            });
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
