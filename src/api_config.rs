@@ -627,6 +627,98 @@ impl Default for RewriteApiConfig {
     }
 }
 
+/// Result of a lightweight connectivity probe against `/v1/models`.
+#[derive(Debug, Clone)]
+pub struct ConnectivityProbe {
+    pub ok: bool,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub url: String,
+    pub error: Option<String>,
+}
+
+/// Probe OpenAI-compatible endpoint: GET models path, report HTTP status + latency.
+/// Does **not** require a 2xx to return; caller decides UX from `status`/`ok`.
+pub fn probe_connectivity(
+    base_url: &str,
+    api_key: &str,
+    models_path: &str,
+    timeout_ms: u64,
+) -> ConnectivityProbe {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return ConnectivityProbe {
+            ok: false,
+            status: 0,
+            latency_ms: 0,
+            url: String::new(),
+            error: Some("Base URL 为空".to_string()),
+        };
+    }
+    let path = if models_path.trim().is_empty() {
+        "/v1/models"
+    } else {
+        models_path.trim()
+    };
+    let url = join_url(base, path);
+    let timeout = Duration::from_millis(timeout_ms.clamp(500, 60_000));
+    let client = match Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return ConnectivityProbe {
+                ok: false,
+                status: 0,
+                latency_ms: 0,
+                url,
+                error: Some(format!("build client: {error}")),
+            };
+        }
+    };
+    let mut request = client.get(&url);
+    let key = api_key.trim();
+    if !key.is_empty() {
+        request = request.bearer_auth(key);
+    } else if let Some(env_key) = read_api_key("AINPUT_API_KEY") {
+        request = request.bearer_auth(env_key);
+    }
+    let started = std::time::Instant::now();
+    match request.send() {
+        Ok(response) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let status = response.status().as_u16();
+            let ok = response.status().is_success();
+            // Drain body so connection can close cleanly; ignore parse errors for probe.
+            let _ = response.bytes();
+            ConnectivityProbe {
+                ok,
+                status,
+                latency_ms,
+                url,
+                error: if ok {
+                    None
+                } else {
+                    Some(format!("HTTP {status}"))
+                },
+            }
+        }
+        Err(error) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            ConnectivityProbe {
+                ok: false,
+                status: 0,
+                latency_ms,
+                url,
+                error: Some(format!("{error}")),
+            }
+        }
+    }
+}
+
 /// List model ids from an OpenAI-compatible `/v1/models` endpoint.
 pub fn list_models(
     base_url: &str,

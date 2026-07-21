@@ -41,6 +41,7 @@ use crate::rewrite_language::RewriteLanguageController;
 const PANEL_THREAD_QUIT: u32 = WM_APP + 121;
 const PANEL_OPEN: u32 = WM_APP + 122;
 const PANEL_MODELS_DONE: u32 = WM_APP + 123;
+const PANEL_PROBE_DONE: u32 = WM_APP + 124;
 
 /// Desired **client** area (content). Outer window size is derived via AdjustWindowRectEx.
 const CLIENT_W: i32 = 720;
@@ -95,9 +96,14 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const PANEL_FONT_FAMILY: &str = "Microsoft YaHei UI";
 
 static FETCH_RESULT: OnceLock<Mutex<Option<Result<Vec<String>, String>>>> = OnceLock::new();
+static PROBE_RESULT: OnceLock<Mutex<Option<api_config::ConnectivityProbe>>> = OnceLock::new();
 
 fn fetch_result_slot() -> &'static Mutex<Option<Result<Vec<String>, String>>> {
     FETCH_RESULT.get_or_init(|| Mutex::new(None))
+}
+
+fn probe_result_slot() -> &'static Mutex<Option<api_config::ConnectivityProbe>> {
+    PROBE_RESULT.get_or_init(|| Mutex::new(None))
 }
 
 #[derive(Clone)]
@@ -279,6 +285,10 @@ unsafe fn run_panel_thread(shutdown: Arc<AtomicBool>) -> Result<()> {
         }
         if msg.message == PANEL_MODELS_DONE {
             handle_fetch_result();
+            continue;
+        }
+        if msg.message == PANEL_PROBE_DONE {
+            handle_probe_result();
             continue;
         }
         unsafe {
@@ -864,14 +874,35 @@ fn fill_model_combo(combo: HWND, models: &[String], prefer: &str) {
     }
 }
 
-fn save_fields(state: &PanelState) {
-    let base = get_window_text(state.base_url);
-    let key = get_window_text(state.api_key);
-    let model = get_combo_text(state.model);
-    let timeout_ms = parse_timeout_ms(&get_window_text(state.timeout));
+/// Save path: write config (including API key) to disk, hot-reload rewriter,
+/// then async probe connectivity (HTTP status + latency). No RefCell hold across UI.
+fn save_fields() {
+    let Some(ui) = panel_ui_handles() else {
+        return;
+    };
+
+    // Snapshot controller handles without holding borrow across SetWindowText.
+    let snapshot = PANEL_STATE.with(|cell| {
+        let borrow = cell.try_borrow().ok()?;
+        let state = borrow.as_ref()?;
+        Some((
+            state.api_path.clone(),
+            state.rewrite_language.clone(),
+            state.rewriter.clone(),
+            state.rewrite_check,
+        ))
+    });
+    let Some((api_path, rewrite_language, rewriter, rewrite_check)) = snapshot else {
+        return;
+    };
+
+    let base = get_window_text(ui.base_url);
+    let key = get_window_text(ui.api_key);
+    let model = get_combo_text(ui.model);
+    let timeout_ms = parse_timeout_ms(&get_window_text(ui.timeout));
     let enable_rewrite = unsafe {
         SendMessageW(
-            state.rewrite_check,
+            rewrite_check,
             BM_GETCHECK,
             Some(WPARAM(0)),
             Some(LPARAM(0)),
@@ -880,20 +911,20 @@ fn save_fields(state: &PanelState) {
     };
 
     if enable_rewrite && base.trim().is_empty() {
-        set_status(state, "启用改写前请先填写 Base URL");
+        set_status_hwnd(ui.status, "启用改写前请先填写 Base URL");
         return;
     }
     if enable_rewrite && model.trim().is_empty() {
-        set_status(state, "启用改写前请先填写或选择模型");
+        set_status_hwnd(ui.status, "启用改写前请先填写或选择模型");
         return;
     }
     if enable_rewrite && key.trim().is_empty() {
-        set_status(state, "启用改写前请先填写 API Key");
+        set_status_hwnd(ui.status, "启用改写前请先填写 API Key");
         return;
     }
 
-    let mut config = if state.api_path.exists() {
-        match std::fs::read_to_string(&state.api_path)
+    let mut config = if api_path.exists() {
+        match std::fs::read_to_string(&api_path)
             .ok()
             .and_then(|raw| serde_json::from_str::<ApiConnectionsConfig>(&raw).ok())
         {
@@ -907,6 +938,7 @@ fn save_fields(state: &PanelState) {
     if config.cliproxyapi.base_url.is_empty() {
         config.cliproxyapi.base_url = NVIDIA_BASE_URL.to_string();
     }
+    // Persist API key to local state file (not uploaded to ainput).
     config.cliproxyapi.api_key = key.trim().to_string();
     if config.cliproxyapi.api_key_env.trim().is_empty() {
         config.cliproxyapi.api_key_env = "AINPUT_API_KEY".to_string();
@@ -921,37 +953,118 @@ fn save_fields(state: &PanelState) {
     config.rewrite.timeout_ms = timeout_ms;
 
     let connections = ApiConnections {
-        path: state.api_path.clone(),
+        path: api_path,
         config,
     };
     if let Err(error) = connections.save() {
-        set_status(state, &format!("保存失败：{error}"));
+        set_status_hwnd(ui.status, &format!("保存失败：{error}"));
         return;
     }
 
-    state.rewrite_language.set_rewrite_enabled(enable_rewrite);
-    if let Err(error) = state.rewriter.apply_connection(
+    rewrite_language.set_rewrite_enabled(enable_rewrite);
+    if let Err(error) = rewriter.apply_connection(
         &connections.config.cliproxyapi.base_url,
         &connections.config.cliproxyapi.api_key,
         &connections.config.rewrite.model,
         &connections.config.cliproxyapi.chat_completions_path,
         timeout_ms,
     ) {
-        set_status(state, &format!("已写盘，热加载失败：{error}"));
+        set_status_hwnd(ui.status, &format!("Key 已保存，热加载失败：{error}"));
         return;
     }
 
-    let msg = if enable_rewrite {
-        format!("已保存 · AI 改写开启 · 超时 {timeout_ms} ms")
+    let key_note = if connections.config.cliproxyapi.api_key.is_empty() {
+        "Key 空"
     } else {
-        "已保存 · 仅本地听写".to_string()
+        "Key 已落盘"
     };
-    set_status(state, &msg);
+    let rewrite_note = if enable_rewrite {
+        "改写开"
+    } else {
+        "仅听写"
+    };
+    set_status_hwnd(
+        ui.status,
+        &format!("已保存（{key_note} · {rewrite_note}）· 测连通中…"),
+    );
     info!(
         path = %connections.path.display(),
         rewrite_enabled = enable_rewrite,
         timeout_ms,
-        "API settings saved"
+        key_saved = !connections.config.cliproxyapi.api_key.is_empty(),
+        "API settings saved; probing connectivity"
+    );
+
+    // Async connectivity probe — never block UI thread / never panic process.
+    let hwnd_raw = ui.hwnd.0 as isize;
+    let probe_base = connections.config.cliproxyapi.base_url.clone();
+    let probe_key = connections.config.cliproxyapi.api_key.clone();
+    let probe_path = connections.config.cliproxyapi.models_path.clone();
+    thread::spawn(move || {
+        let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            api_config::probe_connectivity(&probe_base, &probe_key, &probe_path, timeout_ms)
+        }))
+        .unwrap_or_else(|_| api_config::ConnectivityProbe {
+            ok: false,
+            status: 0,
+            latency_ms: 0,
+            url: String::new(),
+            error: Some("连通探测线程 panic".to_string()),
+        });
+        if let Ok(mut slot) = probe_result_slot().lock() {
+            *slot = Some(probe);
+        }
+        let hwnd = HWND(hwnd_raw as *mut _);
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), PANEL_PROBE_DONE, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+fn handle_probe_result() {
+    let probe = probe_result_slot()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    let Some(ui) = panel_ui_handles() else {
+        return;
+    };
+    let Some(probe) = probe else {
+        set_status_hwnd(ui.status, "已保存 · 连通结果丢失，可再点保存重测");
+        return;
+    };
+    let msg = if probe.ok {
+        format!(
+            "已保存 · Key 已落盘 · 连通 OK · HTTP {} · {} ms",
+            probe.status, probe.latency_ms
+        )
+    } else if probe.status > 0 {
+        format!(
+            "已保存 · Key 已落盘 · 连通异常 · HTTP {} · {} ms",
+            probe.status, probe.latency_ms
+        )
+    } else {
+        let err = probe
+            .error
+            .as_deref()
+            .unwrap_or("网络错误");
+        let short = if err.chars().count() > 80 {
+            format!("{}…", err.chars().take(80).collect::<String>())
+        } else {
+            err.to_string()
+        };
+        format!(
+            "已保存 · Key 已落盘 · 连通失败 · {} ms · {short}",
+            probe.latency_ms
+        )
+    };
+    set_status_hwnd(ui.status, &msg);
+    info!(
+        ok = probe.ok,
+        status = probe.status,
+        latency_ms = probe.latency_ms,
+        url = %probe.url,
+        "API connectivity probe done"
     );
 }
 
@@ -1084,13 +1197,7 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             if code == BN_CLICKED {
                 match id {
-                    ID_SAVE => {
-                        PANEL_STATE.with(|state| {
-                            if let Some(state) = state.borrow().as_ref() {
-                                save_fields(state);
-                            }
-                        });
-                    }
+                    ID_SAVE => save_fields(),
                     ID_CANCEL => {
                         unsafe {
                             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1104,6 +1211,10 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         m if m == PANEL_MODELS_DONE => {
             handle_fetch_result();
+            LRESULT(0)
+        }
+        m if m == PANEL_PROBE_DONE => {
+            handle_probe_result();
             LRESULT(0)
         }
         WM_CLOSE => {
