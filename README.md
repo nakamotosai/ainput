@@ -25,6 +25,14 @@
 
 https://input.saaaai.com/
 
+## Download (v0.1.0)
+
+| Channel | Link |
+|---|---|
+| **GitHub Release** | [ainput-0.1.0-win64.zip](https://github.com/nakamotosai/ainput/releases/download/v0.1.0/ainput-0.1.0-win64.zip) |
+| **Hugging Face mirror** | [ainput-0.1.0-win64.zip](https://huggingface.co/nakamotosai/cnjp-input/resolve/main/ainput-0.1.0-win64.zip) · [repo](https://huggingface.co/nakamotosai/cnjp-input) |
+| Site | https://input.saaaai.com/ |
+
 ## Quick start
 
 1. Download the release zip (or build from source).

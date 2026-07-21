@@ -5,6 +5,8 @@ Local-first Windows voice dictation. Hold **CapsLock**, speak, text pastes into 
 ## Download
 
 - **Windows x64 green zip:** `ainput-0.1.0-win64.zip` (unpack and run — no installer)
+- **GitHub Release:** https://github.com/nakamotosai/ainput/releases/tag/v0.1.0
+- **Hugging Face mirror:** https://huggingface.co/nakamotosai/cnjp-input/resolve/main/ainput-0.1.0-win64.zip
 - Official site: https://input.saaaai.com/
 
 ## What's in the zip
