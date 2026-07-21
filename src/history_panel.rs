@@ -1,515 +1,172 @@
-//! Native dark panel to browse local dictation history (raw vs rewrite).
+//! Local web UI for dictation history (loopback only).
 //!
-//! Body text uses a light opaque EDIT surface. Dark custom-colored multiline
-//! EDIT on Win32 commonly stacks glyphs when WM_CTLCOLOREDIT cannot return a
-//! solid brush (e.g. RefCell held across CreateWindow). Light body avoids that
-//! class of bug while chrome stays dark.
+//! Opens the default browser to `http://127.0.0.1:<port>/`.
+//! No native Win32 multi-line EDIT (avoids stacked-glyph bugs).
+//! No Python required; pure Rust TCP serve.
 
-use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use tracing::{info, warn};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, BACKGROUND_MODE, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FillRect, HBRUSH, HFONT, HGDIOBJ,
-    OUT_OUTLINE_PRECIS, OPAQUE, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, ES_WANTRETURN, GetClientRect,
-    GetMessageW, HMENU, IDC_ARROW, LoadCursorW, MSG, PostThreadMessageW, RegisterClassW, SW_HIDE,
-    SW_RESTORE, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND,
-    WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
-};
-use windows::core::{HSTRING, PCWSTR, w};
 
-use crate::history;
-
-const PANEL_THREAD_QUIT: u32 = WM_APP + 141;
-const PANEL_OPEN: u32 = WM_APP + 142;
-
-// Logical design sizes at 96 DPI; scaled at runtime with Windows display scale.
-const CLIENT_W_96: i32 = 920;
-const CLIENT_H_96: i32 = 840;
-const MARGIN_96: i32 = 28;
-const FONT_PX_96: i32 = 22;
-const TITLE_FONT_PX_96: i32 = 30;
-const PANEL_FONT_FAMILY: &str = "Microsoft YaHei UI";
-
-const ID_TITLE: i32 = 5001;
-const ID_SUMMARY: i32 = 5002;
-const ID_BODY: i32 = 5003;
-const ID_REFRESH: i32 = 5004;
-const ID_OPEN_FOLDER: i32 = 5005;
-const ID_CLOSE: i32 = 5006;
-
-// Dark chrome
-const BG: COLORREF = COLORREF(0x00_16_14_14);
-const TEXT: COLORREF = COLORREF(0x00_F2_F0_F0);
-const BUTTON_BG: COLORREF = COLORREF(0x00_32_2A_2A);
-// Light body surface — readable multiline EDIT (dark themed EDIT stacks glyphs on Win32).
-const BODY_BG: COLORREF = COLORREF(0x00_F4_F0_EC);
-const BODY_TEXT: COLORREF = COLORREF(0x00_1E_1A_18);
+use crate::history::{self, HistoryRecord};
 
 #[derive(Clone)]
 pub struct HistoryPanelController {
-    thread_id: u32,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    history_path: PathBuf,
+    base_url: String,
+    shutdown: Arc<AtomicBool>,
+    /// Last open error for diagnostics.
+    last_error: Mutex<Option<String>>,
 }
 
 impl HistoryPanelController {
     pub fn start(history_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self> {
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
-        thread::spawn(move || {
-            PANEL_READY.with(|ready| {
-                *ready.borrow_mut() = Some(ready_tx);
-            });
-            PANEL_STATE.with(|state| {
-                *state.borrow_mut() = Some(PanelState::new(history_path));
-            });
-            if let Err(error) = unsafe { run_panel_thread(shutdown) } {
-                warn!(error = %error, "history panel thread failed");
-            }
-        });
-        let thread_id = ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| anyhow!("history panel thread did not initialize"))?
-            .map_err(|error| anyhow!(error))?;
-        Ok(Self { thread_id })
+        // Bind ephemeral port on loopback only.
+        let listener = TcpListener::bind("127.0.0.1:0").context("bind history web server")?;
+        listener
+            .set_nonblocking(false)
+            .context("configure history listener")?;
+        let addr = listener
+            .local_addr()
+            .context("history listener local_addr")?;
+        let base_url = format!("http://{addr}");
+        let path_for_server = history_path.clone();
+        let shutdown_server = Arc::clone(&shutdown);
+
+        thread::Builder::new()
+            .name("ainput-history-web".into())
+            .spawn(move || {
+                if let Err(error) = run_server(listener, path_for_server, shutdown_server) {
+                    warn!(error = %error, "history web server stopped with error");
+                } else {
+                    info!("history web server stopped");
+                }
+            })
+            .context("spawn history web server")?;
+
+        info!(%base_url, path = %history_path.display(), "history web UI ready (loopback)");
+        Ok(Self {
+            inner: Arc::new(Inner {
+                history_path,
+                base_url,
+                shutdown,
+                last_error: Mutex::new(None),
+            }),
+        })
     }
 
     pub fn open(&self) {
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, PANEL_OPEN, WPARAM(0), LPARAM(0));
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return;
         }
-    }
-}
-
-impl Drop for HistoryPanelController {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, PANEL_THREAD_QUIT, WPARAM(0), LPARAM(0));
-        }
-    }
-}
-
-struct PanelState {
-    history_path: PathBuf,
-    hwnd: HWND,
-    summary: HWND,
-    body: HWND,
-    brush_bg: HBRUSH,
-    brush_body: HBRUSH,
-    brush_button: HBRUSH,
-    font: HFONT,
-    title_font: HFONT,
-}
-
-impl PanelState {
-    fn new(history_path: PathBuf) -> Self {
-        Self {
-            history_path,
-            hwnd: HWND::default(),
-            summary: HWND::default(),
-            body: HWND::default(),
-            brush_bg: HBRUSH::default(),
-            brush_body: HBRUSH::default(),
-            brush_button: HBRUSH::default(),
-            font: HFONT::default(),
-            title_font: HFONT::default(),
-        }
-    }
-}
-
-thread_local! {
-    static PANEL_READY: RefCell<Option<mpsc::Sender<Result<u32, String>>>> =
-        const { RefCell::new(None) };
-    static PANEL_STATE: RefCell<Option<PanelState>> = const { RefCell::new(None) };
-    /// Always-available brushes for WM_CTLCOLOR* — never depend on RefCell borrow.
-    static CTL_BRUSH_BG: Cell<isize> = const { Cell::new(0) };
-    static CTL_BRUSH_BODY: Cell<isize> = const { Cell::new(0) };
-    static CTL_BRUSH_BUTTON: Cell<isize> = const { Cell::new(0) };
-}
-
-fn set_ctl_brushes(bg: HBRUSH, body: HBRUSH, button: HBRUSH) {
-    CTL_BRUSH_BG.with(|c| c.set(bg.0 as isize));
-    CTL_BRUSH_BODY.with(|c| c.set(body.0 as isize));
-    CTL_BRUSH_BUTTON.with(|c| c.set(button.0 as isize));
-}
-
-fn ctl_brush_bg() -> HBRUSH {
-    HBRUSH(CTL_BRUSH_BG.with(|c| c.get()) as *mut _)
-}
-
-fn ctl_brush_body() -> HBRUSH {
-    HBRUSH(CTL_BRUSH_BODY.with(|c| c.get()) as *mut _)
-}
-
-fn ctl_brush_button() -> HBRUSH {
-    HBRUSH(CTL_BRUSH_BUTTON.with(|c| c.get()) as *mut _)
-}
-
-fn ui_scale_from_hwnd(hwnd: Option<HWND>) -> f32 {
-    let dpi = unsafe {
-        if let Some(hwnd) = hwnd {
-            let d = GetDpiForWindow(hwnd);
-            if d > 0 { d } else { 96 }
-        } else {
-            96
-        }
-    };
-    (dpi as f32 / 96.0).max(1.0)
-}
-
-fn scale_px(value_96: i32, scale: f32) -> i32 {
-    ((value_96 as f32) * scale).round().max(1.0) as i32
-}
-
-unsafe fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
-    let family = HSTRING::from(PANEL_FONT_FAMILY);
-    unsafe {
-        CreateFontW(
-            -height_px.abs(),
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_OUTLINE_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
-            PCWSTR(family.as_ptr()),
-        )
-    }
-}
-
-fn outer_size_for_client(style: WINDOW_STYLE, client_w: i32, client_h: i32) -> (i32, i32) {
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: client_w,
-        bottom: client_h,
-    };
-    let ok = unsafe { AdjustWindowRectEx(&mut rect, style, false, WINDOW_EX_STYLE(0)) };
-    if ok.is_err() {
-        return (client_w + 16, client_h + 40);
-    }
-    (rect.right - rect.left, rect.bottom - rect.top)
-}
-
-unsafe fn run_panel_thread(shutdown: Arc<AtomicBool>) -> Result<()> {
-    let instance = unsafe { GetModuleHandleW(None) }
-        .map_err(|error| anyhow!("get module handle failed: {error}"))?;
-    unsafe { register_panel_class(HINSTANCE(instance.0))? };
-    let hwnd = unsafe { create_panel_window(HINSTANCE(instance.0))? };
-    unsafe { create_panel_controls(hwnd)? };
-    PANEL_STATE.with(|state| {
-        if let Some(state) = state.borrow_mut().as_mut() {
-            state.hwnd = hwnd;
-        }
-    });
-    let thread_id = unsafe { GetCurrentThreadId() };
-    PANEL_READY.with(|ready| {
-        if let Some(sender) = ready.borrow_mut().take() {
-            let _ = sender.send(Ok(thread_id));
-        }
-    });
-    info!(thread_id, "history panel thread started");
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
+        let url = self.inner.base_url.clone();
+        match open_browser_hidden(&url) {
+            Ok(()) => {
+                info!(%url, "opened history web UI in browser");
+                if let Ok(mut slot) = self.inner.last_error.lock() {
+                    *slot = None;
+                }
             }
-            return Ok(());
-        }
-        let mut msg = MSG::default();
-        let has = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if has.0 == -1 {
-            return Err(anyhow!("history panel GetMessage failed"));
-        }
-        if has.0 == 0 || msg.message == PANEL_THREAD_QUIT {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
+            Err(error) => {
+                warn!(error = %error, %url, "open history web UI failed");
+                if let Ok(mut slot) = self.inner.last_error.lock() {
+                    *slot = Some(error.to_string());
+                }
             }
-            return Ok(());
         }
-        if msg.message == PANEL_OPEN {
-            open_panel_ui();
-            continue;
-        }
-        unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.inner.history_path
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.inner.base_url
     }
 }
 
-unsafe fn register_panel_class(instance: HINSTANCE) -> Result<()> {
-    let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
-    let class = WNDCLASSW {
-        lpfnWndProc: Some(panel_wnd_proc),
-        hInstance: instance,
-        // v3: light body surface + CTL brushes outside RefCell.
-        lpszClassName: w!("ainput_history_panel_v3"),
-        hCursor: cursor,
-        hbrBackground: unsafe { CreateSolidBrush(BG) },
-        ..Default::default()
-    };
-    unsafe { RegisterClassW(&class) };
+fn run_server(listener: TcpListener, history_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<()> {
+    // Accept with short timeout so shutdown can exit.
+    listener
+        .set_nonblocking(true)
+        .context("set nonblocking")?;
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                let path = history_path.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_client(stream, &path) {
+                        warn!(error = %error, peer = %peer, "history web request failed");
+                    }
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                warn!(error = %error, "history web accept failed");
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
     Ok(())
 }
 
-unsafe fn create_panel_window(instance: HINSTANCE) -> Result<HWND> {
-    let title = HSTRING::from(format!("ainput · 听写历史 {}", env!("CARGO_PKG_VERSION")));
-    let style = WINDOW_STYLE(
-        WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0,
-    );
-    let (outer_w, outer_h) = outer_size_for_client(style, CLIENT_W_96, CLIENT_H_96);
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("ainput_history_panel_v3"),
-            PCWSTR(title.as_ptr()),
-            style,
-            80,
-            40,
-            outer_w,
-            outer_h,
-            None,
-            None,
-            Some(instance),
-            None,
-        )
+fn handle_client(mut stream: TcpStream, history_path: &Path) -> Result<()> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    if n == 0 {
+        return Ok(());
     }
-    .map_err(|error| anyhow!("create history panel window failed: {error}"))?;
-    let scale = ui_scale_from_hwnd(Some(hwnd));
-    if (scale - 1.0).abs() > 0.01 {
-        let client_w = scale_px(CLIENT_W_96, scale);
-        let client_h = scale_px(CLIENT_H_96, scale);
-        let (ow, oh) = outer_size_for_client(style, client_w, client_h);
-        unsafe {
-            let _ = SetWindowPos(hwnd, None, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER);
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req.lines().next().unwrap_or("");
+    let path = first_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/");
+
+    match path {
+        "/" | "/index.html" => {
+            let records = history::load_recent(history_path, 500).unwrap_or_default();
+            let html = render_html_page(history_path, &records);
+            write_response(&mut stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
         }
-    }
-    Ok(hwnd)
-}
-
-/// Create children **without** holding PANEL_STATE RefCell across CreateWindow/SendMessage
-/// (those re-enter WM_CTLCOLOR* and would get a null brush → stacked glyphs).
-unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
-    let scale = ui_scale_from_hwnd(Some(hwnd));
-    let font_px = scale_px(FONT_PX_96, scale);
-    let title_px = scale_px(TITLE_FONT_PX_96, scale);
-    let margin = scale_px(MARGIN_96, scale);
-    let client_w = scale_px(CLIENT_W_96, scale);
-    let client_h = scale_px(CLIENT_H_96, scale);
-    info!(
-        scale,
-        font_px, title_px, client_w, client_h, "history panel layout scaled for display DPI"
-    );
-
-    let font = unsafe { create_ui_font(font_px, 400) };
-    let title_font = unsafe { create_ui_font(title_px, 600) };
-    if font.is_invalid() || title_font.is_invalid() {
-        return Err(anyhow!("create history panel font failed"));
-    }
-    let brush_bg = unsafe { CreateSolidBrush(BG) };
-    let brush_body = unsafe { CreateSolidBrush(BODY_BG) };
-    let brush_button = unsafe { CreateSolidBrush(BUTTON_BG) };
-    set_ctl_brushes(brush_bg, brush_body, brush_button);
-
-    let instance = unsafe { GetModuleHandleW(None) }.unwrap_or_default();
-    let child = |class: PCWSTR,
-                 text: &str,
-                 style: WINDOW_STYLE,
-                 x: i32,
-                 y: i32,
-                 w: i32,
-                 h: i32,
-                 id: i32,
-                 use_title: bool|
-     -> Result<HWND> {
-        let text = HSTRING::from(text);
-        let child_hwnd = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                class,
-                PCWSTR(text.as_ptr()),
-                WINDOW_STYLE(style.0 | WS_CHILD.0 | WS_VISIBLE.0),
-                x,
-                y,
-                w,
-                h,
-                Some(hwnd),
-                Some(HMENU(id as isize as *mut _)),
-                Some(HINSTANCE(instance.0)),
-                None,
-            )
+        "/api/history" | "/api/history.json" => {
+            let records = history::load_recent(history_path, 500).unwrap_or_default();
+            let payload = serde_json::json!({
+                "path": history_path.display().to_string(),
+                "count": records.len(),
+                "rewrite_enabled_count": records.iter().filter(|r| r.rewrite_enabled).count(),
+                "records": records,
+            });
+            let body = serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| b"[]".to_vec());
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+            )?;
         }
-        .map_err(|error| anyhow!("create history child {id}: {error}"))?;
-        let use_font = if use_title { title_font } else { font };
-        unsafe {
-            SendMessageW(
-                child_hwnd,
-                WM_SETFONT,
-                Some(WPARAM(use_font.0 as usize)),
-                Some(LPARAM(1)),
-            );
-        }
-        Ok(child_hwnd)
-    };
-
-    let field_w = client_w - margin * 2;
-    let title_h = scale_px(36, scale);
-    let summary_h = scale_px(56, scale);
-    let btn_h = scale_px(48, scale);
-    let btn_w = scale_px(128, scale);
-    let btn_w_wide = scale_px(180, scale);
-    let gap = scale_px(16, scale);
-    let mut y = scale_px(22, scale);
-
-    let _title = child(
-        w!("STATIC"),
-        "听写历史",
-        WINDOW_STYLE(0),
-        margin,
-        y,
-        field_w,
-        title_h,
-        ID_TITLE,
-        true,
-    )?;
-    y += title_h + scale_px(10, scale);
-    let summary = child(
-        w!("STATIC"),
-        "加载中…",
-        WINDOW_STYLE(0),
-        margin,
-        y,
-        field_w,
-        summary_h,
-        ID_SUMMARY,
-        false,
-    )?;
-    y += summary_h + scale_px(12, scale);
-    let body_h = (client_h - y - btn_h - scale_px(28, scale)).max(scale_px(200, scale));
-    let body = child(
-        w!("EDIT"),
-        "",
-        WINDOW_STYLE(
-            WS_BORDER.0
-                | WS_VSCROLL.0
-                | ES_MULTILINE as u32
-                | ES_READONLY as u32
-                | ES_AUTOVSCROLL as u32
-                | ES_WANTRETURN as u32
-                | WS_TABSTOP.0,
-        ),
-        margin,
-        y,
-        field_w,
-        body_h,
-        ID_BODY,
-        false,
-    )?;
-    y += body_h + gap;
-    let _refresh = child(
-        w!("BUTTON"),
-        "刷新",
-        WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-        margin,
-        y,
-        btn_w,
-        btn_h,
-        ID_REFRESH,
-        false,
-    )?;
-    let _open = child(
-        w!("BUTTON"),
-        "打开存档目录",
-        WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-        margin + btn_w + gap,
-        y,
-        btn_w_wide,
-        btn_h,
-        ID_OPEN_FOLDER,
-        false,
-    )?;
-    let _close = child(
-        w!("BUTTON"),
-        "关闭",
-        WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-        margin + btn_w + gap + btn_w_wide + gap,
-        y,
-        btn_w,
-        btn_h,
-        ID_CLOSE,
-        false,
-    )?;
-
-    // Store HWNDs / resources after all CreateWindow calls finished.
-    PANEL_STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            state.summary = summary;
-            state.body = body;
-            state.brush_bg = brush_bg;
-            state.brush_body = brush_body;
-            state.brush_button = brush_button;
-            state.font = font;
-            state.title_font = title_font;
-        }
-    });
-    Ok(())
-}
-
-fn open_panel_ui() {
-    let snapshot = PANEL_STATE.with(|cell| {
-        let borrow = cell.try_borrow().ok()?;
-        let state = borrow.as_ref()?;
-        Some((
-            state.hwnd,
-            state.summary,
-            state.body,
-            state.history_path.clone(),
-        ))
-    });
-    let Some((hwnd, summary, body, path)) = snapshot else {
-        return;
-    };
-    refresh_content(summary, body, &path);
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-    }
-    info!(path = %path.display(), "history panel opened");
-}
-
-fn refresh_content(summary: HWND, body: HWND, path: &std::path::Path) {
-    match history::load_recent(path, 300) {
-        Ok(records) => {
-            let total = records.len();
+        "/api/summary" => {
+            let records = history::load_recent(history_path, 500).unwrap_or_default();
             let rewrite_n = records.iter().filter(|r| r.rewrite_enabled).count();
-            let with_before_after = records
+            let with_ba = records
                 .iter()
                 .filter(|r| {
                     r.rewrite_enabled
@@ -517,151 +174,419 @@ fn refresh_content(summary: HWND, body: HWND, path: &std::path::Path) {
                         && (!r.rewrite_text.trim().is_empty() || !r.pasted_text.trim().is_empty())
                 })
                 .count();
-            set_window_text(
-                summary,
-                &format!(
-                    "共 {total} 条 · 开启过改写 {rewrite_n} 条 · 有前后对比 {with_before_after} 条\r\n存档: {}",
-                    path.display()
-                ),
-            );
-            set_window_text(body, &history::render_history(&records));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "total": records.len(),
+                "rewrite_enabled": rewrite_n,
+                "with_before_after": with_ba,
+                "path": history_path.display().to_string(),
+            }))
+            .unwrap_or_default();
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+            )?;
         }
-        Err(error) => {
-            set_window_text(summary, &format!("读取失败：{error}"));
-            set_window_text(body, "");
+        _ if path.starts_with("/open-folder") => {
+            open_folder(history_path);
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                br#"{"ok":true}"#,
+            )?;
+        }
+        _ => {
+            write_response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found",
+            )?;
         }
     }
+    Ok(())
 }
 
-fn set_window_text(hwnd: HWND, text: &str) {
-    let text = HSTRING::from(text);
-    unsafe {
-        let _ = SetWindowTextW(hwnd, PCWSTR(text.as_ptr()));
-    }
+fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) -> Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    let _ = stream.flush();
+    Ok(())
 }
 
-fn open_history_folder() {
-    let path = PANEL_STATE.with(|cell| {
-        cell.try_borrow()
-            .ok()
-            .and_then(|b| b.as_ref().map(|s| s.history_path.clone()))
-    });
-    let Some(path) = path else {
-        return;
-    };
-    let folder = path
+fn open_folder(history_path: &Path) {
+    let folder = history_path
         .parent()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| path.clone());
+        .unwrap_or_else(|| history_path.to_path_buf());
+    // explorer is fine; not a console python flash.
     let _ = std::process::Command::new("explorer.exe")
         .arg(folder.as_os_str())
         .spawn();
 }
 
-extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        WM_ERASEBKGND => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
-            let mut rect = RECT::default();
-            unsafe {
-                let _ = GetClientRect(hwnd, &mut rect);
-                let brush = ctl_brush_bg();
-                if !brush.is_invalid() {
-                    let _ = FillRect(hdc, &rect, brush);
-                }
-            }
-            LRESULT(1)
+/// Open default browser without a console window flash.
+fn open_browser_hidden(url: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::PCWSTR;
+
+        let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        // ShellExecuteW opens the default handler; no cmd.exe console flash.
+        let rc = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(operation.as_ptr()),
+                PCWSTR(url_wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // Per MSDN: return value > 32 means success.
+        if rc.0 as usize > 32 {
+            return Ok(());
         }
-        WM_CTLCOLORSTATIC => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
-            unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, TEXT);
-            }
-            LRESULT(ctl_brush_bg().0 as isize)
+        // Fallback: explorer.exe http://... (also no console).
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let status = std::process::Command::new("explorer.exe")
+            .arg(url)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .context("spawn explorer for browser")?;
+        if status.success() {
+            return Ok(());
         }
-        WM_CTLCOLOREDIT => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
-            // Light opaque body: solid fill matches brush — no stacked glyphs.
-            unsafe {
-                let _ = SetBkMode(hdc, OPAQUE);
-                SetBkColor(hdc, BODY_BG);
-                SetTextColor(hdc, BODY_TEXT);
-            }
-            LRESULT(ctl_brush_body().0 as isize)
-        }
-        WM_CTLCOLORBTN => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
-            unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, TEXT);
-            }
-            LRESULT(ctl_brush_button().0 as isize)
-        }
-        WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as i32;
-            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
-            if code == BN_CLICKED {
-                match id {
-                    ID_REFRESH => {
-                        let snapshot = PANEL_STATE.with(|cell| {
-                            let borrow = cell.try_borrow().ok()?;
-                            let state = borrow.as_ref()?;
-                            Some((state.summary, state.body, state.history_path.clone()))
-                        });
-                        if let Some((summary, body, path)) = snapshot {
-                            refresh_content(summary, body, &path);
-                        }
-                    }
-                    ID_OPEN_FOLDER => open_history_folder(),
-                    ID_CLOSE => unsafe {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
-                    },
-                    _ => {}
-                }
-            }
-            LRESULT(0)
-        }
-        WM_CLOSE => {
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            PANEL_STATE.with(|state| {
-                if let Some(state) = state.borrow_mut().as_mut() {
-                    unsafe {
-                        if !state.font.is_invalid() {
-                            let _ = DeleteObject(HGDIOBJ(state.font.0));
-                        }
-                        if !state.title_font.is_invalid() {
-                            let _ = DeleteObject(HGDIOBJ(state.title_font.0));
-                        }
-                        if !state.brush_bg.is_invalid() {
-                            let _ = DeleteObject(HGDIOBJ(state.brush_bg.0));
-                        }
-                        if !state.brush_body.is_invalid() {
-                            let _ = DeleteObject(HGDIOBJ(state.brush_body.0));
-                        }
-                        if !state.brush_button.is_invalid() {
-                            let _ = DeleteObject(HGDIOBJ(state.brush_button.0));
-                        }
-                    }
-                    state.font = HFONT::default();
-                    state.title_font = HFONT::default();
-                    state.brush_bg = HBRUSH::default();
-                    state.brush_body = HBRUSH::default();
-                    state.brush_button = HBRUSH::default();
-                }
-            });
-            set_ctl_brushes(HBRUSH::default(), HBRUSH::default(), HBRUSH::default());
-            LRESULT(0)
-        }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        return Err(anyhow!(
+            "ShellExecute failed (rc={}) and explorer exited {status}",
+            rc.0 as usize
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = url;
+        Err(anyhow!("history web UI open is Windows-only"))
     }
 }
 
-// Silence unused import if OPAQUE is used via path.
-#[allow(dead_code)]
-const _OPAQUE_CHECK: BACKGROUND_MODE = OPAQUE;
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn short_error(text: &str, max_chars: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn render_html_page(path: &Path, records: &[HistoryRecord]) -> String {
+    let total = records.len();
+    let rewrite_n = records.iter().filter(|r| r.rewrite_enabled).count();
+    let with_ba = records
+        .iter()
+        .filter(|r| {
+            r.rewrite_enabled
+                && !r.raw_text.trim().is_empty()
+                && (!r.rewrite_text.trim().is_empty() || !r.pasted_text.trim().is_empty())
+        })
+        .count();
+
+    let mut cards = String::new();
+    for (index, record) in records.iter().rev().enumerate() {
+        let n = index + 1;
+        let mode = if record.rewrite_enabled {
+            "AI改写"
+        } else {
+            "原文直出"
+        };
+        let mode_class = if record.rewrite_enabled {
+            "tag-ai"
+        } else {
+            "tag-raw"
+        };
+        let target = if record.target_process.trim().is_empty() {
+            "未知应用"
+        } else {
+            record.target_process.as_str()
+        };
+        let raw = first_nonempty(&[&record.raw_text, &record.finalized_text]);
+        let rewritten = first_nonempty(&[&record.rewrite_text]);
+        let pasted = record.pasted_text.trim();
+
+        cards.push_str("<article class=\"card\">");
+        cards.push_str(&format!(
+            "<header><span class=\"idx\">#{n}</span> <span class=\"tag {mode_class}\">{mode}</span> <span class=\"meta\">{target} · {}ms</span></header>",
+            record.total_elapsed_ms
+        ));
+
+        if record.rewrite_enabled {
+            cards.push_str(&format!(
+                "<div class=\"row\"><div class=\"label\">改写前</div><div class=\"text\">{}</div></div>",
+                escape_html(if raw.is_empty() { "(空)" } else { raw })
+            ));
+            if rewritten.is_empty() && !record.rewrite_error.is_empty() {
+                cards.push_str(
+                    "<div class=\"row\"><div class=\"label\">改写后</div><div class=\"text fail\">(失败，见错误)</div></div>",
+                );
+            } else {
+                cards.push_str(&format!(
+                    "<div class=\"row\"><div class=\"label\">改写后</div><div class=\"text\">{}</div></div>",
+                    escape_html(if rewritten.is_empty() { "(空)" } else { rewritten })
+                ));
+            }
+            if !pasted.is_empty() && pasted != rewritten {
+                cards.push_str(&format!(
+                    "<div class=\"row\"><div class=\"label\">最终粘贴</div><div class=\"text\">{}</div></div>",
+                    escape_html(pasted)
+                ));
+            }
+            if !record.rewrite_model.is_empty() || record.rewrite_elapsed_ms > 0 {
+                cards.push_str(&format!(
+                    "<div class=\"hint\">模型: {} · 改写耗时 {}ms</div>",
+                    escape_html(if record.rewrite_model.is_empty() {
+                        "(未记)"
+                    } else {
+                        &record.rewrite_model
+                    }),
+                    record.rewrite_elapsed_ms
+                ));
+            }
+            if !record.rewrite_error.is_empty() {
+                cards.push_str(&format!(
+                    "<div class=\"err\">改写错误: {}</div>",
+                    escape_html(&short_error(&record.rewrite_error, 360))
+                ));
+            }
+        } else {
+            let preview = if !pasted.is_empty() {
+                pasted
+            } else if !raw.is_empty() {
+                raw
+            } else {
+                "(空)"
+            };
+            cards.push_str(&format!(
+                "<div class=\"row\"><div class=\"label\">原文</div><div class=\"text\">{}</div></div>",
+                escape_html(preview)
+            ));
+        }
+
+        if !record.error.is_empty() {
+            cards.push_str(&format!(
+                "<div class=\"err\">状态: {}</div>",
+                escape_html(&short_error(&record.error, 200))
+            ));
+        } else if !record.skipped_reason.is_empty()
+            && record.skipped_reason != "rewrite_disabled_raw_paste"
+        {
+            cards.push_str(&format!(
+                "<div class=\"hint\">状态: {}</div>",
+                escape_html(&short_error(&record.skipped_reason, 160))
+            ));
+        }
+
+        cards.push_str("</article>");
+    }
+
+    if cards.is_empty() {
+        cards.push_str(
+            r#"<div class="empty">暂无记录。按住 CapsLock 说几句后点「刷新」。</div>"#,
+        );
+    }
+
+    let path_esc = escape_html(&path.display().to_string());
+    format!(
+        r##"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ainput · 听写历史</title>
+<style>
+  :root {{
+    color-scheme: dark;
+    --bg: #141414;
+    --panel: #1c1a1a;
+    --card: #242020;
+    --text: #f2f0f0;
+    --muted: #a39a96;
+    --line: #3a3230;
+    --ai: #6aa84f;
+    --raw: #888;
+    --fail: #e06c75;
+    --btn: #322a2a;
+    --btn-hover: #433838;
+    font-family: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    font-size: 16px;
+  }}
+  header.app {{
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: rgba(20,20,20,.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+    padding: 16px 20px 14px;
+  }}
+  h1 {{
+    margin: 0 0 6px;
+    font-size: 22px;
+    font-weight: 650;
+  }}
+  .summary {{ color: var(--muted); font-size: 14px; }}
+  .path {{ color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 4px; }}
+  .actions {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 12px;
+  }}
+  button, a.btn {{
+    appearance: none;
+    border: 1px solid var(--line);
+    background: var(--btn);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 14px;
+    cursor: pointer;
+    text-decoration: none;
+  }}
+  button:hover, a.btn:hover {{ background: var(--btn-hover); }}
+  main {{
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 18px 16px 40px;
+    display: grid;
+    gap: 12px;
+  }}
+  .card {{
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 14px 12px;
+  }}
+  .card header {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+  }}
+  .idx {{ color: var(--muted); font-size: 13px; }}
+  .tag {{
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+  }}
+  .tag-ai {{ color: #c6efb0; border-color: #3d5a2e; background: #1f2a18; }}
+  .tag-raw {{ color: #ccc; }}
+  .meta {{ color: var(--muted); font-size: 12px; }}
+  .row {{
+    display: grid;
+    grid-template-columns: 72px 1fr;
+    gap: 8px;
+    margin: 6px 0;
+  }}
+  .label {{ color: var(--muted); font-size: 13px; padding-top: 2px; }}
+  .text {{ white-space: pre-wrap; word-break: break-word; font-size: 15px; }}
+  .text.fail {{ color: var(--fail); }}
+  .hint {{ color: var(--muted); font-size: 12px; margin-top: 6px; }}
+  .err {{ color: var(--fail); font-size: 12px; margin-top: 6px; word-break: break-word; }}
+  .empty {{
+    text-align: center;
+    color: var(--muted);
+    padding: 48px 12px;
+    border: 1px dashed var(--line);
+    border-radius: 14px;
+  }}
+  footer {{
+    max-width: 920px;
+    margin: 0 auto 28px;
+    padding: 0 16px;
+    color: var(--muted);
+    font-size: 12px;
+  }}
+</style>
+</head>
+<body>
+<header class="app">
+  <h1>听写历史</h1>
+  <div class="summary">共 {total} 条 · 开启过改写 {rewrite_n} 条 · 有前后对比 {with_ba} 条</div>
+  <div class="path">存档: {path_esc}</div>
+  <div class="actions">
+    <button type="button" onclick="location.reload()">刷新</button>
+    <button type="button" onclick="openFolder()">打开存档目录</button>
+    <a class="btn" href="/api/history.json" target="_blank" rel="noreferrer">原始 JSON</a>
+  </div>
+</header>
+<main>
+{cards}
+</main>
+<footer>本地 loopback 页面 · 仅本机 · 不上云 · ainput {version}</footer>
+<script>
+async function openFolder() {{
+  try {{
+    await fetch('/open-folder');
+  }} catch (e) {{
+    console.warn(e);
+  }}
+}}
+</script>
+</body>
+</html>
+"##,
+        total = total,
+        rewrite_n = rewrite_n,
+        with_ba = with_ba,
+        path_esc = path_esc,
+        cards = cards,
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn first_nonempty<'a>(parts: &[&'a str]) -> &'a str {
+    for part in parts {
+        if !part.trim().is_empty() {
+            return part.trim();
+        }
+    }
+    ""
+}

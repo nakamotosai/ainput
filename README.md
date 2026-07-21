@@ -17,7 +17,7 @@
 - **CapsLock hold-to-talk** → local non-streaming transcription
 - Optional **AI rewrite** (non-streaming HTTP) when you configure an API
 - Tray icon + HUD feedback
-- Local dictation history (raw vs rewrite) under `state/logs/history.jsonl`
+- Local dictation history (raw vs rewrite) under `state/logs/history.jsonl`, viewed via loopback web UI
 - Personal correction rules (local)
 - No cloud ASR, no screen recording, no built-in vendor API key
 
@@ -28,7 +28,7 @@
 3. Run `ainput.exe` or `run-ainput.bat`.
 4. Hold **CapsLock**, speak, release — text pastes into the focused window.
 5. (Optional) Tray → **API / 改写设置…** → fill Key → **拉取模型** → pick model → set timeout → enable rewrite → Save.
-6. Tray → **听写历史…** to browse how many utterances were spoken, with rewrite before/after when AI rewrite is on.
+6. Tray → **听写历史…** opens a **local browser page** (`http://127.0.0.1:…`, loopback only) to browse counts and rewrite before/after.
 
 Runtime state is stored next to the executable under `state/` (config, logs, history). History is local-only JSONL: `state/logs/history.jsonl`.
 
