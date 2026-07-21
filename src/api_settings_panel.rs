@@ -700,38 +700,90 @@ fn parse_timeout_ms(text: &str) -> u64 {
         .unwrap_or(DEFAULT_TIMEOUT_MS)
 }
 
-fn start_fetch_models() {
-    let snapshot = PANEL_STATE.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        let state = borrow.as_mut()?;
-        if state.fetching {
-            set_status(state, "正在拉取，请稍候…");
-            return None;
+/// Snapshot of HWND handles for UI updates **without** holding PANEL_STATE borrow.
+/// Holding `RefCell::borrow_mut` across `SetWindowTextW`/`SendMessageW` re-enters
+/// `WM_CTLCOLOR*` which also borrows PANEL_STATE → panic → whole process exits.
+#[derive(Clone, Copy)]
+struct PanelUiHandles {
+    hwnd: HWND,
+    base_url: HWND,
+    api_key: HWND,
+    model: HWND,
+    timeout: HWND,
+    status: HWND,
+}
+
+fn panel_ui_handles() -> Option<PanelUiHandles> {
+    PANEL_STATE.with(|cell| {
+        let borrow = cell.try_borrow().ok()?;
+        let state = borrow.as_ref()?;
+        Some(PanelUiHandles {
+            hwnd: state.hwnd,
+            base_url: state.base_url,
+            api_key: state.api_key,
+            model: state.model,
+            timeout: state.timeout,
+            status: state.status,
+        })
+    })
+}
+
+fn set_status_hwnd(status: HWND, text: &str) {
+    set_window_text(status, text);
+}
+
+fn set_fetching(flag: bool) {
+    PANEL_STATE.with(|cell| {
+        if let Ok(mut borrow) = cell.try_borrow_mut() {
+            if let Some(state) = borrow.as_mut() {
+                state.fetching = flag;
+            }
         }
-        let base = get_window_text(state.base_url);
-        let key = get_window_text(state.api_key);
-        let timeout_ms = parse_timeout_ms(&get_window_text(state.timeout));
-        if base.trim().is_empty() {
-            set_status(state, "请先填写 Base URL");
-            return None;
-        }
-        if key.trim().is_empty() {
-            set_status(state, "请先填写 API Key 再拉取模型");
-            return None;
-        }
-        state.fetching = true;
-        set_status(
-            state,
-            &format!("正在拉取模型列表…（超时 {timeout_ms} ms）"),
-        );
-        Some((state.hwnd.0 as isize, base, key, timeout_ms))
     });
-    let Some((hwnd_raw, base, key, timeout_ms)) = snapshot else {
+}
+
+fn is_fetching() -> bool {
+    PANEL_STATE.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|b| b.as_ref().map(|s| s.fetching))
+            .unwrap_or(false)
+    })
+}
+
+fn start_fetch_models() {
+    let Some(ui) = panel_ui_handles() else {
         return;
     };
+    if is_fetching() {
+        set_status_hwnd(ui.status, "正在拉取，请稍候…");
+        return;
+    }
+    let base = get_window_text(ui.base_url);
+    let key = get_window_text(ui.api_key);
+    let timeout_ms = parse_timeout_ms(&get_window_text(ui.timeout));
+    if base.trim().is_empty() {
+        set_status_hwnd(ui.status, "请先填写 Base URL");
+        return;
+    }
+    if key.trim().is_empty() {
+        set_status_hwnd(ui.status, "请先填写 API Key 再拉取模型");
+        return;
+    }
+    set_fetching(true);
+    set_status_hwnd(
+        ui.status,
+        &format!("正在拉取模型列表…（超时 {timeout_ms} ms）"),
+    );
+    info!(timeout_ms, base = %base, "API panel model fetch started");
+    let hwnd_raw = ui.hwnd.0 as isize;
     thread::spawn(move || {
-        let result = api_config::list_models(&base, &key, "/v1/models", timeout_ms)
-            .map_err(|error| format!("{error:#}"));
+        // Never panic across the thread boundary — always post a result.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            api_config::list_models(&base, &key, "/v1/models", timeout_ms)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("拉取线程内部 panic")))
+        .map_err(|error| format!("{error:#}"));
         if let Ok(mut slot) = fetch_result_slot().lock() {
             *slot = Some(result);
         }
@@ -747,30 +799,42 @@ fn handle_fetch_result() {
         .lock()
         .ok()
         .and_then(|mut slot| slot.take());
-    PANEL_STATE.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        let Some(state) = borrow.as_mut() else {
-            return;
-        };
-        state.fetching = false;
-        match result {
-            Some(Ok(models)) => {
-                let count = models.len();
-                let prefer = get_combo_text(state.model);
-                fill_model_combo(state.model, &models, &prefer);
-                set_status(state, &format!("已拉取 {count} 个模型，请下拉选择"));
+    set_fetching(false);
+    let Some(ui) = panel_ui_handles() else {
+        return;
+    };
+    match result {
+        Some(Ok(mut models)) => {
+            // Cap combo fill — NVIDIA lists can be huge; keep UI responsive.
+            const MAX_COMBO: usize = 800;
+            let total = models.len();
+            if models.len() > MAX_COMBO {
+                models.truncate(MAX_COMBO);
             }
-            Some(Err(error)) => {
-                let short = if error.chars().count() > 160 {
-                    format!("{}…", error.chars().take(160).collect::<String>())
-                } else {
-                    error
-                };
-                set_status(state, &format!("拉取失败（可手填模型）：{short}"));
-            }
-            None => set_status(state, "拉取结果丢失，请重试"),
+            let prefer = get_combo_text(ui.model);
+            fill_model_combo(ui.model, &models, &prefer);
+            let msg = if total > models.len() {
+                format!(
+                    "已拉取 {total} 个模型，列表显示前 {} 个（可手填完整 id）",
+                    models.len()
+                )
+            } else {
+                format!("已拉取 {total} 个模型，请下拉选择")
+            };
+            set_status_hwnd(ui.status, &msg);
+            info!(total, shown = models.len(), "API panel model fetch ok");
         }
-    });
+        Some(Err(error)) => {
+            let short = if error.chars().count() > 160 {
+                format!("{}…", error.chars().take(160).collect::<String>())
+            } else {
+                error
+            };
+            set_status_hwnd(ui.status, &format!("拉取失败（可手填模型）：{short}"));
+            warn!(error = %short, "API panel model fetch failed");
+        }
+        None => set_status_hwnd(ui.status, "拉取结果丢失，请重试"),
+    }
 }
 
 fn fill_model_combo(combo: HWND, models: &[String], prefer: &str) {
@@ -959,9 +1023,11 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = GetClientRect(hwnd, &mut rect);
             }
             PANEL_STATE.with(|state| {
-                if let Some(state) = state.borrow().as_ref() {
-                    unsafe {
-                        let _ = FillRect(hdc, &rect, state.brush_bg);
+                if let Ok(borrow) = state.try_borrow() {
+                    if let Some(state) = borrow.as_ref() {
+                        unsafe {
+                            let _ = FillRect(hdc, &rect, state.brush_bg);
+                        }
                     }
                 }
             });
@@ -973,11 +1039,12 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 SetBkMode(hdc, TRANSPARENT);
                 SetTextColor(hdc, TEXT);
             }
+            // try_borrow: never panic if a caller holds PANEL_STATE during SetWindowText.
             let brush = PANEL_STATE.with(|state| {
                 state
-                    .borrow()
-                    .as_ref()
-                    .map(|s| s.brush_bg)
+                    .try_borrow()
+                    .ok()
+                    .and_then(|b| b.as_ref().map(|s| s.brush_bg))
                     .unwrap_or_default()
             });
             LRESULT(brush.0 as isize)
@@ -990,9 +1057,9 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let brush = PANEL_STATE.with(|state| {
                 state
-                    .borrow()
-                    .as_ref()
-                    .map(|s| s.brush_input)
+                    .try_borrow()
+                    .ok()
+                    .and_then(|b| b.as_ref().map(|s| s.brush_input))
                     .unwrap_or_default()
             });
             LRESULT(brush.0 as isize)
@@ -1005,9 +1072,9 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let brush = PANEL_STATE.with(|state| {
                 state
-                    .borrow()
-                    .as_ref()
-                    .map(|s| s.brush_button)
+                    .try_borrow()
+                    .ok()
+                    .and_then(|b| b.as_ref().map(|s| s.brush_button))
                     .unwrap_or_default()
             });
             LRESULT(brush.0 as isize)
