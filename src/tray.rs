@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -14,57 +13,34 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION,
     IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadCursorW, LoadIconW, LoadImageW, MF_CHECKED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PostQuitMessage,
-    PostThreadMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PostQuitMessage, PostThreadMessageW,
+    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CREATE, WM_DESTROY,
+    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-use crate::config::{HudAnimationTheme, RewriteOutputLanguage};
-use crate::debug_panel::DebugPanelController;
-use crate::history_panel::HistoryPanelController;
+use crate::api_settings_panel::ApiSettingsPanelController;
 use crate::hud::HudController;
-use crate::hud_font_panel::HudFontPanelController;
-use crate::prompt_studio::PromptStudioController;
 use crate::rewrite_language::RewriteLanguageController;
-use crate::suspect_terms::SuspectTermsNotification;
-use crate::suspect_terms_panel::SuspectTermsPanelController;
 
 const TRAY_THREAD_QUIT: u32 = WM_APP + 41;
 const TRAY_CALLBACK: u32 = WM_APP + 42;
-const TRAY_SUSPECT_NOTIFICATION: u32 = WM_APP + 43;
 const TRAY_API_NOTIFICATION: u32 = WM_APP + 44;
 const TRAY_UID: u32 = 1;
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 static API_NOTIFICATION_QUEUE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-const MENU_DEBUG_PANEL: usize = 2003;
-const MENU_HISTORY_PANEL: usize = 2004;
-const MENU_PROMPT_STUDIO: usize = 2006;
-const MENU_SUSPECT_TERMS: usize = 2007;
-const MENU_HUD_FONT_PANEL: usize = 2008;
-const MENU_WEB_CONSOLE: usize = 2009;
-const MENU_OPEN_API_CONFIG: usize = 2010;
+
+const MENU_API_SETTINGS: usize = 2010;
 const MENU_AUTO_START: usize = 2011;
 const MENU_EXIT: usize = 2005;
 const MENU_REWRITE_ENABLED: usize = 2700;
-const MENU_REWRITE_LANG_CHINESE: usize = 2701;
-const MENU_REWRITE_LANG_ENGLISH: usize = 2702;
-const MENU_REWRITE_LANG_JAPANESE: usize = 2703;
-const MENU_STREAMING_REWRITE_ENABLED: usize = 2704;
-const MENU_HUD_ANIMATION_TEXT_ONLY: usize = 2800;
-const MENU_HUD_ANIMATION_VOICE_BARS: usize = 2801;
-const MENU_HUD_ANIMATION_WAVEFORM: usize = 2802;
-const MENU_HUD_ANIMATION_STAGE_DOTS: usize = 2803;
-const MENU_HUD_ANIMATION_AI_GLOW: usize = 2804;
-const MENU_HUD_ANIMATION_MINIMAL_PULSE: usize = 2805;
-const MENU_HUD_ANIMATION_FULL: usize = 2806;
 
 pub struct Tray {
     thread_id: u32,
@@ -74,14 +50,9 @@ pub struct Tray {
 impl Tray {
     pub fn start(
         hud: HudController,
-        hud_font_panel: HudFontPanelController,
-        debug_panel: DebugPanelController,
-        history_panel: HistoryPanelController,
-        suspect_terms_panel: SuspectTermsPanelController,
-        prompt_studio: PromptStudioController,
+        api_settings: ApiSettingsPanelController,
         rewrite_language: RewriteLanguageController,
         api_config_path: PathBuf,
-        suspect_notifications: mpsc::Receiver<SuspectTermsNotification>,
         api_notifications: mpsc::Receiver<String>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -93,17 +64,13 @@ impl Tray {
             TRAY_STATE.with(|state| {
                 *state.borrow_mut() = Some(TrayState {
                     hud,
-                    hud_font_panel,
-                    debug_panel,
-                    history_panel,
-                    suspect_terms_panel,
-                    prompt_studio,
+                    api_settings,
                     rewrite_language,
                     api_config_path,
                     shutdown,
                 });
             });
-            let result = unsafe { run_tray_thread(suspect_notifications, api_notifications) };
+            let result = unsafe { run_tray_thread(api_notifications) };
             if let Err(error) = result {
                 warn!(error = %error, "tray thread failed");
             }
@@ -135,11 +102,7 @@ impl Drop for Tray {
 #[derive(Clone)]
 struct TrayState {
     hud: HudController,
-    hud_font_panel: HudFontPanelController,
-    debug_panel: DebugPanelController,
-    history_panel: HistoryPanelController,
-    suspect_terms_panel: SuspectTermsPanelController,
-    prompt_studio: PromptStudioController,
+    api_settings: ApiSettingsPanelController,
     rewrite_language: RewriteLanguageController,
     api_config_path: PathBuf,
     shutdown: Arc<AtomicBool>,
@@ -152,10 +115,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-unsafe fn run_tray_thread(
-    suspect_notifications: mpsc::Receiver<SuspectTermsNotification>,
-    api_notifications: mpsc::Receiver<String>,
-) -> Result<()> {
+unsafe fn run_tray_thread(api_notifications: mpsc::Receiver<String>) -> Result<()> {
     let instance = unsafe { GetModuleHandleW(None) }
         .map_err(|error| anyhow!("get module handle failed: {error}"))?;
     unsafe { register_tray_class(HINSTANCE(instance.0))? };
@@ -169,18 +129,6 @@ unsafe fn run_tray_thread(
     unsafe { add_tray_icon(hwnd) };
 
     let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-    thread::spawn(move || {
-        while let Ok(notification) = suspect_notifications.recv() {
-            let _ = unsafe {
-                PostThreadMessageW(
-                    thread_id,
-                    TRAY_SUSPECT_NOTIFICATION,
-                    WPARAM(notification.new_items),
-                    LPARAM(0),
-                )
-            };
-        }
-    });
     let api_thread_id = thread_id;
     thread::spawn(move || {
         while let Ok(notification) = api_notifications.recv() {
@@ -211,10 +159,6 @@ unsafe fn run_tray_thread(
                 let _ = DestroyWindow(hwnd);
             }
             return Ok(());
-        }
-        if msg.message == TRAY_SUSPECT_NOTIFICATION {
-            unsafe { show_suspect_terms_balloon(hwnd, msg.wParam.0) };
-            continue;
         }
         if msg.message == TRAY_API_NOTIFICATION {
             if let Some(message) = take_api_notification() {
@@ -282,7 +226,6 @@ unsafe fn add_tray_icon(hwnd: HWND) {
         info!("ainput tray icon added");
         return;
     }
-
     warn!("failed to add ainput tray icon; deleting stale icon record and retrying");
     unsafe { delete_tray_icon(hwnd) };
     if unsafe { add_tray_icon_once(hwnd) } {
@@ -294,34 +237,12 @@ unsafe fn add_tray_icon(hwnd: HWND) {
 
 unsafe fn add_tray_icon_once(hwnd: HWND) -> bool {
     let data = tray_data(hwnd, true);
-    let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
-    added.as_bool()
+    unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool()
 }
 
 unsafe fn delete_tray_icon(hwnd: HWND) {
     let data = tray_data(hwnd, false);
     let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
-}
-
-unsafe fn show_suspect_terms_balloon(hwnd: HWND, new_items: usize) {
-    if new_items == 0 {
-        return;
-    }
-    let mut data = tray_data(hwnd, false);
-    data.uFlags = NIF_INFO;
-    write_wide_fixed(&mut data.szInfoTitle, "ainput 自动学习词汇");
-    write_wide_fixed(
-        &mut data.szInfo,
-        &format!("发现 {new_items} 条新的疑似错词。点击这里打开面板确认。"),
-    );
-    data.dwInfoFlags = NIIF_INFO;
-    data.Anonymous.uTimeout = 5000;
-    let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
-    if ok.as_bool() {
-        info!(new_items, "suspect terms tray balloon shown");
-    } else {
-        warn!(new_items, "suspect terms tray balloon failed");
-    }
 }
 
 unsafe fn show_api_setup_balloon(hwnd: HWND, message: &str) {
@@ -411,18 +332,12 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         return;
     };
     let state_snapshot = TRAY_STATE.with(|state| {
-        state.borrow().as_ref().map(|state| {
-            (
-                state.rewrite_language.rewrite_enabled(),
-                state.rewrite_language.streaming_rewrite_enabled(),
-                state.rewrite_language.current(),
-                state.hud.animation_theme(),
-            )
-        })
+        state
+            .borrow()
+            .as_ref()
+            .map(|state| state.rewrite_language.rewrite_enabled())
     });
-    let Some((rewrite_enabled, streaming_rewrite_enabled, rewrite_language, hud_animation_theme)) =
-        state_snapshot
-    else {
+    let Some(rewrite_enabled) = state_snapshot else {
         let _ = unsafe { DestroyMenu(menu) };
         return;
     };
@@ -442,17 +357,12 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MF_STRING | MF_GRAYED,
             0,
             &format!(
-                "CapsLock：本地语音 -> {}",
-                rewrite_mode_menu_label(rewrite_enabled),
-            ),
-        );
-        append_menu_text(
-            menu,
-            MF_STRING | MF_GRAYED,
-            0,
-            &format!(
-                "输出语言：{}",
-                rewrite_language_menu_label(rewrite_language)
+                "CapsLock：本地语音 · {}",
+                if rewrite_enabled {
+                    "AI改写"
+                } else {
+                    "原文直出"
+                }
             ),
         );
     }
@@ -469,27 +379,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_REWRITE_ENABLED,
             "本地语音 AI 改写",
         );
-        let streaming_rewrite_flag = if streaming_rewrite_enabled {
-            MF_CHECKED
-        } else {
-            MF_UNCHECKED
-        };
-        append_menu_text(
-            menu,
-            MF_STRING | streaming_rewrite_flag,
-            MENU_STREAMING_REWRITE_ENABLED,
-            "AI 改写（遗留开关）",
-        );
-        append_rewrite_language_menu(menu, rewrite_language);
-    }
-    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
-    unsafe {
-        append_hud_animation_menu(menu, hud_animation_theme);
-    }
-    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
-    unsafe {
-        append_menu_text(menu, MF_STRING, MENU_WEB_CONSOLE, "打开控制台");
-        append_menu_text(menu, MF_STRING, MENU_OPEN_API_CONFIG, "打开 API 配置 JSON");
+        append_menu_text(menu, MF_STRING, MENU_API_SETTINGS, "API / 改写设置…");
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
@@ -517,35 +407,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             )
         };
         match command.0 as usize {
-            MENU_WEB_CONSOLE => open_web_console(),
-            MENU_OPEN_API_CONFIG => open_api_config(),
-            MENU_DEBUG_PANEL => open_debug_panel(),
-            MENU_HISTORY_PANEL => open_history_panel(),
-            MENU_SUSPECT_TERMS => open_suspect_terms_panel(),
-            MENU_HUD_FONT_PANEL => open_hud_font_panel(),
-            MENU_PROMPT_STUDIO => open_prompt_studio(),
+            MENU_API_SETTINGS => open_api_settings(),
             MENU_REWRITE_ENABLED => set_rewrite_enabled(!rewrite_enabled),
-            MENU_STREAMING_REWRITE_ENABLED => {
-                set_streaming_rewrite_enabled(!streaming_rewrite_enabled)
-            }
-            MENU_REWRITE_LANG_CHINESE => {
-                set_rewrite_output_language(RewriteOutputLanguage::Chinese)
-            }
-            MENU_REWRITE_LANG_ENGLISH => {
-                set_rewrite_output_language(RewriteOutputLanguage::English)
-            }
-            MENU_REWRITE_LANG_JAPANESE => {
-                set_rewrite_output_language(RewriteOutputLanguage::Japanese)
-            }
-            MENU_HUD_ANIMATION_TEXT_ONLY => set_hud_animation_theme(HudAnimationTheme::TextOnly),
-            MENU_HUD_ANIMATION_VOICE_BARS => set_hud_animation_theme(HudAnimationTheme::VoiceBars),
-            MENU_HUD_ANIMATION_WAVEFORM => set_hud_animation_theme(HudAnimationTheme::Waveform),
-            MENU_HUD_ANIMATION_STAGE_DOTS => set_hud_animation_theme(HudAnimationTheme::StageDots),
-            MENU_HUD_ANIMATION_AI_GLOW => set_hud_animation_theme(HudAnimationTheme::AiGlow),
-            MENU_HUD_ANIMATION_MINIMAL_PULSE => {
-                set_hud_animation_theme(HudAnimationTheme::MinimalPulse)
-            }
-            MENU_HUD_ANIMATION_FULL => set_hud_animation_theme(HudAnimationTheme::FullAnimated),
             MENU_AUTO_START => toggle_auto_start(),
             MENU_EXIT => {
                 TRAY_STATE.with(|state| {
@@ -564,101 +427,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let _ = unsafe { DestroyMenu(menu) };
 }
 
-unsafe fn append_hud_animation_menu(
-    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
-    current: HudAnimationTheme,
-) {
-    if let Ok(animation_menu) = unsafe { CreatePopupMenu() } {
-        for (id, theme, label) in [
-            (
-                MENU_HUD_ANIMATION_MINIMAL_PULSE,
-                HudAnimationTheme::MinimalPulse,
-                "精致呼吸（推荐）",
-            ),
-            (
-                MENU_HUD_ANIMATION_VOICE_BARS,
-                HudAnimationTheme::VoiceBars,
-                "细音柱",
-            ),
-            (
-                MENU_HUD_ANIMATION_WAVEFORM,
-                HudAnimationTheme::Waveform,
-                "细声波",
-            ),
-            (
-                MENU_HUD_ANIMATION_STAGE_DOTS,
-                HudAnimationTheme::StageDots,
-                "进度点",
-            ),
-            (
-                MENU_HUD_ANIMATION_AI_GLOW,
-                HudAnimationTheme::AiGlow,
-                "AI 细光",
-            ),
-            (
-                MENU_HUD_ANIMATION_FULL,
-                HudAnimationTheme::FullAnimated,
-                "自动动效",
-            ),
-            (
-                MENU_HUD_ANIMATION_TEXT_ONLY,
-                HudAnimationTheme::TextOnly,
-                "文字模式",
-            ),
-        ] {
-            let flag = if current == theme {
-                MF_CHECKED
-            } else {
-                MF_UNCHECKED
-            };
-            unsafe { append_menu_text(animation_menu, MF_STRING | flag, id, label) };
-        }
-        unsafe { append_popup_menu(menu, animation_menu, "HUD 动效") };
-    }
-}
-
-unsafe fn append_rewrite_language_menu(
-    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
-    current: RewriteOutputLanguage,
-) {
-    if let Ok(language_menu) = unsafe { CreatePopupMenu() } {
-        for (id, language, label) in [
-            (
-                MENU_REWRITE_LANG_CHINESE,
-                RewriteOutputLanguage::Chinese,
-                "中文（默认）",
-            ),
-            (
-                MENU_REWRITE_LANG_ENGLISH,
-                RewriteOutputLanguage::English,
-                "English",
-            ),
-            (
-                MENU_REWRITE_LANG_JAPANESE,
-                RewriteOutputLanguage::Japanese,
-                "日本語",
-            ),
-        ] {
-            let flag = if current == language {
-                MF_CHECKED
-            } else {
-                MF_UNCHECKED
-            };
-            unsafe { append_menu_text(language_menu, MF_STRING | flag, id, label) };
-        }
-        unsafe { append_popup_menu(menu, language_menu, "非流式输出语言") };
-    }
-}
-
-unsafe fn append_popup_menu(
-    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
-    submenu: windows::Win32::UI::WindowsAndMessaging::HMENU,
-    label: &str,
-) {
-    let label = HSTRING::from(label);
-    let _ = unsafe { AppendMenuW(menu, MF_POPUP, submenu.0 as usize, PCWSTR(label.as_ptr())) };
-}
-
 unsafe fn append_menu_text(
     menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
     flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS,
@@ -669,117 +437,14 @@ unsafe fn append_menu_text(
     let _ = unsafe { AppendMenuW(menu, flags, id, PCWSTR(label.as_ptr())) };
 }
 
-fn open_debug_panel() {
+fn open_api_settings() {
     TRAY_STATE.with(|state| {
         if let Some(state) = state.borrow().as_ref() {
-            state.debug_panel.open();
-            info!("debug panel opened from tray menu");
-        }
-    });
-}
-
-fn open_history_panel() {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            state.history_panel.open();
-            info!("history panel opened from tray menu");
-        }
-    });
-}
-
-fn open_suspect_terms_panel() {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            state.suspect_terms_panel.open_suspect_terms();
-            info!("suspect terms page opened from tray menu");
-        }
-    });
-}
-
-fn open_web_console() {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            state.suspect_terms_panel.open();
-            info!("web console opened from tray menu");
-        }
-    });
-}
-
-fn open_api_config() {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            let path = state.api_config_path.clone();
-            let path_text = path.to_string_lossy().to_string();
-            let opened = Command::new("cmd")
-                .args(["/C", "start", "", &path_text])
-                .spawn()
-                .map(|_| true)
-                .unwrap_or(false);
-            if !opened {
-                if let Err(error) = Command::new("notepad.exe").arg(&path).spawn() {
-                    warn!(error = %error, path = %path.display(), "open API config JSON failed");
-                    return;
-                }
-            }
-            info!(path = %path.display(), "API config JSON opened from tray menu");
-        }
-    });
-}
-
-fn open_prompt_studio() {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            state.prompt_studio.open();
-            info!("Prompt Studio opened from tray menu");
-        }
-    });
-}
-
-fn open_hud_font_panel() {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            state.hud_font_panel.open();
-            info!("HUD font panel opened from tray menu");
-        }
-    });
-}
-
-fn rewrite_language_menu_label(language: RewriteOutputLanguage) -> &'static str {
-    match language {
-        RewriteOutputLanguage::Chinese => "中文",
-        RewriteOutputLanguage::English => "English",
-        RewriteOutputLanguage::Japanese => "日本語",
-    }
-}
-
-fn rewrite_mode_menu_label(enabled: bool) -> &'static str {
-    if enabled { "AI改写" } else { "原文直出" }
-}
-
-fn hud_animation_theme_menu_label(theme: HudAnimationTheme) -> &'static str {
-    match theme {
-        HudAnimationTheme::TextOnly => "文字模式",
-        HudAnimationTheme::VoiceBars => "音柱图",
-        HudAnimationTheme::Waveform => "声波图",
-        HudAnimationTheme::StageDots => "阶段点位",
-        HudAnimationTheme::AiGlow => "AI 呼吸光",
-        HudAnimationTheme::MinimalPulse => "极简脉冲",
-        HudAnimationTheme::FullAnimated => "全动画",
-    }
-}
-
-fn set_hud_animation_theme(theme: HudAnimationTheme) {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            if let Err(error) = state.hud.set_animation_theme(theme) {
-                warn!(error = %error, ?theme, "HUD animation theme update failed");
-                return;
-            }
-            let label = hud_animation_theme_menu_label(theme);
-            state
-                .hud
-                .show_text(&format!("HUD 动效：{label}"), false, false);
-            info!(?theme, "HUD animation theme selected from tray menu");
+            state.api_settings.open();
+            info!(
+                path = %state.api_config_path.display(),
+                "API settings panel opened from tray"
+            );
         }
     });
 }
@@ -788,32 +453,11 @@ fn set_rewrite_enabled(enabled: bool) {
     TRAY_STATE.with(|state| {
         if let Some(state) = state.borrow().as_ref() {
             state.rewrite_language.set_rewrite_enabled(enabled);
-            let label = rewrite_mode_menu_label(enabled);
+            let label = if enabled { "AI改写" } else { "原文直出" };
             state
                 .hud
                 .show_text(&format!("本地语音：{label}"), false, false);
-            info!(
-                rewrite_enabled = enabled,
-                "Whisper AI rewrite toggle selected from tray menu"
-            );
-        }
-    });
-}
-
-fn set_streaming_rewrite_enabled(enabled: bool) {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            state
-                .rewrite_language
-                .set_streaming_rewrite_enabled(enabled);
-            let label = rewrite_mode_menu_label(enabled);
-            state
-                .hud
-                .show_text(&format!("AI 改写：{label}"), false, false);
-            info!(
-                streaming_rewrite_enabled = enabled,
-                "streaming AI rewrite toggle selected from tray menu"
-            );
+            info!(rewrite_enabled = enabled, "rewrite toggle from tray");
         }
     });
 }
@@ -868,23 +512,6 @@ fn toggle_auto_start() {
     }
 }
 
-fn set_rewrite_output_language(language: RewriteOutputLanguage) {
-    TRAY_STATE.with(|state| {
-        if let Some(state) = state.borrow().as_ref() {
-            state.rewrite_language.set_output_language(language);
-            let label = rewrite_language_menu_label(language);
-            state
-                .hud
-                .show_text(&format!("改写输出语言：{label}"), false, false);
-            info!(
-                output_language = ?language,
-                "Whisper rewrite output language selected from tray menu"
-            );
-        }
-    });
-}
-
-
 extern "system" fn tray_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::Relaxed);
     if taskbar_created != 0 && msg == taskbar_created {
@@ -896,10 +523,6 @@ extern "system" fn tray_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
     match msg {
         TRAY_CALLBACK => {
             let mouse_msg = lparam.0 as u32;
-            if mouse_msg == NIN_BALLOONUSERCLICK {
-                open_suspect_terms_panel();
-                return LRESULT(0);
-            }
             if mouse_msg == WM_LBUTTONUP || mouse_msg == WM_RBUTTONUP {
                 unsafe { show_tray_menu(hwnd) };
                 return LRESULT(0);

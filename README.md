@@ -26,32 +26,15 @@
 2. Unpack anywhere.
 3. Run `ainput.exe` or `run-ainput.bat`.
 4. Hold **CapsLock**, speak, release — text pastes into the focused window.
-5. (Optional) Open tray → console → set OpenAI-compatible **base URL**, **API key**, **model**, enable rewrite.
+5. (Optional) Tray right-click → **API / 改写设置…** → fill Base URL / API Key / Model → enable rewrite → Save.
 
 Runtime state is stored next to the executable under `state/` (config, logs, history).
 
 ## Configure AI rewrite
 
-Copy `config/api.example.json` to `state/config/api.json` (created on first run) and fill:
+Use the **native settings panel** (tray → `API / 改写设置…`). Values are saved to `state/config/api-connections.json` and hot-reloaded (no restart).
 
-```json
-{
-  "version": 1,
-  "openai_compatible": {
-    "base_url": "https://api.example.com",
-    "api_key": "sk-...",
-    "chat_completions_path": "/v1/chat/completions",
-    "models_path": "/v1/models"
-  },
-  "rewrite": {
-    "enabled": true,
-    "model": "your-model-id",
-    "timeout_ms": 5000
-  }
-}
-```
-
-Empty `base_url` / key keeps pure local dictation (rewrite off).
+Empty Base URL keeps pure local dictation (rewrite off).
 
 ## Build from source
 

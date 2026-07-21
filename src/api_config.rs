@@ -131,6 +131,38 @@ impl ApiConnections {
         }
         Ok(Self { path, config })
     }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create API config dir {}", parent.display()))?;
+        }
+        let raw = serde_json::to_string_pretty(&self.config)
+            .context("serialize API connections config")?;
+        std::fs::write(&self.path, format!("{raw}\n"))
+            .with_context(|| format!("write API config {}", self.path.display()))
+    }
+
+    pub fn update_openai_compatible(
+        &mut self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Result<()> {
+        self.config.cliproxyapi.base_url = base_url.trim().trim_end_matches('/').to_string();
+        self.config.cliproxyapi.api_key = api_key.trim().to_string();
+        if self.config.cliproxyapi.api_key_env.trim().is_empty() {
+            self.config.cliproxyapi.api_key_env = "AINPUT_API_KEY".to_string();
+        }
+        if self.config.cliproxyapi.chat_completions_path.trim().is_empty() {
+            self.config.cliproxyapi.chat_completions_path = "/v1/chat/completions".to_string();
+        }
+        if self.config.cliproxyapi.models_path.trim().is_empty() {
+            self.config.cliproxyapi.models_path = "/v1/models".to_string();
+        }
+        self.config.rewrite.model = model.trim().to_string();
+        self.save()
+    }
 }
 
 impl ApiConnectionsConfig {

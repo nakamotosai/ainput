@@ -2,26 +2,23 @@
 
 mod ai_rewrite;
 mod api_config;
+mod api_settings_panel;
 mod asr_pool;
 mod audio;
 mod cloud_asr;
 mod config;
 mod debug_panel;
 mod history;
-mod history_panel;
 mod hotkey;
 mod hud;
-mod hud_font_panel;
 mod local_asr;
 mod modes;
 mod output;
 mod personal_corrections;
 mod pipeline;
-mod prompt_studio;
 mod resample;
 mod rewrite_language;
 mod suspect_terms;
-mod suspect_terms_panel;
 mod term_embeddings;
 mod tray;
 mod worker;
@@ -124,9 +121,6 @@ fn main() -> Result<()> {
         Arc::clone(&shutdown),
     )
     .context("start HUD")?;
-    let hud_font_panel =
-        hud_font_panel::HudFontPanelController::start(hud.clone(), Arc::clone(&shutdown))
-            .context("start HUD font panel")?;
     let modes = modes::ModeStore::new(config.mode.default);
     // Cloud ASR clients remain for disabled legacy code paths; empty endpoints are allowed.
     // Public product path is local SenseVoice only — do not require cloud ASR health.
@@ -146,32 +140,17 @@ fn main() -> Result<()> {
     if !config.profiles.streaming.enabled {
         asr_sessions.set_preheat_enabled(false, "streaming_profile_disabled");
     }
-    let debug_panel = debug_panel::DebugPanelController::start(
-        config
-            .asr
-            .endpoint_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string(),
-        modes.clone(),
-        asr_sessions.clone(),
-        Arc::clone(&shutdown),
-    )
-    .context("start debug panel")?;
+    let debug_panel = debug_panel::DebugPanelController::default();
     let history = history::HistoryService::start(
         state_root.join("logs").join("history.jsonl"),
         Arc::clone(&shutdown),
     )
     .context("start history service")?;
-    let history_panel = history_panel::HistoryPanelController::start(
-        history.path().to_path_buf(),
-        Arc::clone(&shutdown),
-    )
-    .context("start history panel")?;
     let corrections_path = state_root.join("config").join("personal-corrections.json");
-    let (suspect_notification_tx, suspect_notification_rx) = mpsc::channel();
+    let (suspect_notification_tx, _suspect_notification_rx) = mpsc::channel();
     let (api_notification_tx, api_notification_rx) = mpsc::channel();
-    let suspect_terms = suspect_terms::SuspectTermsController::start(
+    // Background analyzers stay disabled by default; no UI entry points ship in public product.
+    let _suspect_terms = suspect_terms::SuspectTermsController::start(
         config.suspect_terms.clone(),
         history.path().to_path_buf(),
         state_root.join("logs").join("suspect-terms.json"),
@@ -192,40 +171,20 @@ fn main() -> Result<()> {
         Arc::clone(&shutdown),
     )
     .context("start term embedding worker")?;
-    let suspect_terms_panel = suspect_terms_panel::SuspectTermsPanelController::start(
-        suspect_terms,
-        hud.clone(),
-        history.path().to_path_buf(),
-        config
-            .asr
-            .endpoint_url
-            .trim()
-            .trim_end_matches('/')
-            .to_string(),
-        config.asr.api_key_env.clone(),
-        config.asr.api_key.clone(),
-        config_path.clone(),
-        config.rewrite.model.clone(),
-        config.prompt_studio.clone(),
+
+    let shared_rewriter = ai_rewrite::SharedRewriter::new(config.rewrite.clone());
+    let api_settings = api_settings_panel::ApiSettingsPanelController::start(
+        api_connections.path.clone(),
+        rewrite_language.clone(),
+        shared_rewriter.clone(),
         Arc::clone(&shutdown),
     )
-    .context("start web console")?;
-    let prompt_studio = prompt_studio::PromptStudioController::start(
-        config.prompt_studio.clone(),
-        history.path().to_path_buf(),
-        Arc::clone(&shutdown),
-    )
-    .context("start Prompt Studio")?;
+    .context("start API settings panel")?;
     let _tray = tray::Tray::start(
         hud.clone(),
-        hud_font_panel,
-        debug_panel.clone(),
-        history_panel,
-        suspect_terms_panel,
-        prompt_studio,
+        api_settings,
         rewrite_language.clone(),
         api_connections.path.clone(),
-        suspect_notification_rx,
         api_notification_rx,
         Arc::clone(&shutdown),
     )
@@ -270,6 +229,7 @@ fn main() -> Result<()> {
         hud,
         debug_panel,
         history,
+        shared_rewriter,
         rewrite_language,
         shutdown,
     );

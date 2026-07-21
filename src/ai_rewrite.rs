@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,8 +8,99 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::{info, warn};
 
 use crate::config::{RewriteConfig, RewriteOutputLanguage};
+
+/// Hot-swappable rewrite client shared by the voice worker and settings UI.
+#[derive(Clone)]
+pub struct SharedRewriter {
+    slot: Arc<Mutex<Option<AiRewriter>>>,
+    config: Arc<Mutex<RewriteConfig>>,
+}
+
+impl SharedRewriter {
+    pub fn new(config: RewriteConfig) -> Self {
+        let rewriter = match AiRewriter::new(config.clone()) {
+            Ok(rewriter) => Some(rewriter),
+            Err(error) => {
+                warn!(error = %error, "AI rewrite client disabled at start");
+                None
+            }
+        };
+        Self {
+            slot: Arc::new(Mutex::new(rewriter)),
+            config: Arc::new(Mutex::new(config)),
+        }
+    }
+
+    pub fn get(&self) -> Option<AiRewriter> {
+        self.slot.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    pub fn snapshot_config(&self) -> RewriteConfig {
+        self.config
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| RewriteConfig::default())
+    }
+
+    /// Apply OpenAI-compatible endpoint fields and rebuild the client immediately.
+    pub fn apply_connection(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        chat_path: &str,
+    ) -> Result<()> {
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|_| anyhow::anyhow!("rewrite config lock poisoned"))?
+            .clone();
+        let base = base_url.trim().trim_end_matches('/');
+        let path = if chat_path.trim().is_empty() {
+            "/v1/chat/completions"
+        } else {
+            chat_path.trim()
+        };
+        config.endpoint_url = if base.is_empty() {
+            String::new()
+        } else {
+            format!("{base}/{}", path.trim_start_matches('/'))
+        };
+        config.api_key = api_key.trim().to_string();
+        config.api_key_env = "AINPUT_API_KEY".to_string();
+        config.model = model.trim().to_string();
+        self.replace_config(config)
+    }
+
+    pub fn replace_config(&self, config: RewriteConfig) -> Result<()> {
+        let rewriter = match AiRewriter::new(config.clone()) {
+            Ok(rewriter) => Some(rewriter),
+            Err(error) => {
+                warn!(error = %error, "AI rewrite client rebuild failed");
+                None
+            }
+        };
+        {
+            let mut guard = self
+                .config
+                .lock()
+                .map_err(|_| anyhow::anyhow!("rewrite config lock poisoned"))?;
+            *guard = config;
+        }
+        {
+            let mut guard = self
+                .slot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("rewrite slot lock poisoned"))?;
+            *guard = rewriter;
+        }
+        info!("AI rewrite client reloaded from settings");
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct AiRewriter {

@@ -12,8 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use tracing::{error, info, warn};
 
 use crate::ai_rewrite::{
-    AiRewriter, RewriteAttempt, RewriteTrace, rewrite_error_is_backend_unavailable,
-    rewrite_prompt_for_language,
+    AiRewriter, RewriteAttempt, RewriteTrace, SharedRewriter,
+    rewrite_error_is_backend_unavailable, rewrite_prompt_for_language,
 };
 use crate::asr_pool::AsrSessionPool;
 use crate::audio::AudioHub;
@@ -302,7 +302,7 @@ pub struct VoiceWorker {
     hud: HudController,
     debug_panel: DebugPanelController,
     history: HistoryService,
-    rewriter: Option<AiRewriter>,
+    rewriter: SharedRewriter,
     rewrite_language: RewriteLanguageController,
     shutdown: Arc<AtomicBool>,
 }
@@ -319,16 +319,10 @@ impl VoiceWorker {
         hud: HudController,
         debug_panel: DebugPanelController,
         history: HistoryService,
+        rewriter: SharedRewriter,
         rewrite_language: RewriteLanguageController,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
-        let rewriter = match AiRewriter::new(config.rewrite.clone()) {
-            Ok(rewriter) => Some(rewriter),
-            Err(error) => {
-                warn!(error = %error, "AI rewrite client disabled");
-                None
-            }
-        };
         Self {
             config,
             asr,
@@ -429,7 +423,7 @@ impl VoiceWorker {
         let output_language = self.rewrite_language.current();
         let mut prewrite = StreamingPrewriteState::new(
             &self.config.rewrite,
-            self.rewriter.clone(),
+            self.rewriter.get(),
             output_language,
         );
         let mut chunk_pump =
@@ -1790,8 +1784,12 @@ impl VoiceWorker {
         let history = self.history.clone();
         let hud = self.hud.clone();
         let debug_panel = self.debug_panel.clone();
-        let rewriter = self.rewriter.clone();
-        let rewrite_min_chars = self.config.rewrite.min_chars;
+        let rewriter = self.rewriter.get();
+        let rewrite_min_chars = self
+            .rewriter
+            .snapshot_config()
+            .min_chars
+            .max(self.config.rewrite.min_chars);
         thread::spawn(move || {
             let silent = job.silent_hud;
             let trace = apply_whisper_rewrite_with(
@@ -1892,8 +1890,12 @@ impl VoiceWorker {
     ) {
         let history = self.history.clone();
         let hud = self.hud.clone();
-        let rewriter = self.rewriter.clone();
-        let rewrite_min_chars = self.config.rewrite.min_chars;
+        let rewriter = self.rewriter.get();
+        let rewrite_min_chars = self
+            .rewriter
+            .snapshot_config()
+            .min_chars
+            .max(self.config.rewrite.min_chars);
         thread::spawn(move || {
             let silent = job.silent_hud;
             let rewrite_started = Instant::now();
@@ -2264,8 +2266,12 @@ impl VoiceWorker {
         let history = self.history.clone();
         let hud = self.hud.clone();
         let debug_panel = self.debug_panel.clone();
-        let rewriter = self.rewriter.clone();
-        let rewrite_min_chars = self.config.rewrite.min_chars;
+        let rewriter = self.rewriter.get();
+        let rewrite_min_chars = self
+            .rewriter
+            .snapshot_config()
+            .min_chars
+            .max(self.config.rewrite.min_chars);
         thread::spawn(move || {
             let (trace, replacement_age_ms) = if let Some(trace) = job.prewrite_trace {
                 (trace, Some(0))
@@ -2366,8 +2372,12 @@ impl VoiceWorker {
     fn spawn_hud_first_streaming_rewrite(&self, job: HudFirstStreamingRewriteJob) {
         let history = self.history.clone();
         let hud = self.hud.clone();
-        let rewriter = self.rewriter.clone();
-        let rewrite_min_chars = self.config.rewrite.min_chars;
+        let rewriter = self.rewriter.get();
+        let rewrite_min_chars = self
+            .rewriter
+            .snapshot_config()
+            .min_chars
+            .max(self.config.rewrite.min_chars);
         thread::spawn(move || {
             let rewrite_started = Instant::now();
             let (trace_tx, trace_rx) = mpsc::channel();
