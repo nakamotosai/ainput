@@ -149,71 +149,108 @@ pub fn clear(path: &Path) -> Result<()> {
 
 pub fn render_history(records: &[HistoryRecord]) -> String {
     let mut out = String::new();
-    out.push_str("ainput 历史 / 对比\r\n\r\n");
+    out.push_str("ainput 听写历史（本机存档，不上云）\r\n\r\n");
     if records.is_empty() {
-        out.push_str("暂无记录。\r\n");
+        out.push_str("暂无记录。按住 CapsLock 说几句后点刷新。\r\n");
         return out;
     }
 
-    let latest_streaming = records
-        .iter()
-        .rev()
-        .find(|record| record.profile_id == "streaming_default");
-    let latest_cloud = records
-        .iter()
-        .rev()
-        .find(|record| record.profile_id == "whisper_capslock" && !record.pasted_text.is_empty());
-    let latest_local = records
-        .iter()
-        .rev()
-        .find(|record| record.profile_id == "local_nonstreaming" && !record.pasted_text.is_empty());
-
-    out.push_str("最近对比\r\n");
-    out.push_str(&format_comparison_line("Ctrl / 流式预览", latest_streaming));
-    out.push_str(&format_comparison_line("CapsLock / 快速本地", latest_local));
-    out.push_str(&format_comparison_line("Alt+Z / 云端备用", latest_cloud));
-    out.push_str("\r\n记录\r\n");
-    for record in records.iter().rev() {
+    out.push_str(&format!("合计 {} 条（新→旧）\r\n\r\n", records.len()));
+    for (index, record) in records.iter().rev().enumerate() {
+        let n = index + 1;
+        let when = format_timestamp_ms(record.timestamp_ms);
+        let target = if record.target_process.trim().is_empty() {
+            "未知应用".to_string()
+        } else {
+            record.target_process.clone()
+        };
+        let mode_label = if record.rewrite_enabled {
+            "AI改写"
+        } else {
+            "原文直出"
+        };
         out.push_str(&format!(
-            "[{}] {} {} {}ms {} {}\r\n",
-            record.timestamp_ms,
-            record.profile_id,
-            record.mode,
-            record.total_elapsed_ms,
-            record.target_context_source,
-            one_line(record.preview_text(), 120)
+            "—— #{n} · {when} · {mode_label} · {target} · {}ms ——\r\n",
+            record.total_elapsed_ms
         ));
+
+        let raw = first_nonempty(&[&record.raw_text, &record.finalized_text]);
+        let rewritten = first_nonempty(&[&record.rewrite_text, &record.pasted_text]);
+        let pasted = record.pasted_text.trim();
+
+        if record.rewrite_enabled {
+            out.push_str(&format!("改写前: {}\r\n", display_or_empty(raw)));
+            out.push_str(&format!("改写后: {}\r\n", display_or_empty(rewritten)));
+            if !pasted.is_empty() && pasted != rewritten {
+                out.push_str(&format!("最终粘贴: {}\r\n", pasted));
+            }
+            if !record.rewrite_model.is_empty() || record.rewrite_elapsed_ms > 0 {
+                out.push_str(&format!(
+                    "模型: {} · 改写耗时 {}ms\r\n",
+                    if record.rewrite_model.is_empty() {
+                        "(未记)"
+                    } else {
+                        &record.rewrite_model
+                    },
+                    record.rewrite_elapsed_ms
+                ));
+            }
+            if !record.rewrite_error.is_empty() {
+                out.push_str(&format!("改写错误: {}\r\n", record.rewrite_error));
+            }
+        } else {
+            out.push_str(&format!("原文: {}\r\n", display_or_empty(record.preview_text())));
+        }
+
         if !record.error.is_empty() || !record.skipped_reason.is_empty() {
             out.push_str(&format!(
-                "  状态: {}{}\r\n",
+                "状态: {}{}\r\n",
                 record.error, record.skipped_reason
             ));
         }
-        if record.rewrite_enabled {
-            out.push_str(&format!(
-                "  AI: model={} elapsed={}ms attempts={} error={}\r\n",
-                record.rewrite_model,
-                record.rewrite_elapsed_ms,
-                record.rewrite_attempts,
-                record.rewrite_error
-            ));
-        }
-        if !record.phase_timings.is_empty() {
-            out.push_str(&format!("  阶段: {}\r\n", record.phase_timings));
-        }
+        out.push_str("\r\n");
     }
     out
 }
 
-fn format_comparison_line(label: &str, record: Option<&HistoryRecord>) -> String {
-    match record {
-        Some(record) => format!(
-            "- {}: {}ms, {}\r\n",
-            label,
-            record.total_elapsed_ms,
-            one_line(record.preview_text(), 120)
-        ),
-        None => format!("- {}: 暂无记录\r\n", label),
+fn first_nonempty<'a>(parts: &[&'a str]) -> &'a str {
+    for part in parts {
+        if !part.trim().is_empty() {
+            return part.trim();
+        }
+    }
+    ""
+}
+
+fn display_or_empty(text: &str) -> &str {
+    if text.trim().is_empty() {
+        "(空)"
+    } else {
+        text
+    }
+}
+
+fn format_timestamp_ms(timestamp_ms: u128) -> String {
+    // History uses wall-clock millis since UNIX epoch when available.
+    if timestamp_ms < 1_000_000_000_000 {
+        return format!("{timestamp_ms}");
+    }
+    let secs = (timestamp_ms / 1000) as i64;
+    // Local-friendly HH:MM:SS from epoch without external crates.
+    // Windows: convert via systemtime when possible.
+    match std::time::SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64)) {
+        Some(time) => match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => {
+                let total = d.as_secs();
+                // Approximate local by using UTC stamp; panel also shows path for full jsonl.
+                let hours = (total / 3600) % 24;
+                let mins = (total / 60) % 60;
+                let s = total % 60;
+                format!("UTC {hours:02}:{mins:02}:{s:02}")
+            }
+            Err(_) => format!("{timestamp_ms}"),
+        },
+        None => format!("{timestamp_ms}"),
     }
 }
 
@@ -259,31 +296,38 @@ mod tests {
     use super::{HistoryRecord, append_record, load_recent, render_history};
 
     #[test]
-    fn renders_streaming_and_whisper_comparison() {
-        let mut streaming = HistoryRecord::new("utt-1", "streaming_default", "streaming_asr");
-        streaming.pasted_text = "你好 Codex".to_string();
-        streaming.total_elapsed_ms = 200;
-        let mut whisper = HistoryRecord::new("utt-2", "whisper_capslock", "whisper_zh");
-        whisper.pasted_text = "你好 CodeX".to_string();
-        whisper.total_elapsed_ms = 900;
-        let mut local = HistoryRecord::new("utt-3", "local_nonstreaming", "local_nonstreaming");
-        local.pasted_text = "你好本地".to_string();
-        local.total_elapsed_ms = 300;
-        let rendered = render_history(&[streaming, whisper, local]);
-        assert!(rendered.contains("Ctrl / 流式预览"));
-        assert!(rendered.contains("CapsLock / 快速本地"));
-        assert!(rendered.contains("Alt+Z / 云端备用"));
-        assert!(rendered.contains("你好 Codex"));
-        assert!(rendered.contains("你好 CodeX"));
+    fn renders_raw_and_rewrite_before_after() {
+        let mut raw_only = HistoryRecord::new("utt-1", "local_nonstreaming", "local_nonstreaming");
+        raw_only.raw_text = "原句一".to_string();
+        raw_only.pasted_text = "原句一".to_string();
+        raw_only.rewrite_enabled = false;
+        raw_only.total_elapsed_ms = 200;
+
+        let mut rewritten = HistoryRecord::new("utt-2", "local_nonstreaming", "local_nonstreaming");
+        rewritten.raw_text = "改写前句子".to_string();
+        rewritten.rewrite_text = "改写后句子".to_string();
+        rewritten.pasted_text = "改写后句子".to_string();
+        rewritten.rewrite_enabled = true;
+        rewritten.rewrite_model = "demo-model".to_string();
+        rewritten.rewrite_elapsed_ms = 123;
+        rewritten.total_elapsed_ms = 900;
+
+        let rendered = render_history(&[raw_only, rewritten]);
+        assert!(rendered.contains("合计 2 条"));
+        assert!(rendered.contains("原文: 原句一"));
+        assert!(rendered.contains("改写前: 改写前句子"));
+        assert!(rendered.contains("改写后: 改写后句子"));
+        assert!(rendered.contains("demo-model"));
     }
 
     #[test]
-    fn renders_phase_timings_when_present() {
+    fn renders_rewrite_error_when_present() {
         let mut record = HistoryRecord::new("utt-1", "local_nonstreaming", "local_nonstreaming");
-        record.pasted_text = "你好".to_string();
-        record.phase_timings = "record=800ms;asr=300ms;rewrite=400ms;paste=30ms".to_string();
+        record.raw_text = "你好".to_string();
+        record.rewrite_enabled = true;
+        record.rewrite_error = "timeout".to_string();
         let rendered = render_history(&[record]);
-        assert!(rendered.contains("阶段: record=800ms;asr=300ms;rewrite=400ms;paste=30ms"));
+        assert!(rendered.contains("改写错误: timeout"));
     }
 
     #[test]

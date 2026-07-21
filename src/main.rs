@@ -9,6 +9,7 @@ mod cloud_asr;
 mod config;
 mod debug_panel;
 mod history;
+mod history_panel;
 mod hotkey;
 mod hud;
 mod local_asr;
@@ -180,9 +181,15 @@ fn main() -> Result<()> {
         Arc::clone(&shutdown),
     )
     .context("start API settings panel")?;
+    let history_panel = history_panel::HistoryPanelController::start(
+        history.path().to_path_buf(),
+        Arc::clone(&shutdown),
+    )
+    .context("start history panel")?;
     let _tray = tray::Tray::start(
         hud.clone(),
         api_settings,
+        history_panel,
         rewrite_language.clone(),
         api_connections.path.clone(),
         api_notification_rx,

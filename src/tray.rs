@@ -27,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::api_settings_panel::ApiSettingsPanelController;
+use crate::history_panel::HistoryPanelController;
 use crate::hud::HudController;
 use crate::rewrite_language::RewriteLanguageController;
 
@@ -38,6 +39,7 @@ static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 static API_NOTIFICATION_QUEUE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 const MENU_API_SETTINGS: usize = 2010;
+const MENU_HISTORY: usize = 2012;
 const MENU_AUTO_START: usize = 2011;
 const MENU_EXIT: usize = 2005;
 const MENU_REWRITE_ENABLED: usize = 2700;
@@ -51,6 +53,7 @@ impl Tray {
     pub fn start(
         hud: HudController,
         api_settings: ApiSettingsPanelController,
+        history_panel: HistoryPanelController,
         rewrite_language: RewriteLanguageController,
         api_config_path: PathBuf,
         api_notifications: mpsc::Receiver<String>,
@@ -65,6 +68,7 @@ impl Tray {
                 *state.borrow_mut() = Some(TrayState {
                     hud,
                     api_settings,
+                    history_panel,
                     rewrite_language,
                     api_config_path,
                     shutdown,
@@ -103,6 +107,7 @@ impl Drop for Tray {
 struct TrayState {
     hud: HudController,
     api_settings: ApiSettingsPanelController,
+    history_panel: HistoryPanelController,
     rewrite_language: RewriteLanguageController,
     api_config_path: PathBuf,
     shutdown: Arc<AtomicBool>,
@@ -380,6 +385,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             "本地语音 AI 改写",
         );
         append_menu_text(menu, MF_STRING, MENU_API_SETTINGS, "API / 改写设置…");
+        append_menu_text(menu, MF_STRING, MENU_HISTORY, "听写历史…");
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
@@ -408,6 +414,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         };
         match command.0 as usize {
             MENU_API_SETTINGS => open_api_settings(),
+            MENU_HISTORY => open_history_panel(),
             MENU_REWRITE_ENABLED => set_rewrite_enabled(!rewrite_enabled),
             MENU_AUTO_START => toggle_auto_start(),
             MENU_EXIT => {
@@ -445,6 +452,15 @@ fn open_api_settings() {
                 path = %state.api_config_path.display(),
                 "API settings panel opened from tray"
             );
+        }
+    });
+}
+
+fn open_history_panel() {
+    TRAY_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.history_panel.open();
+            info!("history panel opened from tray");
         }
     });
 }
