@@ -29,8 +29,8 @@ cargo test
 
 1. Cold start from unpacked zip (empty `state/`).
 2. Hold **CapsLock**, speak, release → text pastes into focused app.
-3. Tray → **API / 改写设置…** → Key → **拉取模型** (must not crash) → pick model → Save (HTTP + latency; key on disk).
-4. Enable rewrite, dictate once → tray **听写历史…** shows before/after when rewrite completed.
+3. Tray → **API / 改写设置…** opens loopback browser page → Key → **拉取模型** (must not crash) → pick model → **保存并测连通** (HTTP + latency; key on disk).
+4. Enable rewrite, dictate once → tray **听写历史…** opens loopback browser page with before/after when rewrite completed.
 5. Kill process cleanly via tray **退出**.
 
 ## Logs
