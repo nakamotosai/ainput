@@ -39,7 +39,8 @@ Use the **native settings panel** (tray → `API / 改写设置…`):
 | Base URL | Prefilled `https://integrate.api.nvidia.com/v1` (any OpenAI-compatible endpoint works) |
 | API Key | You provide; stored only in local `state/config/` |
 | Model | Type manually, or click **拉取模型** after Key is filled |
-| Timeout (ms) | Default `5000` — used for rewrite and model list pull fallback |
+| Timeout (ms) | Default `5000` — used for rewrite, model list pull, and save probe |
+| Save | Writes **API Key** to local `state/config/api-connections.json` and probes connectivity (HTTP status + latency ms) |
 
 Values hot-reload on Save (no restart). Disable rewrite to keep pure local dictation.
 
