@@ -22,6 +22,7 @@ mod rewrite_language;
 mod suspect_terms;
 mod term_embeddings;
 mod tray;
+mod web_ui;
 mod worker;
 
 use std::path::PathBuf;

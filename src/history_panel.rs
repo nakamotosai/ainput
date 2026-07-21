@@ -4,8 +4,8 @@
 //! No native Win32 multi-line EDIT (avoids stacked-glyph bugs).
 //! No Python required; pure Rust TCP serve.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -14,10 +14,11 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::history::{self, HistoryRecord};
+use crate::web_ui::{escape_html, open_browser_hidden, write_response};
 
 #[derive(Clone)]
 pub struct HistoryPanelController {
@@ -209,17 +210,6 @@ fn handle_client(mut stream: TcpStream, history_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) -> Result<()> {
-    let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
-    let _ = stream.flush();
-    Ok(())
-}
-
 fn open_folder(history_path: &Path) {
     let folder = history_path
         .parent()
@@ -229,69 +219,6 @@ fn open_folder(history_path: &Path) {
     let _ = std::process::Command::new("explorer.exe")
         .arg(folder.as_os_str())
         .spawn();
-}
-
-/// Open default browser without a console window flash.
-fn open_browser_hidden(url: &str) -> Result<()> {
-    #[cfg(windows)]
-    {
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        use windows::core::PCWSTR;
-
-        let url_wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-        let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
-        // ShellExecuteW opens the default handler; no cmd.exe console flash.
-        let rc = unsafe {
-            ShellExecuteW(
-                None,
-                PCWSTR(operation.as_ptr()),
-                PCWSTR(url_wide.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        // Per MSDN: return value > 32 means success.
-        if rc.0 as usize > 32 {
-            return Ok(());
-        }
-        // Fallback: explorer.exe http://... (also no console).
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let status = std::process::Command::new("explorer.exe")
-            .arg(url)
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .context("spawn explorer for browser")?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(anyhow!(
-            "ShellExecute failed (rc={}) and explorer exited {status}",
-            rc.0 as usize
-        ));
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = url;
-        Err(anyhow!("history web UI open is Windows-only"))
-    }
-}
-
-fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 fn short_error(text: &str, max_chars: usize) -> String {

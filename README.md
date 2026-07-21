@@ -27,14 +27,14 @@
 2. Unpack anywhere.
 3. Run `ainput.exe` or `run-ainput.bat`.
 4. Hold **CapsLock**, speak, release — text pastes into the focused window.
-5. (Optional) Tray → **API / 改写设置…** → fill Key → **拉取模型** → pick model → set timeout → enable rewrite → Save.
-6. Tray → **听写历史…** opens a **local browser page** (`http://127.0.0.1:…`, loopback only) to browse counts and rewrite before/after.
+5. (Optional) Tray → **API / 改写设置…** opens a **local browser page** → fill Key → **拉取模型** → pick model → set timeout → enable rewrite → **保存并测连通**.
+6. Tray → **听写历史…** opens another **local browser page** to browse counts and rewrite before/after.
 
-Runtime state is stored next to the executable under `state/` (config, logs, history). History is local-only JSONL: `state/logs/history.jsonl`.
+Both UIs bind loopback only (`http://127.0.0.1:<ephemeral-port>/`). Runtime state is stored next to the executable under `state/` (config, logs, history). History is local-only JSONL: `state/logs/history.jsonl`.
 
 ## Configure AI rewrite
 
-Use the **native settings panel** (tray → `API / 改写设置…`):
+Tray → **API / 改写设置…** (loopback web form, no native Win32 panel):
 
 | Field | Default / notes |
 |---|---|
@@ -44,7 +44,7 @@ Use the **native settings panel** (tray → `API / 改写设置…`):
 | Timeout (ms) | Default `5000` — used for rewrite, model list pull, and save probe |
 | Save | Writes **API Key** to local `state/config/api-connections.json` and probes connectivity (HTTP status + latency ms) |
 
-Values hot-reload on Save (no restart). Disable rewrite to keep pure local dictation.
+Values hot-reload on Save (no restart). Disable rewrite to keep pure local dictation. No Python helper process.
 
 ## Build from source
 
