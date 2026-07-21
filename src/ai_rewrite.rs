@@ -616,8 +616,10 @@ fn build_chat_payload(
         "max_tokens": max_tokens,
     });
     if model_requests_zero_reasoning(model) {
+        // Disable chain-of-thought style fields. Never send reasoning_effort="none":
+        // OpenAI-compatible / vLLM validators only accept low|medium|high (400 otherwise).
         payload["include_reasoning"] = json!(false);
-        payload["reasoning_effort"] = json!("none");
+        payload["reasoning_effort"] = json!("low");
         payload["enable_thinking"] = json!(false);
         payload["thinking"] = json!(false);
         payload["chat_template_kwargs"] = json!({
@@ -992,7 +994,7 @@ mod tests {
         }];
         let payload = build_chat_payload("openai/gpt-oss-120b", &messages, 0.1, 128);
         assert_eq!(payload["include_reasoning"], false);
-        assert_eq!(payload["reasoning_effort"], "none");
+        assert_eq!(payload["reasoning_effort"], "low");
         assert_eq!(payload["enable_thinking"], false);
         assert_eq!(payload["thinking"], false);
         assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);
@@ -1018,7 +1020,7 @@ mod tests {
             "test-model"
         ));
         assert_eq!(payload["include_reasoning"], false);
-        assert_eq!(payload["reasoning_effort"], "none");
+        assert_eq!(payload["reasoning_effort"], "low");
         assert_eq!(payload["enable_thinking"], false);
         assert_eq!(payload["thinking"], false);
         assert_eq!(payload["chat_template_kwargs"]["enable_thinking"], false);

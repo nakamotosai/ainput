@@ -236,7 +236,11 @@ pub fn render_history(records: &[HistoryRecord]) -> String {
 
         if record.rewrite_enabled {
             out.push_str(&format!("改写前: {}\r\n", display_or_empty(raw)));
-            out.push_str(&format!("改写后: {}\r\n", display_or_empty(rewritten)));
+            if record.rewrite_text.trim().is_empty() && !record.rewrite_error.is_empty() {
+                out.push_str("改写后: (失败，见下方错误)\r\n");
+            } else {
+                out.push_str(&format!("改写后: {}\r\n", display_or_empty(rewritten)));
+            }
             if !pasted.is_empty() && pasted != rewritten {
                 out.push_str(&format!("最终粘贴: {}\r\n", pasted));
             }
@@ -252,20 +256,46 @@ pub fn render_history(records: &[HistoryRecord]) -> String {
                 ));
             }
             if !record.rewrite_error.is_empty() {
-                out.push_str(&format!("改写错误: {}\r\n", record.rewrite_error));
+                // Keep long provider dumps on one line but cap so EDIT stays readable.
+                let err = short_user_error(&record.rewrite_error, 280);
+                out.push_str(&format!("改写错误: {err}\r\n"));
             }
         } else {
-            out.push_str(&format!("原文: {}\r\n", display_or_empty(record.preview_text())));
+            out.push_str(&format!(
+                "原文: {}\r\n",
+                display_or_empty(record.preview_text())
+            ));
         }
 
-        if !record.error.is_empty() || !record.skipped_reason.is_empty() {
+        if !record.error.is_empty() {
             out.push_str(&format!(
-                "状态: {}{}\r\n",
-                record.error, record.skipped_reason
+                "状态: {}\r\n",
+                short_user_error(&record.error, 200)
+            ));
+        } else if !record.skipped_reason.is_empty()
+            && record.skipped_reason != "rewrite_disabled_raw_paste"
+        {
+            out.push_str(&format!(
+                "状态: {}\r\n",
+                short_user_error(&record.skipped_reason, 160)
             ));
         }
         out.push_str("\r\n");
     }
+    out
+}
+
+fn short_user_error(text: &str, max_chars: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 

@@ -14,11 +14,13 @@ use anyhow::{Result, anyhow};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FillRect, HBRUSH, HFONT, HGDIOBJ, OUT_OUTLINE_PRECIS,
-    SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+    ANTIALIASED_QUALITY, BACKGROUND_MODE, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FillRect, HBRUSH, HFONT, HGDIOBJ,
+    OUT_OUTLINE_PRECIS, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(windows)]
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BN_CLICKED, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -37,12 +39,14 @@ use crate::history;
 const PANEL_THREAD_QUIT: u32 = WM_APP + 141;
 const PANEL_OPEN: u32 = WM_APP + 142;
 
-const CLIENT_W: i32 = 780;
-const CLIENT_H: i32 = 720;
-const MARGIN: i32 = 28;
-const FONT_PX: i32 = 18;
-const TITLE_FONT_PX: i32 = 24;
+// Logical design sizes at 96 DPI; scaled at runtime with Windows display scale.
+const CLIENT_W_96: i32 = 900;
+const CLIENT_H_96: i32 = 820;
+const MARGIN_96: i32 = 28;
+const FONT_PX_96: i32 = 22;
+const TITLE_FONT_PX_96: i32 = 30;
 const PANEL_FONT_FAMILY: &str = "Microsoft YaHei UI";
+const OPAQUE_BG: BACKGROUND_MODE = BACKGROUND_MODE(2);
 
 const ID_TITLE: i32 = 5001;
 const ID_SUMMARY: i32 = 5002;
@@ -131,6 +135,26 @@ thread_local! {
     static PANEL_STATE: RefCell<Option<PanelState>> = const { RefCell::new(None) };
 }
 
+fn ui_scale_from_hwnd(hwnd: Option<HWND>) -> f32 {
+    let dpi = unsafe {
+        if let Some(hwnd) = hwnd {
+            let d = GetDpiForWindow(hwnd);
+            if d > 0 {
+                d
+            } else {
+                96
+            }
+        } else {
+            96
+        }
+    };
+    (dpi as f32 / 96.0).max(1.0)
+}
+
+fn scale_px(value_96: i32, scale: f32) -> i32 {
+    ((value_96 as f32) * scale).round().max(1.0) as i32
+}
+
 unsafe fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
     let family = HSTRING::from(PANEL_FONT_FAMILY);
     unsafe {
@@ -153,16 +177,16 @@ unsafe fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
     }
 }
 
-fn outer_size_for_client(style: WINDOW_STYLE) -> (i32, i32) {
+fn outer_size_for_client(style: WINDOW_STYLE, client_w: i32, client_h: i32) -> (i32, i32) {
     let mut rect = RECT {
         left: 0,
         top: 0,
-        right: CLIENT_W,
-        bottom: CLIENT_H,
+        right: client_w,
+        bottom: client_h,
     };
     let ok = unsafe { AdjustWindowRectEx(&mut rect, style, false, WINDOW_EX_STYLE(0)) };
     if ok.is_err() {
-        return (CLIENT_W + 16, CLIENT_H + 40);
+        return (client_w + 16, client_h + 40);
     }
     (rect.right - rect.left, rect.bottom - rect.top)
 }
@@ -220,7 +244,8 @@ unsafe fn register_panel_class(instance: HINSTANCE) -> Result<()> {
     let class = WNDCLASSW {
         lpfnWndProc: Some(panel_wnd_proc),
         hInstance: instance,
-        lpszClassName: w!("ainput_history_panel_v1"),
+        // v2: DPI-scaled fonts/layout + opaque EDIT fill (fixes moiré/garbled text).
+        lpszClassName: w!("ainput_history_panel_v2"),
         hCursor: cursor,
         hbrBackground: unsafe { CreateSolidBrush(BG) },
         ..Default::default()
@@ -234,15 +259,16 @@ unsafe fn create_panel_window(instance: HINSTANCE) -> Result<HWND> {
     let style = WINDOW_STYLE(
         WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0,
     );
-    let (outer_w, outer_h) = outer_size_for_client(style);
-    unsafe {
+    // First pass at 96 DPI; after HWND exists we may re-size if scale > 1.
+    let (outer_w, outer_h) = outer_size_for_client(style, CLIENT_W_96, CLIENT_H_96);
+    let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("ainput_history_panel_v1"),
+            w!("ainput_history_panel_v2"),
             PCWSTR(title.as_ptr()),
             style,
-            100,
-            60,
+            80,
+            40,
             outer_w,
             outer_h,
             None,
@@ -251,7 +277,20 @@ unsafe fn create_panel_window(instance: HINSTANCE) -> Result<HWND> {
             None,
         )
     }
-    .map_err(|error| anyhow!("create history panel window failed: {error}"))
+    .map_err(|error| anyhow!("create history panel window failed: {error}"))?;
+    let scale = ui_scale_from_hwnd(Some(hwnd));
+    if (scale - 1.0).abs() > 0.01 {
+        let client_w = scale_px(CLIENT_W_96, scale);
+        let client_h = scale_px(CLIENT_H_96, scale);
+        let (ow, oh) = outer_size_for_client(style, client_w, client_h);
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
+            };
+            let _ = SetWindowPos(hwnd, None, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER);
+        }
+    }
+    Ok(hwnd)
 }
 
 unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
@@ -260,8 +299,23 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
         let Some(state) = borrow.as_mut() else {
             return Err(anyhow!("history panel state missing"));
         };
-        state.font = unsafe { create_ui_font(FONT_PX, 400) };
-        state.title_font = unsafe { create_ui_font(TITLE_FONT_PX, 600) };
+        let scale = ui_scale_from_hwnd(Some(hwnd));
+        let font_px = scale_px(FONT_PX_96, scale);
+        let title_px = scale_px(TITLE_FONT_PX_96, scale);
+        let margin = scale_px(MARGIN_96, scale);
+        let client_w = scale_px(CLIENT_W_96, scale);
+        let client_h = scale_px(CLIENT_H_96, scale);
+        info!(
+            scale,
+            font_px,
+            title_px,
+            client_w,
+            client_h,
+            "history panel layout scaled for display DPI"
+        );
+
+        state.font = unsafe { create_ui_font(font_px, 400) };
+        state.title_font = unsafe { create_ui_font(title_px, 600) };
         if state.font.is_invalid() || state.title_font.is_invalid() {
             return Err(anyhow!("create history panel font failed"));
         }
@@ -312,33 +366,39 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             Ok(child_hwnd)
         };
 
-        let field_w = CLIENT_W - MARGIN * 2;
-        let mut y = 22i32;
+        let field_w = client_w - margin * 2;
+        let title_h = scale_px(36, scale);
+        let summary_h = scale_px(56, scale);
+        let btn_h = scale_px(48, scale);
+        let btn_w = scale_px(128, scale);
+        let btn_w_wide = scale_px(180, scale);
+        let gap = scale_px(16, scale);
+        let mut y = scale_px(22, scale);
         let _title = child(
             w!("STATIC"),
             "听写历史",
             WINDOW_STYLE(0),
-            MARGIN,
+            margin,
             y,
             field_w,
-            32,
+            title_h,
             ID_TITLE,
             true,
         )?;
-        y += 40;
+        y += title_h + scale_px(10, scale);
         state.summary = child(
             w!("STATIC"),
             "加载中…",
             WINDOW_STYLE(0),
-            MARGIN,
+            margin,
             y,
             field_w,
-            48,
+            summary_h,
             ID_SUMMARY,
             false,
         )?;
-        y += 56;
-        let body_h = CLIENT_H - y - 80;
+        y += summary_h + scale_px(12, scale);
+        let body_h = (client_h - y - btn_h - scale_px(28, scale)).max(scale_px(200, scale));
         state.body = child(
             w!("EDIT"),
             "",
@@ -351,22 +411,22 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
                     | ES_WANTRETURN as u32
                     | WS_TABSTOP.0,
             ),
-            MARGIN,
+            margin,
             y,
             field_w,
             body_h,
             ID_BODY,
             false,
         )?;
-        y += body_h + 16;
+        y += body_h + gap;
         let _refresh = child(
             w!("BUTTON"),
             "刷新",
             WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-            MARGIN,
+            margin,
             y,
-            120,
-            44,
+            btn_w,
+            btn_h,
             ID_REFRESH,
             false,
         )?;
@@ -374,10 +434,10 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             w!("BUTTON"),
             "打开存档目录",
             WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-            MARGIN + 140,
+            margin + btn_w + gap,
             y,
-            160,
-            44,
+            btn_w_wide,
+            btn_h,
             ID_OPEN_FOLDER,
             false,
         )?;
@@ -385,10 +445,10 @@ unsafe fn create_panel_controls(hwnd: HWND) -> Result<()> {
             w!("BUTTON"),
             "关闭",
             WINDOW_STYLE(BS_PUSHBUTTON as u32 | WS_TABSTOP.0),
-            MARGIN + 320,
+            margin + btn_w + gap + btn_w_wide + gap,
             y,
-            120,
-            44,
+            btn_w,
+            btn_h,
             ID_CLOSE,
             false,
         )?;
@@ -510,6 +570,9 @@ extern "system" fn panel_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CTLCOLOREDIT => {
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
             unsafe {
+                // Opaque fill is required for multiline EDIT — TRANSPARENT leaves
+                // stale glyphs / moiré (garbled “雪花字”) when scrolling or refreshing.
+                SetBkMode(hdc, OPAQUE_BG);
                 SetBkColor(hdc, INPUT_BG);
                 SetTextColor(hdc, TEXT);
             }
