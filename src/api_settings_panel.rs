@@ -22,7 +22,7 @@ use crate::web_ui::{
 };
 
 const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 
 #[derive(Clone)]
 pub struct ApiSettingsPanelController {

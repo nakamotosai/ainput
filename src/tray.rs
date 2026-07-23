@@ -30,6 +30,14 @@ use crate::api_settings_panel::ApiSettingsPanelController;
 use crate::history_panel::HistoryPanelController;
 use crate::hud::HudController;
 use crate::rewrite_language::RewriteLanguageController;
+use crate::rewrite_prompt::{
+    PRESET_COMPACT, PRESET_CUSTOM, PRESET_LIGHT, PRESET_STANDARD, RewritePromptController,
+};
+use crate::rewrite_prompt_panel::RewritePromptPanelController;
+use crate::hotkey_panel::HotkeyPanelController;
+use crate::hotkey_user::HotkeyUserController;
+use crate::voice_command::VoiceCommandController;
+use crate::voice_command_panel::VoiceCommandPanelController;
 
 const TRAY_THREAD_QUIT: u32 = WM_APP + 41;
 const TRAY_CALLBACK: u32 = WM_APP + 42;
@@ -43,6 +51,14 @@ const MENU_HISTORY: usize = 2012;
 const MENU_AUTO_START: usize = 2011;
 const MENU_EXIT: usize = 2005;
 const MENU_REWRITE_ENABLED: usize = 2700;
+const MENU_PROMPT_STANDARD: usize = 2801;
+const MENU_PROMPT_COMPACT: usize = 2802;
+const MENU_PROMPT_LIGHT: usize = 2803;
+const MENU_PROMPT_CUSTOM: usize = 2804;
+const MENU_PROMPT_EDIT: usize = 2805;
+const MENU_VOICE_COMMAND_ENABLED: usize = 2901;
+const MENU_VOICE_COMMAND_EDIT: usize = 2902;
+const MENU_HOTKEY_EDIT: usize = 2910;
 
 pub struct Tray {
     thread_id: u32,
@@ -55,6 +71,12 @@ impl Tray {
         api_settings: ApiSettingsPanelController,
         history_panel: HistoryPanelController,
         rewrite_language: RewriteLanguageController,
+        rewrite_prompt: RewritePromptController,
+        rewrite_prompt_panel: RewritePromptPanelController,
+        voice_command: VoiceCommandController,
+        voice_command_panel: VoiceCommandPanelController,
+        hotkey_user: HotkeyUserController,
+        hotkey_panel: HotkeyPanelController,
         api_config_path: PathBuf,
         api_notifications: mpsc::Receiver<String>,
         shutdown: Arc<AtomicBool>,
@@ -70,6 +92,12 @@ impl Tray {
                     api_settings,
                     history_panel,
                     rewrite_language,
+                    rewrite_prompt,
+                    rewrite_prompt_panel,
+                    voice_command,
+                    voice_command_panel,
+                    hotkey_user,
+                    hotkey_panel,
                     api_config_path,
                     shutdown,
                 });
@@ -109,6 +137,12 @@ struct TrayState {
     api_settings: ApiSettingsPanelController,
     history_panel: HistoryPanelController,
     rewrite_language: RewriteLanguageController,
+    rewrite_prompt: RewritePromptController,
+    rewrite_prompt_panel: RewritePromptPanelController,
+    voice_command: VoiceCommandController,
+    voice_command_panel: VoiceCommandPanelController,
+    hotkey_user: HotkeyUserController,
+    hotkey_panel: HotkeyPanelController,
     api_config_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 }
@@ -337,12 +371,24 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         return;
     };
     let state_snapshot = TRAY_STATE.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .map(|state| state.rewrite_language.rewrite_enabled())
+        state.borrow().as_ref().map(|state| {
+            (
+                state.rewrite_language.rewrite_enabled(),
+                state.rewrite_prompt.preset(),
+                state.rewrite_prompt.preset_label().to_string(),
+                state.voice_command.enabled(),
+                state.hotkey_user.local_nonstreaming(),
+            )
+        })
     });
-    let Some(rewrite_enabled) = state_snapshot else {
+    let Some((
+        rewrite_enabled,
+        prompt_preset,
+        prompt_label,
+        voice_command_enabled,
+        voice_hotkey_label,
+    )) = state_snapshot
+    else {
         let _ = unsafe { DestroyMenu(menu) };
         return;
     };
@@ -362,7 +408,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MF_STRING | MF_GRAYED,
             0,
             &format!(
-                "CapsLock：本地语音 · {}",
+                "{voice_hotkey_label}：本地语音 · {}",
                 if rewrite_enabled {
                     "AI改写"
                 } else {
@@ -386,6 +432,90 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         );
         append_menu_text(menu, MF_STRING, MENU_API_SETTINGS, "API / 改写设置…");
         append_menu_text(menu, MF_STRING, MENU_HISTORY, "听写历史…");
+    }
+    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    unsafe {
+        append_menu_text(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            &format!("改写提示词 · 当前：{prompt_label}"),
+        );
+        append_menu_text(
+            menu,
+            MF_STRING
+                | if prompt_preset == PRESET_STANDARD {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            MENU_PROMPT_STANDARD,
+            "提示词：标准",
+        );
+        append_menu_text(
+            menu,
+            MF_STRING
+                | if prompt_preset == PRESET_COMPACT {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            MENU_PROMPT_COMPACT,
+            "提示词：精简",
+        );
+        append_menu_text(
+            menu,
+            MF_STRING
+                | if prompt_preset == PRESET_LIGHT {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            MENU_PROMPT_LIGHT,
+            "提示词：轻润色",
+        );
+        append_menu_text(
+            menu,
+            MF_STRING
+                | if prompt_preset == PRESET_CUSTOM {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            MENU_PROMPT_CUSTOM,
+            "提示词：自定义",
+        );
+        append_menu_text(menu, MF_STRING, MENU_PROMPT_EDIT, "编辑改写提示词…");
+    }
+    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    unsafe {
+        let voice_flag = if voice_command_enabled {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        append_menu_text(
+            menu,
+            MF_STRING | voice_flag,
+            MENU_VOICE_COMMAND_ENABLED,
+            "语音指令（老蔡老蔡）",
+        );
+        append_menu_text(
+            menu,
+            MF_STRING,
+            MENU_VOICE_COMMAND_EDIT,
+            "编辑语音指令提示词…",
+        );
+    }
+    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    unsafe {
+        append_menu_text(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            &format!("语音快捷键 · 当前：{voice_hotkey_label}"),
+        );
+        append_menu_text(menu, MF_STRING, MENU_HOTKEY_EDIT, "自定义语音快捷键…");
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
@@ -416,6 +546,14 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_API_SETTINGS => open_api_settings(),
             MENU_HISTORY => open_history_panel(),
             MENU_REWRITE_ENABLED => set_rewrite_enabled(!rewrite_enabled),
+            MENU_PROMPT_STANDARD => set_rewrite_prompt_preset(PRESET_STANDARD),
+            MENU_PROMPT_COMPACT => set_rewrite_prompt_preset(PRESET_COMPACT),
+            MENU_PROMPT_LIGHT => set_rewrite_prompt_preset(PRESET_LIGHT),
+            MENU_PROMPT_CUSTOM => set_rewrite_prompt_preset(PRESET_CUSTOM),
+            MENU_PROMPT_EDIT => open_rewrite_prompt_panel(),
+            MENU_VOICE_COMMAND_ENABLED => set_voice_command_enabled(!voice_command_enabled),
+            MENU_VOICE_COMMAND_EDIT => open_voice_command_panel(),
+            MENU_HOTKEY_EDIT => open_hotkey_panel(),
             MENU_AUTO_START => toggle_auto_start(),
             MENU_EXIT => {
                 TRAY_STATE.with(|state| {
@@ -474,6 +612,66 @@ fn set_rewrite_enabled(enabled: bool) {
                 .hud
                 .show_text(&format!("本地语音：{label}"), false, false);
             info!(rewrite_enabled = enabled, "rewrite toggle from tray");
+        }
+    });
+}
+
+fn set_rewrite_prompt_preset(preset: u8) {
+    TRAY_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            if preset == PRESET_CUSTOM && state.rewrite_prompt.custom_prompt().trim().is_empty() {
+                state.rewrite_prompt_panel.open();
+                state
+                    .hud
+                    .show_text("请先填写自定义提示词", false, false);
+                return;
+            }
+            state.rewrite_prompt.set_preset(preset);
+            let label = state.rewrite_prompt.preset_label();
+            state
+                .hud
+                .show_text(&format!("改写提示词：{label}"), false, false);
+            info!(preset, label, "rewrite prompt preset from tray");
+        }
+    });
+}
+
+fn open_rewrite_prompt_panel() {
+    TRAY_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.rewrite_prompt_panel.open();
+            info!("rewrite prompt panel opened from tray");
+        }
+    });
+}
+
+fn set_voice_command_enabled(enabled: bool) {
+    TRAY_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.voice_command.set_enabled(enabled);
+            let label = if enabled { "已开启" } else { "已关闭" };
+            state
+                .hud
+                .show_text(&format!("语音指令（老蔡老蔡）：{label}"), false, false);
+            info!(enabled, "voice command toggle from tray");
+        }
+    });
+}
+
+fn open_voice_command_panel() {
+    TRAY_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.voice_command_panel.open();
+            info!("voice command panel opened from tray");
+        }
+    });
+}
+
+fn open_hotkey_panel() {
+    TRAY_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.hotkey_panel.open();
+            info!("hotkey panel opened from tray");
         }
     });
 }

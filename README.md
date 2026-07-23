@@ -14,8 +14,9 @@
 
 ## Features (public product)
 
-- **CapsLock hold-to-talk** → local non-streaming transcription
-- Optional **AI rewrite** (non-streaming HTTP) when you configure an API
+- **Hold-to-talk** (default **CapsLock**; tray can set **MouseX1/X2**, F13–F24, or combos — custom choice is remembered in `state/config/hotkey-user.toml`)
+- Optional **AI rewrite** (non-streaming HTTP) when you configure an API; editable rewrite prompt + light/standard presets
+- **Voice command** wake phrase (optional tray toggle + custom instruction prompt)
 - Tray icon + HUD feedback
 - Local dictation history (raw vs rewrite) under `state/logs/history.jsonl`, viewed via loopback web UI
 - Personal correction rules (local)
@@ -25,12 +26,12 @@
 
 https://input.saaaai.com/
 
-## Download (v0.1.0)
+## Download (v0.1.2)
 
 | Channel | Link |
 |---|---|
-| **GitHub Release** | [ainput-0.1.0-win64.zip](https://github.com/nakamotosai/ainput/releases/download/v0.1.0/ainput-0.1.0-win64.zip) |
-| **Hugging Face mirror** | [ainput-0.1.0-win64.zip](https://huggingface.co/nakamotosai/cnjp-input/resolve/main/ainput-0.1.0-win64.zip) · [repo](https://huggingface.co/nakamotosai/cnjp-input) |
+| **GitHub Release** | [ainput-0.1.2-win64.zip](https://github.com/nakamotosai/ainput/releases/download/v0.1.2/ainput-0.1.2-win64.zip) |
+| **Hugging Face mirror** | [ainput-0.1.2-win64.zip](https://huggingface.co/nakamotosai/cnjp-input/resolve/main/ainput-0.1.2-win64.zip) · [repo](https://huggingface.co/nakamotosai/cnjp-input) |
 | Site | https://input.saaaai.com/ |
 
 ## Quick start
@@ -38,7 +39,7 @@ https://input.saaaai.com/
 1. Download the release zip (or build from source).
 2. Unpack anywhere.
 3. Run `ainput.exe` or `run-ainput.bat`.
-4. Hold **CapsLock**, speak, release — text pastes into the focused window.
+4. Hold the voice hotkey (default **CapsLock**), speak, release — text pastes into the focused window. Change the key via tray → **自定义语音快捷键…** (restart after save). Mouse side buttons strip system Back/Forward like CapsLock.
 5. (Optional) Tray → **API / 改写设置…** opens a **local browser page** → fill Key → **拉取模型** → pick model → set timeout → enable rewrite → **保存并测连通**.
 6. Tray → **听写历史…** opens another **local browser page** to browse counts and rewrite before/after.
 
@@ -72,7 +73,7 @@ cargo build --release
 Package a portable folder + zip:
 
 ```powershell
-.\scripts\make-portable.ps1 -Version 0.1.0
+.\scripts\make-portable.ps1 -Version 0.1.2
 ```
 
 ## Privacy

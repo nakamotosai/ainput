@@ -387,10 +387,16 @@ impl AppConfig {
         self.rewrite.fallback_models = api.rewrite.fallback_models.clone();
         self.rewrite.api_key_env = api_key_env.clone();
         self.rewrite.api_key = api_key.clone();
+        if api.rewrite.timeout_ms > 0 {
+            self.rewrite.timeout_ms = api.rewrite.timeout_ms.clamp(500, 120_000);
+        }
 
         self.prompt_studio.endpoint_url = chat_endpoint.clone();
         self.prompt_studio.model = api.rewrite.model.clone();
         self.prompt_studio.fallback_models = api.rewrite.fallback_models.clone();
+        if api.rewrite.timeout_ms > 0 {
+            self.prompt_studio.timeout_ms = api.rewrite.timeout_ms.clamp(500, 120_000);
+        }
         self.prompt_studio.api_key_env = api_key_env.clone();
         self.prompt_studio.api_key = api_key.clone();
 
@@ -850,7 +856,7 @@ impl Default for RewriteConfig {
             fallback_models: Vec::new(),
             api_key_env: "AINPUT_API_KEY".to_string(),
             api_key: String::new(),
-            timeout_ms: 3000,
+            timeout_ms: 15_000,
             debounce_ms: 260,
             min_chars: 4,
             max_output_chars: 256,
@@ -1168,7 +1174,7 @@ mod tests {
             enabled = true
             mode = "during_hold"
             output_language = "japanese"
-            timeout_ms = 3000
+            timeout_ms = 15000
             fallback_models = ["gpt-5.3-codex"]
 
             [whisper]

@@ -29,6 +29,8 @@ use crate::output;
 use crate::personal_corrections;
 use crate::resample::LinearResampler;
 use crate::rewrite_language::RewriteLanguageController;
+use crate::rewrite_prompt::RewritePromptController;
+use crate::voice_command::{self, VoiceCommandController};
 
 static UTTERANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -65,7 +67,8 @@ const STREAMING_EMPTY_SNAPSHOT_MIN_AUDIO_MS: u64 = 1000;
 const STREAMING_DYNAMIC_RELEASE_GRACE_MIN_MS: u64 = 80;
 const STREAMING_DYNAMIC_RELEASE_GRACE_MAX_MS: u64 = 150;
 const STREAMING_DYNAMIC_RELEASE_RECENT_PARTIAL_MS: u64 = 220;
-const ASYNC_REWRITE_REPLACEMENT_MAX_AGE_MS: u128 = 1500;
+// Raised: thinking models (step/qwen) often return after 1.5–8s.
+const ASYNC_REWRITE_REPLACEMENT_MAX_AGE_MS: u128 = 12_000;
 const HUD_FIRST_REWRITE_DEADLINE_MS: u64 = 450;
 
 struct AsyncWhisperRewriteJob {
@@ -75,6 +78,7 @@ struct AsyncWhisperRewriteJob {
     raw_pasted_text: String,
     rewrite_enabled: bool,
     output_language: RewriteOutputLanguage,
+    system_prompt: String,
     audio_ms: u64,
     asr_elapsed_ms: u128,
     started_at: Instant,
@@ -95,6 +99,7 @@ struct HudFirstWhisperRewriteJob {
     raw_paste_fallback: String,
     rewrite_enabled: bool,
     output_language: RewriteOutputLanguage,
+    system_prompt: String,
     audio_ms: u64,
     asr_elapsed_ms: u128,
     started_at: Instant,
@@ -304,6 +309,8 @@ pub struct VoiceWorker {
     history: HistoryService,
     rewriter: SharedRewriter,
     rewrite_language: RewriteLanguageController,
+    rewrite_prompt: RewritePromptController,
+    voice_command: VoiceCommandController,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -321,6 +328,8 @@ impl VoiceWorker {
         history: HistoryService,
         rewriter: SharedRewriter,
         rewrite_language: RewriteLanguageController,
+        rewrite_prompt: RewritePromptController,
+        voice_command: VoiceCommandController,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -336,6 +345,8 @@ impl VoiceWorker {
             history,
             rewriter,
             rewrite_language,
+            rewrite_prompt,
+            voice_command,
             shutdown,
         }
     }
@@ -1127,6 +1138,7 @@ impl VoiceWorker {
                 raw_pasted_text: raw_finalized.text.clone(),
                 rewrite_enabled,
                 output_language,
+                system_prompt: self.rewrite_prompt.active_prompt(),
                 audio_ms: response.audio_ms,
                 asr_elapsed_ms,
                 started_at,
@@ -1259,6 +1271,7 @@ impl VoiceWorker {
                 raw_paste_fallback: raw_finalized.text.clone(),
                 rewrite_enabled,
                 output_language,
+                system_prompt: self.rewrite_prompt.active_prompt(),
                 audio_ms: response.audio_ms,
                 asr_elapsed_ms,
                 started_at,
@@ -1351,6 +1364,7 @@ impl VoiceWorker {
             raw_pasted_text: paste_outcome.text.clone(),
             rewrite_enabled,
             output_language,
+            system_prompt: self.rewrite_prompt.active_prompt(),
             audio_ms: response.audio_ms,
             asr_elapsed_ms,
             started_at,
@@ -1470,6 +1484,22 @@ impl VoiceWorker {
         let raw_text = prepare_asr_text(&response.text);
         let output_language = self.rewrite_language.current();
         let rewrite_enabled = self.rewrite_language.rewrite_enabled();
+
+        // Voice command: "老蔡老蔡 …" → generate, not dictation rewrite.
+        if self.voice_command.enabled() {
+            if let Some(command) = voice_command::parse_voice_command(&raw_text) {
+                return self.handle_voice_command(
+                    &utterance_id,
+                    profile_id,
+                    &raw_text,
+                    &command.instruction,
+                    audio_ms,
+                    asr_elapsed_ms,
+                    started_at,
+                );
+            }
+        }
+
         let raw_finalized =
             finalize_asr_text_for_paste_for_language(&raw_text, RewriteOutputLanguage::Chinese);
         let raw_text_for_paste = raw_finalized.text.as_str();
@@ -1539,6 +1569,7 @@ impl VoiceWorker {
                     raw_pasted_text: raw_finalized.text.clone(),
                     rewrite_enabled,
                     output_language,
+                    system_prompt: self.rewrite_prompt.active_prompt(),
                     audio_ms,
                     asr_elapsed_ms,
                     started_at,
@@ -1665,6 +1696,7 @@ impl VoiceWorker {
                     raw_paste_fallback: raw_finalized.text.clone(),
                     rewrite_enabled,
                     output_language,
+                    system_prompt: self.rewrite_prompt.active_prompt(),
                     audio_ms,
                     asr_elapsed_ms,
                     started_at,
@@ -1756,6 +1788,7 @@ impl VoiceWorker {
                 raw_pasted_text: paste_outcome.text.clone(),
                 rewrite_enabled,
                 output_language,
+                system_prompt: self.rewrite_prompt.active_prompt(),
                 audio_ms,
                 asr_elapsed_ms,
                 started_at,
@@ -1783,6 +1816,129 @@ impl VoiceWorker {
             total_elapsed_ms = started_at.elapsed().as_millis(),
             mode = "local_nonstreaming",
             "local non-streaming raw text pasted; async rewrite scheduled"
+        );
+        Ok(())
+    }
+
+    fn handle_voice_command(
+        &self,
+        utterance_id: &str,
+        profile_id: VoiceProfileId,
+        raw_text: &str,
+        instruction: &str,
+        audio_ms: u64,
+        asr_elapsed_ms: u128,
+        started_at: Instant,
+    ) -> Result<()> {
+        self.hud.show_meter_busy();
+        info!(
+            utterance_id,
+            instruction = %short_text(instruction, 200),
+            raw_text = %short_text(raw_text, 200),
+            "voice command detected (老蔡老蔡)"
+        );
+        let Some(rewriter) = self.rewriter.get() else {
+            let msg = "语音指令需要先配置 API / 模型";
+            self.hud.show_text(msg, false, false);
+            let mut record =
+                HistoryRecord::new(utterance_id, profile_id.as_str(), "voice_command");
+            record.raw_text = raw_text.to_string();
+            record.finalized_text = instruction.to_string();
+            record.audio_ms = audio_ms;
+            record.asr_elapsed_ms = asr_elapsed_ms;
+            record.total_elapsed_ms = started_at.elapsed().as_millis();
+            record.error = "rewriter_unavailable".to_string();
+            record.skipped_reason = "voice_command_no_api".to_string();
+            self.history.record(record);
+            return Ok(());
+        };
+
+        let command_started = Instant::now();
+        let system_prompt = self.voice_command.active_prompt();
+        let generated = match rewriter.generate_command(instruction, &system_prompt) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                self.hud.show_text("语音指令无输出", false, false);
+                let mut record =
+                    HistoryRecord::new(utterance_id, profile_id.as_str(), "voice_command");
+                record.raw_text = raw_text.to_string();
+                record.finalized_text = instruction.to_string();
+                record.audio_ms = audio_ms;
+                record.asr_elapsed_ms = asr_elapsed_ms;
+                record.total_elapsed_ms = started_at.elapsed().as_millis();
+                record.skipped_reason = "voice_command_empty".to_string();
+                self.history.record(record);
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(error = %error, "voice command generation failed");
+                self.hud
+                    .show_text(&format!("语音指令失败：{}", short_text(&error.to_string(), 80)), false, false);
+                let mut record =
+                    HistoryRecord::new(utterance_id, profile_id.as_str(), "voice_command");
+                record.raw_text = raw_text.to_string();
+                record.finalized_text = instruction.to_string();
+                record.audio_ms = audio_ms;
+                record.asr_elapsed_ms = asr_elapsed_ms;
+                record.total_elapsed_ms = started_at.elapsed().as_millis();
+                record.error = error.to_string();
+                record.skipped_reason = "voice_command_error".to_string();
+                self.history.record(record);
+                return Ok(());
+            }
+        };
+        let gen_ms = command_started.elapsed().as_millis();
+        let output_target = output::capture_output_target();
+        let paste_outcome = match output::paste_text_to_target_with_trace(
+            &generated,
+            &output_target,
+            &self.config.output,
+            utterance_id,
+            output::TargetPunctuationPolicy::Preserve,
+            output::TargetMatchPolicy::BestEffort,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let mut record =
+                    HistoryRecord::new(utterance_id, profile_id.as_str(), "voice_command");
+                record.raw_text = raw_text.to_string();
+                record.finalized_text = generated.clone();
+                record.audio_ms = audio_ms;
+                record.asr_elapsed_ms = asr_elapsed_ms;
+                record.total_elapsed_ms = started_at.elapsed().as_millis();
+                record.error = format!("paste failed: {error}");
+                record.skipped_reason = "voice_command_paste_failed".to_string();
+                self.history.record(record);
+                self.hud.clear();
+                return Err(error.context("paste voice command text"));
+            }
+        };
+        let mut record = HistoryRecord::new(utterance_id, profile_id.as_str(), "voice_command");
+        record.raw_text = raw_text.to_string();
+        record.finalized_text = generated.clone();
+        record.pasted_text = paste_outcome.text.clone();
+        record.target_process = paste_outcome.target_summary.process_name.clone();
+        record.target_class = paste_outcome.target_summary.class_name.clone();
+        record.target_title = paste_outcome.target_summary.title.clone();
+        record.target_context_source = paste_outcome.target_context.source.to_string();
+        record.target_right_context = paste_outcome.target_context.right.as_str().to_string();
+        record.finalizer_actions = "voice_command".to_string();
+        record.output_actions = paste_outcome.text_actions.clone();
+        record.audio_ms = audio_ms;
+        record.asr_elapsed_ms = asr_elapsed_ms;
+        record.rewrite_elapsed_ms = gen_ms;
+        record.rewrite_model = rewriter.model().to_string();
+        record.total_elapsed_ms = started_at.elapsed().as_millis();
+        record.skipped_reason = "voice_command_applied".to_string();
+        self.history.record(record);
+        self.hud.clear();
+        info!(
+            utterance_id,
+            instruction = %short_text(instruction, 200),
+            generated = %short_text(&generated, 300),
+            gen_ms,
+            total_elapsed_ms = started_at.elapsed().as_millis(),
+            "voice command pasted"
         );
         Ok(())
     }
@@ -1816,6 +1972,7 @@ impl VoiceWorker {
                 &job.raw_text,
                 job.output_language,
                 silent,
+                Some(job.system_prompt.as_str()),
             );
             let rewrite_source = trace.output.as_deref().unwrap_or(&job.raw_text);
             let finalized =
@@ -1925,6 +2082,7 @@ impl VoiceWorker {
                 let raw_text = job.raw_text.clone();
                 let rewrite_enabled = job.rewrite_enabled;
                 let output_language = job.output_language;
+                let system_prompt = job.system_prompt.clone();
                 thread::spawn(move || {
                     let trace = apply_whisper_rewrite_with(
                         rewriter.as_ref(),
@@ -1934,6 +2092,7 @@ impl VoiceWorker {
                         &raw_text,
                         output_language,
                         silent,
+                        Some(system_prompt.as_str()),
                     );
                     let _ = trace_tx.send(trace);
                 });
@@ -2303,6 +2462,7 @@ impl VoiceWorker {
                     &job.raw_text,
                     job.output_language,
                     false,
+                    None, // streaming path keeps language default prompt
                 );
                 let age_ms = trace.elapsed_ms;
                 (trace, Some(age_ms))
@@ -2418,6 +2578,7 @@ impl VoiceWorker {
                         &raw_text,
                         job.output_language,
                         false,
+                        None, // streaming path keeps language default prompt
                     );
                     let _ = trace_tx.send(trace);
                 });
@@ -3103,6 +3264,7 @@ fn apply_whisper_rewrite_with(
     raw_text: &str,
     output_language: RewriteOutputLanguage,
     silent_hud: bool,
+    custom_system_prompt: Option<&str>,
 ) -> RewriteTrace {
     let Some(rewriter) = rewriter else {
         return RewriteTrace {
@@ -3145,8 +3307,20 @@ fn apply_whisper_rewrite_with(
             false,
         );
     }
-    let prompt = rewrite_prompt_for_language(output_language);
-    let mut trace = rewriter.rewrite_with_prompt_trace_enabled(raw_text, &prompt, rewrite_enabled);
+    // Chinese: user-selected tray prompt. Other languages: built-in translation prompt.
+    let owned_default;
+    let prompt = if output_language == RewriteOutputLanguage::Chinese {
+        if let Some(custom) = custom_system_prompt.filter(|p| !p.trim().is_empty()) {
+            custom
+        } else {
+            owned_default = rewrite_prompt_for_language(output_language);
+            owned_default.as_str()
+        }
+    } else {
+        owned_default = rewrite_prompt_for_language(output_language);
+        owned_default.as_str()
+    };
+    let mut trace = rewriter.rewrite_with_prompt_trace_enabled(raw_text, prompt, rewrite_enabled);
     if let Some(output) = trace.output.clone() {
         if let Some(decision) = personal_corrections::guard_rewrite_output(raw_text, &output) {
             trace.attempts.push(RewriteAttempt {
@@ -3542,7 +3716,12 @@ fn finalize_asr_text_for_paste_for_language(
     if finalized != personal_normalized {
         actions.push("dedupe_punctuation");
     }
-    if should_append_sentence_period(&finalized) {
+    // Replace trailing 笑死 with 🤣 before period logic — emoji must not keep
+    // the two Chinese characters, and must not be followed by any punctuation.
+    let laugh_replaced = replace_trailing_laugh_with_emoji(&mut finalized);
+    if laugh_replaced {
+        actions.push("laugh_emoji");
+    } else if should_append_sentence_period(&finalized) {
         finalized.push(sentence_period_for_language(output_language));
         actions.push("append_period");
     }
@@ -3553,6 +3732,35 @@ fn finalize_asr_text_for_paste_for_language(
         text: finalized,
         actions: actions.join(","),
     }
+}
+
+/// If the transcript ends with 笑死 (optional trailing punctuation), replace that
+/// ending with a bare 🤣 — the characters 笑死 are removed, no trailing punct.
+fn replace_trailing_laugh_with_emoji(text: &mut String) -> bool {
+    const MARKER: &str = "笑死";
+    const EMOJI: &str = "🤣";
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() || trimmed.ends_with(EMOJI) {
+        return false;
+    }
+    // Strip trailing sentence punctuation that ASR/period-append may leave.
+    let core = trimmed.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '。' | '.' | '!' | '！' | '?' | '？' | '~' | '～' | '…' | ',' | '，' | ' '
+        )
+    });
+    if !core.ends_with(MARKER) {
+        return false;
+    }
+    let prefix_end = core.len().saturating_sub(MARKER.len());
+    let prefix = core[..prefix_end].trim_end();
+    if prefix.is_empty() {
+        *text = EMOJI.to_string();
+    } else {
+        *text = format!("{prefix}{EMOJI}");
+    }
+    true
 }
 
 fn normalize_output_spacing(
@@ -3872,7 +4080,11 @@ fn rewrite_no_output_hud_text(trace: &RewriteTrace) -> &'static str {
     if rewrite_trace_has_backend_failure(trace) {
         "原文已上屏，改写后端暂不可用"
     } else {
-        "原文已上屏，未改写"
+        match classify_rewrite_no_output(trace) {
+            "rewrite_content_safety" => "原文已上屏，改写未通过安全校验",
+            "rewrite_nochange" => "原文已上屏，无需改写",
+            _ => "原文已上屏，未改写",
+        }
     }
 }
 
@@ -3880,7 +4092,36 @@ fn rewrite_no_output_paste_source(trace: &RewriteTrace) -> &'static str {
     if rewrite_trace_has_backend_failure(trace) {
         "raw_after_rewrite_backend_unavailable"
     } else {
-        "raw_after_rewrite_no_output"
+        match classify_rewrite_no_output(trace) {
+            "rewrite_content_safety" => "raw_after_rewrite_content_safety",
+            "rewrite_nochange" => "raw_after_rewrite_nochange",
+            _ => "raw_after_rewrite_no_output",
+        }
+    }
+}
+
+/// Split the old opaque `rewrite_no_output` bucket for history / HUD.
+fn classify_rewrite_no_output(trace: &RewriteTrace) -> &'static str {
+    if trace.output.is_some() {
+        return "rewrite_no_output";
+    }
+    if rewrite_trace_has_backend_failure(trace) {
+        return "rewrite_backend_unavailable";
+    }
+    let has_ok = trace.attempts.iter().any(|a| a.ok);
+    let any_changed = trace.attempts.iter().any(|a| a.ok && a.changed);
+    let any_safety = trace.attempts.iter().any(|a| {
+        let e = a.error.to_ascii_lowercase();
+        e.contains("content safety")
+            || e.contains("rewrite_content_")
+            || e.contains("content_safety")
+    });
+    if any_safety {
+        "rewrite_content_safety"
+    } else if has_ok && !any_changed {
+        "rewrite_nochange"
+    } else {
+        "rewrite_no_output"
     }
 }
 
@@ -3914,7 +4155,7 @@ fn async_streaming_rewrite_replacement_outcome(
     if trace.output.is_none() && rewrite_trace_has_backend_failure(trace) {
         output::ReplacementOutcome::skipped("rewrite_backend_unavailable")
     } else if trace.output.is_none() {
-        output::ReplacementOutcome::skipped("rewrite_no_output")
+        output::ReplacementOutcome::skipped(classify_rewrite_no_output(trace))
     } else if candidate.trim().is_empty() || candidate == raw_pasted_text {
         output::ReplacementOutcome::skipped("rewrite_empty_or_same")
     } else if debug_mode {
@@ -4049,6 +4290,23 @@ mod tests {
     }
 
     #[test]
+    fn finalize_replaces_trailing_laugh_with_emoji() {
+        // 笑死 is replaced (not kept) and no trailing punctuation after 🤣.
+        assert_eq!(finalize_asr_text_for_paste("这个梗笑死").text, "这个梗🤣");
+        assert_eq!(finalize_asr_text_for_paste("这个梗笑死。").text, "这个梗🤣");
+        assert_eq!(finalize_asr_text_for_paste("这个梗笑死！").text, "这个梗🤣");
+        assert_eq!(finalize_asr_text_for_paste("笑死").text, "🤣");
+        // Middle 笑死 is ordinary text.
+        let mid = finalize_asr_text_for_paste("笑死我了还要继续").text;
+        assert!(!mid.contains('🤣'));
+        assert!(mid.contains("笑死"));
+        // Already ends with emoji — leave alone.
+        let mut already = "太好笑🤣".to_string();
+        assert!(!super::replace_trailing_laugh_with_emoji(&mut already));
+        assert_eq!(already, "太好笑🤣");
+    }
+
+    #[test]
     fn prepare_asr_text_normalizes_personal_english_terms_for_hud() {
         assert_eq!(
             prepare_asr_text("我现在再用 A I A I 来改写。"),
@@ -4144,6 +4402,7 @@ mod tests {
             raw_pasted_text: raw_pasted_text.to_string(),
             rewrite_enabled: true,
             output_language: RewriteOutputLanguage::Chinese,
+            system_prompt: String::new(),
             audio_ms: 1000,
             asr_elapsed_ms: 100,
             started_at: Instant::now(),
@@ -4163,6 +4422,39 @@ mod tests {
         assert_eq!(
             async_rewrite_replacement_outcome(&no_output, "原文", &job("原文")).output_actions,
             "replacement_skipped:rewrite_no_output"
+        );
+
+        let nochange = RewriteTrace {
+            enabled: true,
+            output: None,
+            attempts: vec![RewriteAttempt {
+                model: "openai/gpt-oss-120b".to_string(),
+                ok: true,
+                changed: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            async_rewrite_replacement_outcome(&nochange, "原文", &job("原文")).output_actions,
+            "replacement_skipped:rewrite_nochange"
+        );
+
+        let safety = RewriteTrace {
+            enabled: true,
+            output: None,
+            attempts: vec![RewriteAttempt {
+                model: "openai/gpt-oss-120b".to_string(),
+                ok: false,
+                error: "AI rewrite output failed content safety: rewrite_content_too_short"
+                    .to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            async_rewrite_replacement_outcome(&safety, "原文", &job("原文")).output_actions,
+            "replacement_skipped:rewrite_content_safety"
         );
 
         let backend_unavailable = RewriteTrace {

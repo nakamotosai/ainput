@@ -11,6 +11,8 @@ mod debug_panel;
 mod history;
 mod history_panel;
 mod hotkey;
+mod hotkey_panel;
+mod hotkey_user;
 mod hud;
 mod local_asr;
 mod modes;
@@ -19,9 +21,13 @@ mod personal_corrections;
 mod pipeline;
 mod resample;
 mod rewrite_language;
+mod rewrite_prompt;
+mod rewrite_prompt_panel;
 mod suspect_terms;
 mod term_embeddings;
 mod tray;
+mod voice_command;
+mod voice_command_panel;
 mod web_ui;
 mod worker;
 
@@ -77,6 +83,11 @@ fn run_app() -> Result<()> {
     let mut config = config::AppConfig::load(&config_path)
         .with_context(|| format!("load config {}", config_path.display()))?;
     config.apply_api_connections(&api_connections.config);
+    let hotkey_user = hotkey_user::HotkeyUserController::load_or_default(
+        state_root.join("config").join("hotkey-user.toml"),
+        &config.profiles.local_nonstreaming.hotkey,
+    );
+    hotkey_user.apply_to_profiles(&mut config.profiles);
     personal_corrections::init(state_root.join("config").join("personal-corrections.json"));
     let rewrite_language = rewrite_language::RewriteLanguageController::new(
         config.rewrite.enabled,
@@ -193,6 +204,12 @@ fn run_app() -> Result<()> {
     .context("start term embedding worker")?;
 
     let shared_rewriter = ai_rewrite::SharedRewriter::new(config.rewrite.clone());
+    let rewrite_prompt = rewrite_prompt::RewritePromptController::load_or_default(
+        state_root.join("config").join("rewrite-prompt.toml"),
+    );
+    let voice_command = voice_command::VoiceCommandController::load_or_default(
+        state_root.join("config").join("voice-command.toml"),
+    );
     let api_settings = api_settings_panel::ApiSettingsPanelController::start(
         api_connections.path.clone(),
         rewrite_language.clone(),
@@ -205,11 +222,32 @@ fn run_app() -> Result<()> {
         Arc::clone(&shutdown),
     )
     .context("start history panel")?;
+    let rewrite_prompt_panel = rewrite_prompt_panel::RewritePromptPanelController::start(
+        rewrite_prompt.clone(),
+        Arc::clone(&shutdown),
+    )
+    .context("start rewrite prompt panel")?;
+    let voice_command_panel = voice_command_panel::VoiceCommandPanelController::start(
+        voice_command.clone(),
+        Arc::clone(&shutdown),
+    )
+    .context("start voice command panel")?;
+    let hotkey_panel = hotkey_panel::HotkeyPanelController::start(
+        hotkey_user.clone(),
+        Arc::clone(&shutdown),
+    )
+    .context("start hotkey panel")?;
     let _tray = tray::Tray::start(
         hud.clone(),
         api_settings,
         history_panel,
         rewrite_language.clone(),
+        rewrite_prompt.clone(),
+        rewrite_prompt_panel,
+        voice_command.clone(),
+        voice_command_panel,
+        hotkey_user.clone(),
+        hotkey_panel,
         api_connections.path.clone(),
         api_notification_rx,
         Arc::clone(&shutdown),
@@ -257,6 +295,8 @@ fn run_app() -> Result<()> {
         history,
         shared_rewriter,
         rewrite_language,
+        rewrite_prompt,
+        voice_command,
         shutdown,
     );
     let result = worker.run(hotkey_rx);

@@ -47,7 +47,8 @@ pub struct RewriteApiConfig {
 }
 
 fn default_rewrite_timeout_ms() -> u64 {
-    5_000
+    // Step/Qwen thinking models often need >5s even with thinking disabled.
+    15_000
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

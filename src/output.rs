@@ -1196,6 +1196,17 @@ fn replacement_candidate_char_count(
     if raw_char_count > MAX_SAFE_REPLACEMENT_CHARS {
         return Err("raw_text_too_long");
     }
+    // Defense in depth: never wipe raw paste with a catastrophically short rewrite
+    // (WeChat: 18→「我」; short: 「他把我的脏话改掉了。」→「他把」).
+    let replacement_char_count = replacement.chars().count();
+    if raw_char_count >= 6 {
+        if replacement_char_count <= 3 && replacement_char_count < raw_char_count {
+            return Err("replacement_too_short");
+        }
+        if replacement_char_count * 100 < raw_char_count * 50 {
+            return Err("replacement_too_short");
+        }
+    }
     Ok(raw_char_count)
 }
 
@@ -1252,6 +1263,11 @@ fn replacement_left_context_source(
         };
         let focus_class = window_class_name(focus_hwnd);
         if is_standard_text_control_class(&focus_class) {
+            if capture_standard_text_control_left_context(focus_hwnd, raw_pasted_text) {
+                return Ok("standard_text_control");
+            }
+            // One short settle retry — WeChat/Electron UIA sometimes lags after paste.
+            thread::sleep(Duration::from_millis(45));
             return capture_standard_text_control_left_context(focus_hwnd, raw_pasted_text)
                 .then_some("standard_text_control")
                 .ok_or("left_context_mismatch");
@@ -1259,7 +1275,15 @@ fn replacement_left_context_source(
     }
     match capture_uia_text_left_context(raw_pasted_text) {
         UiaLeftContext::Matches => Ok("uia_text_pattern"),
-        UiaLeftContext::Mismatch => Err("left_context_mismatch"),
+        UiaLeftContext::Mismatch => {
+            thread::sleep(Duration::from_millis(45));
+            match capture_uia_text_left_context(raw_pasted_text) {
+                UiaLeftContext::Matches => Ok("uia_text_pattern"),
+                UiaLeftContext::Mismatch => Err("left_context_mismatch"),
+                UiaLeftContext::SelectionActive => Err("selection_active"),
+                UiaLeftContext::Unavailable => Err("left_context_unavailable"),
+            }
+        }
         UiaLeftContext::SelectionActive => Err("selection_active"),
         UiaLeftContext::Unavailable => Err("left_context_unavailable"),
     }
@@ -1637,6 +1661,10 @@ fn should_append_period_for_target(text: &str) -> bool {
     let Some(last) = text.chars().last() else {
         return false;
     };
+    // Emoji endings (e.g. 🤣 from 笑死 replacement) must stay bare — no 。
+    if is_emoji_char(last) {
+        return false;
+    }
     !matches!(
         last,
         '.' | '。'
@@ -1660,6 +1688,17 @@ fn should_append_period_for_target(text: &str) -> bool {
             | '」'
             | '』'
     )
+}
+
+fn is_emoji_char(ch: char) -> bool {
+    let code = ch as u32;
+    // Common emoji ranges: Misc Symbols, Dingbats, Emoticons, Supplemental Symbols.
+    (0x1F300..=0x1FAFF).contains(&code)
+        || (0x2600..=0x27BF).contains(&code)
+        || matches!(
+            ch,
+            '🤣' | '😂' | '😄' | '😆' | '😅' | '😊' | '😁' | '😉' | '😎' | '👍' | '🙏' | '✨'
+        )
 }
 
 fn trim_trailing_periods(text: &str) -> &str {
@@ -2454,6 +2493,17 @@ mod tests {
     }
 
     #[test]
+    fn target_rule_does_not_append_period_after_emoji() {
+        let laugh = apply_target_punctuation_rule("🤣", TargetRightContext::Empty);
+        assert_eq!(laugh.text, "🤣");
+        assert_eq!(laugh.actions, "none");
+
+        let with_prefix = apply_target_punctuation_rule("这个梗🤣", TargetRightContext::Empty);
+        assert_eq!(with_prefix.text, "这个梗🤣");
+        assert_eq!(with_prefix.actions, "none");
+    }
+
+    #[test]
     fn target_rule_removes_trailing_period_before_right_side_text_or_symbol() {
         for text in [
             "我现在测试。",
@@ -2591,6 +2641,19 @@ mod tests {
             "replacement_same_as_raw"
         );
         assert_eq!(replacement_candidate_char_count("原文", "改写").unwrap(), 2);
+        // Catastrophic shrink must never replace a long raw paste (WeChat 我。 incident).
+        assert_eq!(
+            replacement_candidate_char_count(
+                "我楼下拉面店也有用GPT申图的电了。",
+                "我。"
+            )
+            .unwrap_err(),
+            "replacement_too_short"
+        );
+        assert_eq!(
+            replacement_candidate_char_count("他把我的脏话改掉了。", "他把。").unwrap_err(),
+            "replacement_too_short"
+        );
     }
 
     #[test]
