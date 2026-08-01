@@ -663,13 +663,39 @@ impl HudUserConfig {
     }
 }
 
+/// FIX-8: atomically replace `path` with `content`. Writes a temp file in the
+/// same directory (`.<name>.tmp-<pid>`) then renames over the target, so a
+/// crash or power loss can never leave a half-written config file that fails
+/// to parse on next startup. On Windows, rename within the same volume is
+/// atomic (std::fs::rename replaces an existing destination).
+pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let result = std::fs::write(&tmp, content)
+        .with_context(|| format!("write temp file {}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("atomic rename {} -> {}", tmp.display(), path.display()))
+        });
+    if result.is_err() {
+        // Clean up the temp file when the write or rename failed.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn save_hud_user_config(path: &Path, user: &HudUserConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create HUD user config dir {}", parent.display()))?;
     }
     let raw = toml::to_string_pretty(user).context("serialize HUD user config")?;
-    std::fs::write(path, raw).with_context(|| format!("write HUD user config {}", path.display()))
+    // FIX-8: atomic replace so a crash never leaves a truncated TOML file.
+    atomic_write(path, &raw).with_context(|| format!("write HUD user config {}", path.display()))
 }
 
 fn normalize_hex_color(value: &str, fallback: &str) -> String {
@@ -690,7 +716,8 @@ pub fn save_rewrite_user_config(path: &Path, user: &RewriteUserConfig) -> Result
             .with_context(|| format!("create rewrite user config dir {}", parent.display()))?;
     }
     let raw = toml::to_string_pretty(user).context("serialize rewrite user config")?;
-    std::fs::write(path, raw)
+    // FIX-8: atomic replace so a crash never leaves a truncated TOML file.
+    atomic_write(path, &raw)
         .with_context(|| format!("write rewrite user config {}", path.display()))
 }
 

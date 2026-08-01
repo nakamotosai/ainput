@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::history::{self, HistoryRecord};
-use crate::web_ui::{escape_html, open_browser_hidden, write_response};
+use crate::web_ui::{escape_html, open_browser_hidden, validate_loopback_request, write_response};
 
 #[derive(Clone)]
 pub struct HistoryPanelController {
@@ -136,6 +136,11 @@ fn handle_client(mut stream: TcpStream, history_path: &Path) -> Result<()> {
         return Ok(());
     }
     let req = String::from_utf8_lossy(&buf[..n]);
+    if let Err(reason) = validate_loopback_request(&req) {
+        warn!(reason, "rejected non-loopback history request");
+        write_response(&mut stream, "403 Forbidden", "text/plain; charset=utf-8", b"forbidden")?;
+        return Ok(());
+    }
     let first_line = req.lines().next().unwrap_or("");
     let path = first_line
         .split_whitespace()

@@ -277,12 +277,15 @@ impl AiRewriter {
                         output_char_limit: budget.output_char_limit,
                         prompt_variant,
                     });
+                    // FIX-2: 模型返回空内容（HTTP 成功但 candidate 为 None）时
+                    // 不提前 return，继续尝试下一个 fallback 模型；
+                    // 仅拿到有效候选才选中并返回。
                     if let Some(candidate) = candidate {
                         trace.selected_model = model;
                         trace.output = Some(candidate);
+                        trace.elapsed_ms = started.elapsed().as_millis();
+                        return trace;
                     }
-                    trace.elapsed_ms = started.elapsed().as_millis();
-                    return trace;
                 }
                 Err(error) => {
                     trace.attempts.push(RewriteAttempt {

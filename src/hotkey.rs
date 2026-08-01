@@ -78,6 +78,13 @@ const RELEASE_DEBOUNCE_MS: u64 = 45;
 const INPUT_HOOK_QUIT: u32 = WM_APP + 88;
 const VK_ALT: u16 = 0x12;
 const VK_Z: u16 = b'Z' as u16;
+// FIX-6: 左右修饰键区分用 VK（AltGr 按下时系统合成左 Ctrl，以 VK_LCONTROL 出现）。
+const VK_LCONTROL: u16 = 0xA2;
+const VK_RCONTROL: u16 = 0xA3;
+const VK_LSHIFT: u16 = 0xA0;
+const VK_RSHIFT: u16 = 0xA1;
+const VK_LWIN: u16 = 0x5B;
+const VK_RWIN: u16 = 0x5C;
 /// VK_XBUTTON1 / VK_XBUTTON2 — mouse back/forward side buttons (Razer side keys usually).
 const VK_XBUTTON1: u16 = 0x05;
 const VK_XBUTTON2: u16 = 0x06;
@@ -533,6 +540,21 @@ fn force_capslock_off(reason: &'static str) {
     }
 }
 
+/// FIX-6: 任一 Ctrl/Shift/Win（区分左右）是否按下；AltGr 的合成左 Ctrl 也会被捕获。
+fn modifiers_down() -> bool {
+    key_down(VK_LCONTROL)
+        || key_down(VK_RCONTROL)
+        || key_down(VK_LSHIFT)
+        || key_down(VK_RSHIFT)
+        || key_down(VK_LWIN)
+        || key_down(VK_RWIN)
+}
+
+/// FIX-6: 精确 Alt 按下（Alt 按下且无 Ctrl/Shift/Win），与配置契约 is_alt_z_hotkey 一致。
+fn clean_alt_down() -> bool {
+    key_down(VK_ALT) && !modifiers_down()
+}
+
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let keyboard = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
@@ -540,23 +562,31 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         if SUPPRESS_CAPSLOCK_HOTKEY.load(Ordering::Relaxed)
             && keyboard.vkCode == VK_CAPITAL.0 as u32
         {
+            // FIX-6: 仅吞干净的 CapsLock（无 Ctrl/Shift/Alt/Win）；keyup 只放行被吞的 keydown，保持对称。
             match wparam.0 as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => CAPSLOCK_DOWN.store(true, Ordering::Relaxed),
-                WM_KEYUP | WM_SYSKEYUP => CAPSLOCK_DOWN.store(false, Ordering::Relaxed),
+                WM_KEYDOWN | WM_SYSKEYDOWN if !modifiers_down() && !key_down(VK_ALT) => {
+                    CAPSLOCK_DOWN.store(true, Ordering::Relaxed);
+                    return LRESULT(1);
+                }
+                WM_KEYUP | WM_SYSKEYUP => {
+                    let was_down = CAPSLOCK_DOWN.swap(false, Ordering::Relaxed);
+                    if was_down {
+                        return LRESULT(1);
+                    }
+                }
                 _ => {}
             }
-            return LRESULT(1);
         }
         if SUPPRESS_ALT_Z_HOTKEY.load(Ordering::Relaxed) && keyboard.vkCode == VK_Z as u32 {
-            let alt_is_down = key_down(VK_ALT);
+            // FIX-6: 仅精确 Alt+Z（无 Ctrl/Shift/Win）抑制；Ctrl/Shift/Win+Alt+Z 与 AltGr+Z 放行。
             match wparam.0 as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN if alt_is_down => {
+                WM_KEYDOWN | WM_SYSKEYDOWN if clean_alt_down() => {
                     ALT_Z_DOWN.store(true, Ordering::Relaxed);
                     return LRESULT(1);
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
                     let was_down = ALT_Z_DOWN.swap(false, Ordering::Relaxed);
-                    if was_down || alt_is_down {
+                    if was_down {
                         return LRESULT(1);
                     }
                 }

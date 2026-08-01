@@ -125,6 +125,7 @@ struct AsyncStreamingRewriteJob {
     output_config: OutputConfig,
     debug_mode: bool,
     prewrite_trace: Option<RewriteTrace>,
+    prewrite_finished_at: Option<Instant>,
     prewrite_status: String,
 }
 
@@ -147,6 +148,7 @@ struct HudFirstStreamingRewriteJob {
 struct StreamingPrewriteResult {
     source_text: String,
     trace: RewriteTrace,
+    finished_at: Instant,
 }
 
 struct StreamingPrewriteState {
@@ -566,7 +568,8 @@ impl VoiceWorker {
         let finalized = finalize_asr_text_for_paste(&snapshot);
         let paste_snapshot = finalized.text.as_str();
         let streaming_rewrite_enabled = self.rewrite_language.streaming_rewrite_enabled();
-        let (prewrite_trace, prewrite_status) = prewrite.take_trace_for_release(&snapshot);
+        let (prewrite_trace, prewrite_finished_at, prewrite_status) =
+            prewrite.take_trace_for_release(&snapshot);
         let sent_rms_dbfs = preview.sent_rms_dbfs();
         let sent_peak_dbfs = preview.sent_peak_dbfs();
         info!(
@@ -685,6 +688,7 @@ impl VoiceWorker {
                     output_config: self.config.output.clone(),
                     debug_mode: true,
                     prewrite_trace: prewrite_trace.clone(),
+                    prewrite_finished_at: prewrite_finished_at.clone(),
                     prewrite_status: prewrite_status.clone(),
                 });
             } else {
@@ -923,6 +927,7 @@ impl VoiceWorker {
             output_config: self.config.output.clone(),
             debug_mode: false,
             prewrite_trace,
+            prewrite_finished_at,
             prewrite_status,
         });
         info!(
@@ -2452,7 +2457,15 @@ impl VoiceWorker {
             .max(self.config.rewrite.min_chars);
         thread::spawn(move || {
             let (trace, replacement_age_ms) = if let Some(trace) = job.prewrite_trace {
-                (trace, Some(0))
+                // FIX-1: prewrite results get their real age (produced-at time), so
+                // stale prewrites are subject to ASYNC_REWRITE_REPLACEMENT_MAX_AGE_MS
+                // just like fresh rewrites. Falls back to 0 only if the timestamp is
+                // missing (should not happen).
+                let age_ms = job
+                    .prewrite_finished_at
+                    .map(|finished_at| finished_at.elapsed().as_millis())
+                    .unwrap_or(0);
+                (trace, Some(age_ms))
             } else {
                 let trace = apply_whisper_rewrite_with(
                     rewriter.as_ref(),
@@ -3593,6 +3606,9 @@ impl StreamingPrewriteState {
             let _ = tx.send(StreamingPrewriteResult {
                 source_text: source_text.clone(),
                 trace,
+                // FIX-1: record when this prewrite result was produced so the
+                // async rewrite can apply the real freshness gate instead of 0.
+                finished_at: Instant::now(),
             });
             inflight.fetch_sub(1, Ordering::Relaxed);
             info!(
@@ -3612,24 +3628,33 @@ impl StreamingPrewriteState {
         );
     }
 
-    fn take_trace_for_release(&mut self, final_text: &str) -> (Option<RewriteTrace>, String) {
+    // FIX-1: also return the instant the prewrite result was produced so the
+    // async rewrite can gate on real prewrite age instead of bypassing with 0.
+    fn take_trace_for_release(
+        &mut self,
+        final_text: &str,
+    ) -> (Option<RewriteTrace>, Option<Instant>, String) {
         if !self.enabled {
-            return (None, "prewrite_disabled".to_string());
+            return (None, None, "prewrite_disabled".to_string());
         }
         let mut latest = None;
         while let Ok(result) = self.rx.try_recv() {
             latest = Some(result);
         }
         let Some(result) = latest else {
-            return (None, "prewrite_miss_no_result".to_string());
+            return (None, None, "prewrite_miss_no_result".to_string());
         };
         if result.trace.output.is_none() {
-            return (None, "prewrite_miss_no_output".to_string());
+            return (None, None, "prewrite_miss_no_output".to_string());
         }
         if !texts_close_enough_for_prewrite(&result.source_text, final_text) {
-            return (None, "prewrite_miss_changed_text".to_string());
+            return (None, None, "prewrite_miss_changed_text".to_string());
         }
-        (Some(result.trace), "prewrite_hit".to_string())
+        (
+            Some(result.trace),
+            Some(result.finished_at),
+            "prewrite_hit".to_string(),
+        )
     }
 }
 

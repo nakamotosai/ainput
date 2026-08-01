@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -18,7 +18,8 @@ use crate::hotkey::{
 };
 use crate::hotkey_user::HotkeyUserController;
 use crate::web_ui::{
-    escape_html, open_browser_hidden, read_http_request, request_method, request_path, write_response,
+    escape_html, open_browser_hidden, read_http_request, request_method, request_path,
+    validate_loopback_request, write_response,
 };
 
 #[derive(Clone)]
@@ -79,17 +80,43 @@ impl HotkeyPanelController {
     }
 }
 
+/// FIX-7: hard cap on concurrently handled connections (one thread each).
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+
+/// Releases a connection slot on drop (even on early return / panic unwind).
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn run_server(
     listener: TcpListener,
     state: Arc<ServerState>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     listener.set_nonblocking(true).context("set nonblocking")?;
+    let active = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, peer)) => {
+            Ok((mut stream, peer)) => {
+                // FIX-7: refuse new connections when the thread pool is saturated.
+                if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = write_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "text/plain; charset=utf-8",
+                        b"too many connections",
+                    );
+                    continue;
+                }
                 let state = Arc::clone(&state);
+                let active = Arc::clone(&active);
                 thread::spawn(move || {
+                    let _guard = ConnGuard(active);
                     if let Err(error) = handle_client(stream, &state) {
                         warn!(error = %error, peer = %peer, "hotkey web request failed");
                     }
@@ -111,6 +138,19 @@ fn handle_client(mut stream: TcpStream, state: &ServerState) -> Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let (head, body) = read_http_request(&mut stream)?;
+    // FIX-7: only serve loopback same-origin requests. Blocks DNS rebinding and
+    // drive-by web pages from POSTing /api/save, /api/reset, /api/capture.
+    // Runs before any dispatch, so a rejected request never mutates state.
+    if let Err(reason) = validate_loopback_request(&head) {
+        warn!(reason, "hotkey web request rejected");
+        write_response(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            b"403 Forbidden",
+        )?;
+        return Ok(());
+    }
     let first = head.lines().next().unwrap_or("");
     let method = request_method(first);
     let path = request_path(first);

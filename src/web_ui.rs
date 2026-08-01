@@ -11,8 +11,11 @@ pub fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
+    // FIX-7: no wildcard CORS — every UI page is same-origin with its own
+    // loopback API (relative fetch()), so the header is both unneeded and a
+    // drive-by vector (lets any site read/write loopback APIs).
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
@@ -98,8 +101,18 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
             if let Some(header_end) = find_header_end(&buf) {
                 let headers = &buf[..header_end];
                 let content_length = parse_content_length(headers).unwrap_or(0);
+                // FIX-7: cap request body size so a forged / huge Content-Length
+                // cannot make us buffer unbounded memory.
+                if content_length > MAX_BODY_BYTES {
+                    return Err(anyhow!(
+                        "Content-Length too large ({content_length} bytes)"
+                    ));
+                }
                 let body_start = header_end + 4;
-                while buf.len() < body_start + content_length {
+                let Some(body_end) = body_start.checked_add(content_length) else {
+                    return Err(anyhow!("invalid Content-Length"));
+                };
+                while buf.len() < body_end {
                     let n = stream.read(&mut chunk)?;
                     if n == 0 {
                         break;
@@ -108,7 +121,7 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
                 }
                 let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
                 let body = if body_start < buf.len() {
-                    buf[body_start..body_start + content_length.min(buf.len() - body_start)].to_vec()
+                    buf[body_start..body_end.min(buf.len())].to_vec()
                 } else {
                     Vec::new()
                 };
@@ -121,6 +134,63 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
     }
     let head = String::from_utf8_lossy(&buf).into_owned();
     Ok((head, Vec::new()))
+}
+
+/// Max accepted request body size (64 KiB). Anything larger is rejected.
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Validate that a loopback HTTP request comes from the local machine.
+///
+/// Blocks DNS-rebinding and drive-by web pages from reaching loopback APIs:
+/// the `Host` header (mandatory in HTTP/1.1) must be `127.0.0.1` or
+/// `localhost` (optionally with a port), and any `Origin` / `Referer` must be
+/// an `http://127.0.0.1` or `http://localhost` origin (optionally with a
+/// port). Non-loopback values yield an error description.
+pub fn validate_loopback_request(head: &str) -> std::result::Result<(), &'static str> {
+    let mut host: Option<&str> = None;
+    let mut origin: Option<&str> = None;
+    let mut referer: Option<&str> = None;
+    for line in head.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue; // request line or blank line
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "host" => host = Some(value.trim()),
+            "origin" => origin = Some(value.trim()),
+            "referer" => referer = Some(value.trim()),
+            _ => {}
+        }
+    }
+    let host = host.ok_or("missing Host header")?;
+    if !is_loopback_authority(host) {
+        return Err("non-loopback Host header");
+    }
+    // FIX-7: `Origin: null` (file:// / sandboxed pages) is also rejected here.
+    for header in [origin, referer].into_iter().flatten() {
+        if !is_loopback_origin(header) {
+            return Err("non-loopback Origin/Referer header");
+        }
+    }
+    Ok(())
+}
+
+/// Authority (`host` or `host:port`) that is loopback: 127.0.0.1 / localhost.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    matches!(host, "127.0.0.1" | "localhost")
+}
+
+/// Origin/Referer value: `http://127.0.0.1[:port][/path?query]` or the
+/// localhost equivalent. https or scheme-less values are rejected.
+fn is_loopback_origin(value: &str) -> bool {
+    let Some(authority) = value.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = authority.split(['/', '?']).next().unwrap_or(authority);
+    is_loopback_authority(authority)
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {

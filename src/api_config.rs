@@ -7,6 +7,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::atomic_write;
+
 #[derive(Debug, Clone)]
 pub struct ApiConnections {
     pub path: PathBuf,
@@ -102,6 +104,51 @@ struct ModelEntry {
     id: String,
 }
 
+/// FIX-10: marker prefix for obfuscated api_key values on disk.
+const OBFUSCATED_KEY_PREFIX: &str = "obf:";
+/// FIX-10: XOR byte used to obfuscate api_key values at rest.
+/// NOTE: this is NOT cryptography — it only stops casually reading the key
+/// out of api-connections.json. Anyone with filesystem access can reverse it.
+const KEY_OBFUSCATION_XOR: u8 = 0x5A;
+
+/// FIX-10: obfuscate an api_key for storage. Empty keys and values that are
+/// already obfuscated pass through unchanged.
+fn obfuscate_key(plain: &str) -> String {
+    if plain.is_empty() || plain.starts_with(OBFUSCATED_KEY_PREFIX) {
+        return plain.to_string();
+    }
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(OBFUSCATED_KEY_PREFIX.len() + plain.len() * 2);
+    out.push_str(OBFUSCATED_KEY_PREFIX);
+    for &byte in plain.as_bytes() {
+        let _ = write!(out, "{:02x}", byte ^ KEY_OBFUSCATION_XOR);
+    }
+    out
+}
+
+/// FIX-10: restore the plaintext api_key from an obfuscated (or legacy
+/// plaintext) stored value. Values without the `obf:` prefix are returned
+/// unchanged, so old config files keep working.
+fn deobfuscate_key(stored: &str) -> String {
+    let Some(hex) = stored.strip_prefix(OBFUSCATED_KEY_PREFIX) else {
+        return stored.to_string();
+    };
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let raw = hex.as_bytes();
+    let mut i = 0;
+    while i + 1 < raw.len() {
+        let hi = (raw[i] as char).to_digit(16);
+        let lo = (raw[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => bytes.push(((hi * 16 + lo) as u8) ^ KEY_OBFUSCATION_XOR),
+            // Malformed obfuscated value: hand it back untouched.
+            _ => return stored.to_string(),
+        }
+        i += 2;
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| stored.to_string())
+}
+
 impl ApiConnections {
     pub fn load_or_create(state_root: &Path, install_root: &Path) -> Result<Self> {
         let path = state_root.join("config").join("api-connections.json");
@@ -120,9 +167,11 @@ impl ApiConnections {
                     )
                 })?;
             } else {
-                let raw = serde_json::to_string_pretty(&ApiConnectionsConfig::default())
+                // FIX-8: atomic write (default keys are empty, obfuscation is a no-op).
+                let raw = ApiConnectionsConfig::default()
+                    .to_disk_string()
                     .context("serialize default API connections config")?;
-                std::fs::write(&path, format!("{raw}\n"))
+                atomic_write(&path, &raw)
                     .with_context(|| format!("write API config {}", path.display()))?;
             }
         }
@@ -131,10 +180,15 @@ impl ApiConnections {
         let raw_value = serde_json::from_str::<Value>(&raw).ok();
         let mut config: ApiConnectionsConfig = serde_json::from_str(&raw)
             .with_context(|| format!("parse API config {}", path.display()))?;
+        // FIX-10: memory always holds plaintext keys; only the on-disk form is obfuscated.
+        config.deobfuscate_keys();
         if config.normalize_missing_defaults(raw_value.as_ref()) {
-            let normalized = serde_json::to_string_pretty(&config)
+            // FIX-8: atomic write; FIX-10: re-obfuscate keys for the write-back
+            // (config already holds plaintext after deobfuscate_keys above).
+            let normalized = config
+                .to_disk_string()
                 .context("serialize normalized API connections config")?;
-            std::fs::write(&path, format!("{normalized}\n"))
+            atomic_write(&path, &normalized)
                 .with_context(|| format!("write normalized API config {}", path.display()))?;
         }
         Ok(Self { path, config })
@@ -145,9 +199,12 @@ impl ApiConnections {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create API config dir {}", parent.display()))?;
         }
-        let raw = serde_json::to_string_pretty(&self.config)
+        // FIX-8: atomic replace; FIX-10: obfuscate api_key fields on disk.
+        let raw = self
+            .config
+            .to_disk_string()
             .context("serialize API connections config")?;
-        std::fs::write(&self.path, format!("{raw}\n"))
+        atomic_write(&self.path, &raw)
             .with_context(|| format!("write API config {}", self.path.display()))
     }
 
@@ -174,6 +231,27 @@ impl ApiConnections {
 }
 
 impl ApiConnectionsConfig {
+    /// FIX-10: serialize for disk with the three api_key fields obfuscated.
+    /// In-memory values always stay plaintext; obfuscation happens only here,
+    /// right before the bytes hit the file.
+    fn to_disk_string(&self) -> Result<String> {
+        let mut disk = self.clone();
+        disk.cliproxyapi.api_key = obfuscate_key(&disk.cliproxyapi.api_key);
+        disk.embedding.api_key = obfuscate_key(&disk.embedding.api_key);
+        disk.asr_sidecar.api_key = obfuscate_key(&disk.asr_sidecar.api_key);
+        let raw = serde_json::to_string_pretty(&disk)
+            .context("serialize API connections config")?;
+        Ok(format!("{raw}\n"))
+    }
+
+    /// FIX-10: restore plaintext api_key values after loading from disk.
+    /// Idempotent: legacy plaintext and empty values pass through unchanged.
+    fn deobfuscate_keys(&mut self) {
+        self.cliproxyapi.api_key = deobfuscate_key(&self.cliproxyapi.api_key);
+        self.embedding.api_key = deobfuscate_key(&self.embedding.api_key);
+        self.asr_sidecar.api_key = deobfuscate_key(&self.asr_sidecar.api_key);
+    }
+
     fn normalize_missing_defaults(&mut self, raw: Option<&Value>) -> bool {
         let mut changed = false;
         let clip_default = CliproxyApiConfig::default();
@@ -402,7 +480,8 @@ impl ApiConnectionsConfig {
 pub fn write_setup_status(state_root: &Path, status: &ApiSetupStatus) -> Result<()> {
     let path = state_root.join("logs").join("api-setup-status.json");
     let raw = serde_json::to_string_pretty(status).context("serialize API setup status")?;
-    std::fs::write(&path, format!("{raw}\n"))
+    // FIX-8: atomic replace so a crash never leaves a truncated status file.
+    atomic_write(&path, &format!("{raw}\n"))
         .with_context(|| format!("write API setup status {}", path.display()))
 }
 

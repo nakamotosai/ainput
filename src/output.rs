@@ -67,6 +67,9 @@ struct ClipboardWriteReport {
     set_attempts: u32,
     set_retries: u32,
     set_elapsed_ms: u128,
+    // FIX-5: exact text placed on the clipboard by this paste; restore verifies the
+    // clipboard still holds it before overwriting, so a user copy is never clobbered.
+    set_text: String,
     previous_text: Option<String>,
     previous_text_captured: bool,
     previous_text_error: String,
@@ -297,6 +300,7 @@ fn set_clipboard_text_with_retry(
         set_attempts: stats.attempts,
         set_retries: stats.retries,
         set_elapsed_ms: started_at.elapsed().as_millis(),
+        set_text: text_to_set,
         previous_text_captured: previous_text.is_some(),
         previous_text,
         previous_text_error,
@@ -320,6 +324,38 @@ fn restore_previous_clipboard_text_if_needed(
     };
     if config.clipboard_restore_delay_ms > 0 {
         thread::sleep(Duration::from_millis(config.clipboard_restore_delay_ms));
+    }
+    // FIX-5: only restore when the clipboard still holds the exact text this paste set;
+    // the user may have copied something new during the restore delay — never clobber it.
+    let current_text = match Clipboard::new()
+        .map_err(|error| anyhow!("{error}"))
+        .and_then(|mut clipboard| clipboard.get_text().map_err(|error| anyhow!("{error}")))
+    {
+        Ok(text) => text,
+        Err(error) => {
+            report.restore_attempted = true;
+            report.restore_ok = false;
+            report.restore_error = format!("clipboard_read_failed:{error}");
+            warn!(
+                error = %report.restore_error,
+                previous_text_chars = previous_text.chars().count(),
+                set_text_chars = report.set_text.chars().count(),
+                "clipboard restore skipped because current clipboard content could not be read"
+            );
+            return;
+        }
+    };
+    if current_text != report.set_text {
+        report.restore_attempted = true;
+        report.restore_ok = false;
+        report.restore_error = "clipboard_changed_by_user".to_string();
+        warn!(
+            restore_error = %report.restore_error,
+            previous_text_chars = previous_text.chars().count(),
+            set_text_chars = report.set_text.chars().count(),
+            "clipboard restore skipped because clipboard content changed after paste"
+        );
+        return;
     }
     report.restore_attempted = true;
     let (restore_result, _) = retry_with_backoff(
@@ -656,6 +692,40 @@ pub fn paste_text_to_target_with_trace(
                 text_actions: prepared.actions,
             });
         }
+    }
+    // FIX-4: BestEffort path re-checks the foreground window immediately before Ctrl+V;
+    // an Alt-Tab inside the stabilize window would otherwise paste into the wrong window.
+    if target.fingerprint.hwnd != 0 && !foreground_matches_target(&target.fingerprint) {
+        append_action(&mut prepared.actions, "copy_only_foreground_changed");
+        warn!(
+            utterance_id,
+            target_hwnd = target.fingerprint.hwnd,
+            target_pid = target.fingerprint.process_id,
+            target_process = %target.summary.process_name,
+            target_class = %target.summary.class_name,
+            target_title = %target.summary.title,
+            text_chars = prepared.text.chars().count(),
+            text_hash = stable_text_hash(&prepared.text),
+            text_preview = %short_text(&prepared.text, 160),
+            target_text_actions = %prepared.actions,
+            modifiers_after_stabilize = %input_after_stabilize.modifiers,
+            mouse_buttons_after_stabilize = %input_after_stabilize.mouse_buttons,
+            cursor_after_stabilize = %input_after_stabilize.cursor_label(),
+            clipboard_set_ms,
+            clipboard_policy = clipboard_report.policy.as_str(),
+            clipboard_set_attempts = clipboard_report.set_attempts,
+            clipboard_set_retries = clipboard_report.set_retries,
+            clipboard_retained = clipboard_report.clipboard_retained(),
+            output_action = "copy_only_foreground_changed",
+            "paste skipped because foreground window changed before Ctrl+V; text retained in clipboard"
+        );
+        return Ok(PasteOutcome {
+            text: prepared.text,
+            target_context: target.context.clone(),
+            target_summary: target.summary.clone(),
+            target_fingerprint: target.fingerprint.clone(),
+            text_actions: prepared.actions,
+        });
     }
     let paste_result = send_ctrl_v();
     let paste_done_ms = started_at.elapsed().as_millis();
@@ -1701,8 +1771,10 @@ fn is_emoji_char(ch: char) -> bool {
         )
 }
 
+// FIX-3: strip only full-width periods (。 ．); ASCII '.' must survive so
+// terminal commands like `cd ..` are not mangled before paste.
 fn trim_trailing_periods(text: &str) -> &str {
-    text.trim_end_matches(|ch| matches!(ch, '.' | '。' | '．'))
+    text.trim_end_matches(|ch| matches!(ch, '。' | '．'))
 }
 
 #[derive(Debug, Default)]
@@ -2450,6 +2522,7 @@ mod tests {
             set_attempts: 1,
             set_retries: 0,
             set_elapsed_ms: 0,
+            set_text: String::new(),
             previous_text: None,
             previous_text_captured: false,
             previous_text_error: String::new(),
@@ -2505,16 +2578,15 @@ mod tests {
 
     #[test]
     fn target_rule_removes_trailing_period_before_right_side_text_or_symbol() {
-        for text in [
-            "我现在测试。",
-            "我现在测试.",
-            "我现在测试．",
-            "我现在测试。。",
-        ] {
+        for text in ["我现在测试。", "我现在测试．", "我现在测试。。"] {
             let prepared = apply_target_punctuation_rule(text, TargetRightContext::NonEmpty);
             assert_eq!(prepared.text, "我现在测试");
             assert_eq!(prepared.actions, "target_strip_period_before_right_text");
         }
+        // FIX-3: ASCII '.' is preserved (e.g. `cd ..` in a terminal).
+        let prepared = apply_target_punctuation_rule("我现在测试.", TargetRightContext::NonEmpty);
+        assert_eq!(prepared.text, "我现在测试.");
+        assert_eq!(prepared.actions, "none");
         let prepared = apply_target_punctuation_rule("为什么？", TargetRightContext::NonEmpty);
         assert_eq!(prepared.text, "为什么？");
     }

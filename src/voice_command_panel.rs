@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 use crate::voice_command::{command_system_prompt, VoiceCommandController};
 use crate::web_ui::{
-    escape_html, open_browser_hidden, read_http_request, request_method, request_path, write_response,
+    escape_html, open_browser_hidden, read_http_request, request_method, request_path,
+    validate_loopback_request, write_response,
 };
 
 #[derive(Clone)]
@@ -114,6 +115,11 @@ fn handle_client(mut stream: TcpStream, state: &ServerState) -> Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let (head, body) = read_http_request(&mut stream)?;
+    if let Err(reason) = validate_loopback_request(&head) {
+        warn!(reason, "rejected non-loopback voice command request");
+        write_response(&mut stream, "403 Forbidden", "text/plain; charset=utf-8", b"forbidden")?;
+        return Ok(());
+    }
     let first = head.lines().next().unwrap_or("");
     let method = request_method(first);
     let path = request_path(first);

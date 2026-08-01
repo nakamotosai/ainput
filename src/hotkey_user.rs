@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::config::ProfileConfigs;
+use crate::config::{atomic_write, ProfileConfigs};
 use crate::hotkey::{hotkey_supports_suppress, parse_hotkey_label, validate_hotkey_label};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -63,14 +63,16 @@ impl HotkeyUserController {
     pub fn set_local_nonstreaming(&self, label: &str) -> Result<String, String> {
         let normalized = validate_hotkey_label(label).map_err(|e| e.to_string())?;
         let normalized = normalize_label(&normalized);
-        if let Ok(mut guard) = self.inner.local_nonstreaming.lock() {
-            *guard = normalized.clone();
-        }
         let file = HotkeyUserFile {
             local_nonstreaming: Some(normalized.clone()),
         };
+        // FIX-8: persist to disk first, then update the in-memory value. The
+        // old order (memory first) left memory and disk diverged on write failure.
         if let Err(error) = save_file(&self.inner.path, &file) {
             return Err(format!("保存失败: {error}"));
+        }
+        if let Ok(mut guard) = self.inner.local_nonstreaming.lock() {
+            *guard = normalized.clone();
         }
         info!(hotkey = %normalized, "voice hotkey saved (restart required)");
         Ok(normalized)
@@ -115,7 +117,8 @@ fn save_file(path: &Path, file: &HotkeyUserFile) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, toml::to_string_pretty(file)?)?;
+    // FIX-8: atomic replace so a crash never leaves a truncated hotkey-user.toml.
+    atomic_write(path, &toml::to_string_pretty(file)?)?;
     Ok(())
 }
 

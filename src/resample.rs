@@ -29,10 +29,13 @@ impl LinearResampler {
             output.push(left + (right - left) * frac);
             self.cursor += self.ratio;
         }
+        // FIX-9: drain 和 cursor 回退必须用同一个 clamp 后的值，
+        // 否则 floor(cursor) > input.len()（ratio>1 时）会 drain 全部但 cursor 减多，相位回退。
         let consumed = self.cursor.floor() as usize;
-        if consumed > 0 {
-            self.input.drain(0..consumed.min(self.input.len()));
-            self.cursor -= consumed as f64;
+        let drained = consumed.min(self.input.len());
+        if drained > 0 {
+            self.input.drain(0..drained);
+            self.cursor -= drained as f64;
         }
         output
     }
