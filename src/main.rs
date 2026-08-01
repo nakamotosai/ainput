@@ -54,6 +54,21 @@ use windows::core::PCWSTR;
 
 fn main() {
     install_panic_hook();
+    #[cfg(windows)]
+    {
+        let _single_instance_mutex = match acquire_single_instance_lock() {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                show_already_running();
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("ainput: single-instance lock failed: {error:#}");
+                show_startup_error(&format!("单实例锁创建失败：{error:#}"));
+                std::process::exit(1);
+            }
+        };
+    }
     if let Err(error) = run_app() {
         let message = format!("{error:#}");
         eprintln!("ainput failed: {message}");
@@ -325,6 +340,57 @@ fn install_panic_hook() {
         default_hook(info);
     }));
 }
+
+#[cfg(windows)]
+/// Named-mutex single-instance guard. Returns `Some(handle)` when this process
+/// is the first instance; the handle must stay open for the process lifetime.
+/// Returns `Ok(None)` when another instance already holds the lock.
+fn acquire_single_instance_lock() -> Result<Option<windows::Win32::Foundation::HANDLE>> {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::w;
+
+    let handle =
+        unsafe { CreateMutexW(None, false, w!("Local\\ainput_single_instance")) }
+            .context("create single-instance mutex")?;
+    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already_running {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+    Ok(Some(handle))
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance_lock() -> Result<Option<()>> {
+    Ok(Some(()))
+}
+
+#[cfg(windows)]
+fn show_already_running() {
+    use std::os::windows::ffi::OsStrExt;
+    let title: Vec<u16> = std::ffi::OsStr::new("ainput")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let body: Vec<u16> = std::ffi::OsStr::new("ainput 已经在运行（不允许同时开两个）。")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_already_running() {}
 
 fn show_startup_error(message: &str) {
     #[cfg(windows)]
