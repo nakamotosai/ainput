@@ -54,21 +54,22 @@ use windows::core::PCWSTR;
 
 fn main() {
     install_panic_hook();
+    // Held for the whole process: drop scope is main() end, so the named
+    // mutex stays alive across run_app() (windows-rs HANDLE has no Drop,
+    // but bind at function scope anyway so lifetime never depends on that).
     #[cfg(windows)]
-    {
-        let _single_instance_mutex = match acquire_single_instance_lock() {
-            Ok(Some(handle)) => handle,
-            Ok(None) => {
-                show_already_running();
-                std::process::exit(0);
-            }
-            Err(error) => {
-                eprintln!("ainput: single-instance lock failed: {error:#}");
-                show_startup_error(&format!("单实例锁创建失败：{error:#}"));
-                std::process::exit(1);
-            }
-        };
-    }
+    let _single_instance_mutex = match acquire_single_instance_lock() {
+        Ok(Some(handle)) => handle,
+        Ok(None) => {
+            show_already_running();
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!("ainput: single-instance lock failed: {error:#}");
+            show_startup_error(&format!("单实例锁创建失败：{error:#}"));
+            std::process::exit(1);
+        }
+    };
     if let Err(error) = run_app() {
         let message = format!("{error:#}");
         eprintln!("ainput failed: {message}");
