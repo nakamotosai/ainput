@@ -28,11 +28,23 @@ pub struct VoiceCommand {
 /// If `text` starts with a wake phrase, return the command body.
 /// Returns `None` when this is ordinary dictation.
 pub fn parse_voice_command(text: &str) -> Option<VoiceCommand> {
+    parse_voice_command_with(text, WAKE_PHRASE)
+}
+
+/// Like [`parse_voice_command`], but matches against a user-configurable wake
+/// phrase. The default wake phrase keeps its historical ASR variants; a custom
+/// phrase matches only itself (with intra-word spaces tolerated).
+pub fn parse_voice_command_with(text: &str, wake_phrase: &str) -> Option<VoiceCommand> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
-    for wake in WAKE_VARIANTS {
+    let variants: Vec<&str> = if wake_phrase == WAKE_PHRASE {
+        WAKE_VARIANTS.to_vec()
+    } else {
+        vec![wake_phrase]
+    };
+    for wake in variants {
         if let Some(rest) = strip_wake_from_original(trimmed, wake) {
             let instruction = rest
                 .trim_start_matches(|c: char| {
@@ -59,10 +71,6 @@ pub fn parse_voice_command(text: &str) -> Option<VoiceCommand> {
     None
 }
 
-pub fn is_voice_command(text: &str) -> bool {
-    parse_voice_command(text).is_some()
-}
-
 pub fn command_system_prompt() -> &'static str {
     "你是嵌入语音输入法的本地助手。用户用语音下达指令。请直接完成指令，只输出最终正文结果。\n\n规则：\n- 不解释、不加前后缀、不加引号、不用 Markdown 代码块\n- 写文章/段落时直接给出正文\n- 翻译时只输出译文\n- 改写/润色时只输出改写后正文\n- 回答问题用简洁中文\n- 不要复述用户指令本身"
 }
@@ -74,6 +82,8 @@ pub struct VoiceCommandUserConfig {
     pub enabled: Option<bool>,
     /// Custom system prompt; empty → default `command_system_prompt()`.
     pub custom_prompt: Option<String>,
+    /// Custom wake phrase; empty/None → `WAKE_PHRASE` ("老蔡老蔡").
+    pub wake_phrase: Option<String>,
 }
 
 #[derive(Clone)]
@@ -84,16 +94,18 @@ pub struct VoiceCommandController {
 struct VoiceCommandControllerInner {
     enabled: AtomicBool,
     custom_prompt: Mutex<String>,
+    wake_phrase: Mutex<String>,
     path: PathBuf,
 }
 
 impl VoiceCommandController {
     pub fn load_or_default(path: PathBuf) -> Self {
-        let (enabled, custom) = load_user_config(&path);
+        let (enabled, custom, wake) = load_user_config(&path);
         Self {
             inner: Arc::new(VoiceCommandControllerInner {
                 enabled: AtomicBool::new(enabled),
                 custom_prompt: Mutex::new(custom),
+                wake_phrase: Mutex::new(wake),
                 path,
             }),
         }
@@ -130,6 +142,31 @@ impl VoiceCommandController {
         info!("voice command custom prompt saved");
     }
 
+    /// Active wake phrase; empty custom value falls back to `WAKE_PHRASE`.
+    pub fn active_wake_phrase(&self) -> String {
+        let custom = self
+            .inner
+            .wake_phrase
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let trimmed = custom.trim();
+        if trimmed.is_empty() {
+            WAKE_PHRASE.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    pub fn set_wake_phrase(&self, phrase: &str) {
+        let text = phrase.trim().to_string();
+        if let Ok(mut guard) = self.inner.wake_phrase.lock() {
+            *guard = text;
+        }
+        self.save();
+        info!("voice command wake phrase saved");
+    }
+
     /// System prompt used for voice-command generation.
     pub fn active_prompt(&self) -> String {
         let custom = self.custom_prompt();
@@ -142,12 +179,23 @@ impl VoiceCommandController {
 
     fn save(&self) {
         let custom = self.custom_prompt();
+        let wake = self
+            .inner
+            .wake_phrase
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let cfg = VoiceCommandUserConfig {
             enabled: Some(self.enabled()),
             custom_prompt: if custom.is_empty() {
                 None
             } else {
                 Some(custom)
+            },
+            wake_phrase: if wake.trim().is_empty() {
+                None
+            } else {
+                Some(wake)
             },
         };
         if let Err(error) = save_user_config(&self.inner.path, &cfg) {
@@ -189,26 +237,27 @@ fn strip_wake_from_original<'a>(text: &'a str, wake: &str) -> Option<&'a str> {
     None
 }
 
-fn load_user_config(path: &Path) -> (bool, String) {
+fn load_user_config(path: &Path) -> (bool, String, String) {
     // Default: feature on.
     if !path.exists() {
-        return (true, String::new());
+        return (true, String::new(), String::new());
     }
     match std::fs::read_to_string(path) {
         Ok(raw) => match toml::from_str::<VoiceCommandUserConfig>(&raw) {
             Ok(cfg) => {
                 let enabled = cfg.enabled.unwrap_or(true);
                 let custom = cfg.custom_prompt.unwrap_or_default();
-                (enabled, custom)
+                let wake = cfg.wake_phrase.unwrap_or_default();
+                (enabled, custom, wake)
             }
             Err(error) => {
                 warn!(error = %error, path = %path.display(), "parse voice command config failed");
-                (true, String::new())
+                (true, String::new(), String::new())
             }
         },
         Err(error) => {
             warn!(error = %error, path = %path.display(), "read voice command config failed");
-            (true, String::new())
+            (true, String::new(), String::new())
         }
     }
 }
@@ -254,6 +303,51 @@ mod tests {
     fn bare_wake_gets_default_instruction() {
         let cmd = parse_voice_command("老蔡老蔡").expect("cmd");
         assert!(cmd.instruction.contains("介绍"));
+    }
+
+    #[test]
+    fn custom_wake_phrase_matches_only_itself() {
+        // Custom phrase: exact match works…
+        let cmd = parse_voice_command_with("小爱小爱，帮我定个闹钟", "小爱小爱").expect("cmd");
+        assert_eq!(cmd.instruction, "帮我定个闹钟");
+        // …but the old default no longer triggers…
+        assert!(parse_voice_command_with("老蔡老蔡，帮我写文章", "小爱小爱").is_none());
+        // …and the default variants are NOT attached to a custom phrase.
+        assert!(parse_voice_command_with("老菜老菜，写诗", "小爱小爱").is_none());
+    }
+
+    #[test]
+    fn custom_wake_phrase_tolerates_spaces() {
+        let cmd = parse_voice_command_with("小 爱 小 爱，写一首诗", "小爱小爱").expect("cmd");
+        assert_eq!(cmd.instruction, "写一首诗");
+    }
+
+    #[test]
+    fn controller_wake_phrase_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ainput-vc-wake-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("voice-command.toml");
+        let ctrl = VoiceCommandController::load_or_default(path.clone());
+        // Default fallback.
+        assert_eq!(ctrl.active_wake_phrase(), WAKE_PHRASE);
+
+        ctrl.set_wake_phrase("小爱小爱");
+        assert_eq!(ctrl.active_wake_phrase(), "小爱小爱");
+
+        let reloaded = VoiceCommandController::load_or_default(path);
+        assert_eq!(reloaded.active_wake_phrase(), "小爱小爱");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_wake_phrase_falls_back_to_default() {
+        let dir = std::env::temp_dir().join(format!("ainput-vc-wake-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("voice-command.toml");
+        let ctrl = VoiceCommandController::load_or_default(path);
+        ctrl.set_wake_phrase("   ");
+        assert_eq!(ctrl.active_wake_phrase(), WAKE_PHRASE);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

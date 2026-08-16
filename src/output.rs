@@ -178,6 +178,10 @@ impl TargetSummary {
     pub fn is_terminal_target(&self) -> bool {
         is_terminal_process_name(&self.process_name)
     }
+
+    pub fn is_terminal_target_allowing(&self, allowlist: &[String]) -> bool {
+        is_terminal_process_name_allowing(&self.process_name, allowlist)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -203,11 +207,11 @@ pub enum TargetRightContext {
     Unknown,
 }
 
-pub fn capture_output_target() -> OutputTarget {
+pub fn capture_output_target(allowlist: &[String]) -> OutputTarget {
     let target = ForegroundWindowSnapshot::capture();
     let summary = target.summary();
     let context = TargetInsertionContext::capture(&target);
-    let route = classify_rewrite_output_route(&summary, &context);
+    let route = classify_rewrite_output_route(&summary, &context, allowlist);
     OutputTarget {
         summary,
         fingerprint: target.fingerprint(),
@@ -429,7 +433,7 @@ pub fn paste_text_with_trace(
     config: &OutputConfig,
     utterance_id: &str,
 ) -> Result<PasteOutcome> {
-    let target = capture_output_target();
+    let target = capture_output_target(&config.rewrite_terminal_allowlist);
     paste_text_to_target_with_trace(
         text,
         &target,
@@ -900,7 +904,7 @@ pub fn replace_recent_paste_with_trace(
         );
         return ReplacementOutcome::skipped("target_changed");
     }
-    if current_target.is_terminal_target() {
+    if current_target.is_terminal_target(&config.rewrite_terminal_allowlist) {
         log_replacement_skip(
             utterance_id,
             "terminal_target",
@@ -1138,8 +1142,9 @@ pub fn apply_target_punctuation_rule(text: &str, right: TargetRightContext) -> P
 fn classify_rewrite_output_route(
     summary: &TargetSummary,
     context: &TargetInsertionContext,
+    allowlist: &[String],
 ) -> RewriteOutputRoute {
-    if summary.is_terminal_target() {
+    if summary.is_terminal_target_allowing(allowlist) {
         return RewriteOutputRoute::HudFirstFinalPaste;
     }
     if is_replace_capable_context_source(context.source)
@@ -1841,10 +1846,10 @@ impl ForegroundWindowSnapshot {
             .is_some_and(|name| name.eq_ignore_ascii_case("wezterm-gui.exe"))
     }
 
-    fn is_terminal_target(&self) -> bool {
+    fn is_terminal_target(&self, allowlist: &[String]) -> bool {
         self.process_name
             .as_deref()
-            .is_some_and(is_terminal_process_name)
+            .is_some_and(|name| is_terminal_process_name_allowing(name, allowlist))
     }
 }
 
@@ -1862,6 +1867,24 @@ pub fn is_terminal_process_name(name: &str) -> bool {
             | "powershell.exe"
             | "pwsh.exe"
     )
+}
+
+/// Same as `is_terminal_process_name`, but treats any name in `allowlist`
+/// (case-insensitive, with or without `.exe` suffix) as NOT a terminal
+/// target — i.e. caller should keep applying rewrite. Names that match the
+/// built-in safety list but are also in `allowlist` are exempted; names that
+/// are NOT in the built-in list return false regardless of allowlist.
+pub fn is_terminal_process_name_allowing(name: &str, allowlist: &[String]) -> bool {
+    if !is_terminal_process_name(name) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    let normalized = lower.strip_suffix(".exe").unwrap_or(&lower);
+    !allowlist.iter().any(|entry| {
+        let entry_lower = entry.to_ascii_lowercase();
+        let entry_stripped = entry_lower.strip_suffix(".exe").unwrap_or(&entry_lower);
+        entry_stripped == normalized
+    })
 }
 
 fn process_image_path(process_id: u32) -> Option<String> {
@@ -2635,6 +2658,37 @@ mod tests {
     }
 
     #[test]
+    fn terminal_process_allowlist_exempts_named_processes() {
+        // Tabby is in the safety list by default — without allowlist it stays "terminal".
+        assert!(super::is_terminal_process_name_allowing(
+            "Tabby.exe",
+            &[]
+        ));
+        // Adding Tabby.exe to allowlist flips it to NOT-terminal (allowlist wins).
+        assert!(!super::is_terminal_process_name_allowing(
+            "Tabby.exe",
+            &[String::from("Tabby.exe")]
+        ));
+        // Allowlist entry without .exe suffix matches against .exe suffix on the
+        // process name (case-insensitive both sides).
+        assert!(!super::is_terminal_process_name_allowing(
+            "WEZTERM-GUI.EXE",
+            &[String::from("wezterm-gui")]
+        ));
+        // Process not in the built-in safety list is NOT terminal regardless of
+        // allowlist contents.
+        assert!(!super::is_terminal_process_name_allowing(
+            "Weixin.exe",
+            &[String::from("weixin.exe")]
+        ));
+        // Unknown allowlist entries are ignored — Tabby stays terminal.
+        assert!(super::is_terminal_process_name_allowing(
+            "Tabby.exe",
+            &[String::from("notepad.exe"), String::from("devenv.exe")]
+        ));
+    }
+
+    #[test]
     fn rewrite_output_route_uses_hud_first_for_terminals() {
         let summary = super::TargetSummary {
             process_name: "WindowsTerminal.exe".to_string(),
@@ -2647,7 +2701,7 @@ mod tests {
             focus_class: None,
         };
         assert_eq!(
-            classify_rewrite_output_route(&summary, &context),
+            classify_rewrite_output_route(&summary, &context, &[]),
             RewriteOutputRoute::HudFirstFinalPaste
         );
     }
@@ -2665,7 +2719,7 @@ mod tests {
             focus_class: Some("Edit".to_string()),
         };
         assert_eq!(
-            classify_rewrite_output_route(&summary, &context),
+            classify_rewrite_output_route(&summary, &context, &[]),
             RewriteOutputRoute::ReplaceCapable
         );
     }
@@ -2683,7 +2737,7 @@ mod tests {
             title: "WeChat".to_string(),
         };
         assert_eq!(
-            classify_rewrite_output_route(&wechat, &context),
+            classify_rewrite_output_route(&wechat, &context, &[]),
             RewriteOutputRoute::ReplaceCapable
         );
 
@@ -2693,7 +2747,7 @@ mod tests {
             title: String::new(),
         };
         assert_eq!(
-            classify_rewrite_output_route(&unknown, &context),
+            classify_rewrite_output_route(&unknown, &context, &[]),
             RewriteOutputRoute::HudFirstFinalPaste
         );
     }

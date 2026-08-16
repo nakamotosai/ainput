@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -164,6 +165,8 @@ struct StreamingPrewriteState {
     inflight: Arc<AtomicUsize>,
     last_spawned_at: Option<Instant>,
     last_source_hash: u64,
+    history_path: PathBuf,
+    context_history_count: usize,
 }
 
 struct StreamingChunkPump {
@@ -438,6 +441,7 @@ impl VoiceWorker {
             &self.config.rewrite,
             self.rewriter.get(),
             output_language,
+            self.history.path().to_path_buf(),
         );
         let mut chunk_pump =
             StreamingChunkPump::start(self.asr.clone(), asr_session.session_id.clone());
@@ -802,7 +806,7 @@ impl VoiceWorker {
             return Ok(());
         }
 
-        let output_target = output::capture_output_target();
+        let output_target = output::capture_output_target(&self.config.output.rewrite_terminal_allowlist);
         if output_target.route == output::RewriteOutputRoute::HudFirstFinalPaste {
             let mut record =
                 HistoryRecord::new(&utterance_id, profile_id.as_str(), "streaming_asr");
@@ -1171,7 +1175,7 @@ impl VoiceWorker {
             );
             return Ok(());
         }
-        let output_target = output::capture_output_target();
+        let output_target = output::capture_output_target(&self.config.output.rewrite_terminal_allowlist);
         if !rewrite_enabled {
             let paste_outcome = match output::paste_text_to_target_with_trace(
                 raw_text_for_paste,
@@ -1492,7 +1496,8 @@ impl VoiceWorker {
 
         // Voice command: "老蔡老蔡 …" → generate, not dictation rewrite.
         if self.voice_command.enabled() {
-            if let Some(command) = voice_command::parse_voice_command(&raw_text) {
+            let wake = self.voice_command.active_wake_phrase();
+            if let Some(command) = voice_command::parse_voice_command_with(&raw_text, &wake) {
                 return self.handle_voice_command(
                     &utterance_id,
                     profile_id,
@@ -1592,7 +1597,7 @@ impl VoiceWorker {
             return Ok(());
         }
 
-        let output_target = output::capture_output_target();
+        let output_target = output::capture_output_target(&self.config.output.rewrite_terminal_allowlist);
         if !rewrite_enabled {
             let paste_outcome = match output::paste_text_to_target_with_trace(
                 raw_text_for_paste,
@@ -1893,7 +1898,7 @@ impl VoiceWorker {
             }
         };
         let gen_ms = command_started.elapsed().as_millis();
-        let output_target = output::capture_output_target();
+        let output_target = output::capture_output_target(&self.config.output.rewrite_terminal_allowlist);
         let paste_outcome = match output::paste_text_to_target_with_trace(
             &generated,
             &output_target,
@@ -1948,6 +1953,24 @@ impl VoiceWorker {
         Ok(())
     }
 
+    /// Load recent dictation history as cross-utterance context for AI rewrite.
+    /// Returns None when disabled (context_history_count == 0) or nothing usable.
+    fn history_context_for_rewrite(&self) -> Option<String> {
+        let count = self.rewriter.snapshot_config().context_history_count;
+        if count == 0 {
+            return None;
+        }
+        // Load extra records so empty ones can be skipped while still keeping
+        // up to `count` non-empty entries.
+        let records = crate::history::load_recent(self.history.path(), count.saturating_mul(3)).ok()?;
+        let context = crate::history::format_recent_context(&records, count);
+        if context.trim().is_empty() {
+            None
+        } else {
+            Some(context)
+        }
+    }
+
     fn spawn_async_whisper_rewrite(&self, job: AsyncWhisperRewriteJob) {
         self.spawn_async_nonstreaming_rewrite(job, "whisper_zh_async_rewrite", "Whisper 非流式");
     }
@@ -1967,6 +1990,7 @@ impl VoiceWorker {
             .snapshot_config()
             .min_chars
             .max(self.config.rewrite.min_chars);
+        let history_context = self.history_context_for_rewrite();
         thread::spawn(move || {
             let silent = job.silent_hud;
             let trace = apply_whisper_rewrite_with(
@@ -1978,6 +2002,7 @@ impl VoiceWorker {
                 job.output_language,
                 silent,
                 Some(job.system_prompt.as_str()),
+                history_context.as_deref(),
             );
             let rewrite_source = trace.output.as_deref().unwrap_or(&job.raw_text);
             let finalized =
@@ -2076,6 +2101,7 @@ impl VoiceWorker {
             .snapshot_config()
             .min_chars
             .max(self.config.rewrite.min_chars);
+        let history_context = self.history_context_for_rewrite();
         thread::spawn(move || {
             let silent = job.silent_hud;
             let rewrite_started = Instant::now();
@@ -2098,6 +2124,7 @@ impl VoiceWorker {
                         output_language,
                         silent,
                         Some(system_prompt.as_str()),
+                        history_context.as_deref(),
                     );
                     let _ = trace_tx.send(trace);
                 });
@@ -2455,6 +2482,7 @@ impl VoiceWorker {
             .snapshot_config()
             .min_chars
             .max(self.config.rewrite.min_chars);
+        let history_context = self.history_context_for_rewrite();
         thread::spawn(move || {
             let (trace, replacement_age_ms) = if let Some(trace) = job.prewrite_trace {
                 // FIX-1: prewrite results get their real age (produced-at time), so
@@ -2476,6 +2504,7 @@ impl VoiceWorker {
                     job.output_language,
                     false,
                     None, // streaming path keeps language default prompt
+                    history_context.as_deref(),
                 );
                 let age_ms = trace.elapsed_ms;
                 (trace, Some(age_ms))
@@ -2572,6 +2601,7 @@ impl VoiceWorker {
             .snapshot_config()
             .min_chars
             .max(self.config.rewrite.min_chars);
+        let history_context = self.history_context_for_rewrite();
         thread::spawn(move || {
             let rewrite_started = Instant::now();
             let (trace_tx, trace_rx) = mpsc::channel();
@@ -2592,6 +2622,7 @@ impl VoiceWorker {
                         job.output_language,
                         false,
                         None, // streaming path keeps language default prompt
+                        history_context.as_deref(),
                     );
                     let _ = trace_tx.send(trace);
                 });
@@ -3278,6 +3309,7 @@ fn apply_whisper_rewrite_with(
     output_language: RewriteOutputLanguage,
     silent_hud: bool,
     custom_system_prompt: Option<&str>,
+    history_context: Option<&str>,
 ) -> RewriteTrace {
     let Some(rewriter) = rewriter else {
         return RewriteTrace {
@@ -3333,7 +3365,8 @@ fn apply_whisper_rewrite_with(
         owned_default = rewrite_prompt_for_language(output_language);
         owned_default.as_str()
     };
-    let mut trace = rewriter.rewrite_with_prompt_trace_enabled(raw_text, prompt, rewrite_enabled);
+    let mut trace =
+        rewriter.rewrite_with_prompt_trace_enabled_ctx(raw_text, prompt, rewrite_enabled, history_context);
     if let Some(output) = trace.output.clone() {
         if let Some(decision) = personal_corrections::guard_rewrite_output(raw_text, &output) {
             trace.attempts.push(RewriteAttempt {
@@ -3528,6 +3561,7 @@ impl StreamingPrewriteState {
         config: &crate::config::RewriteConfig,
         rewriter: Option<AiRewriter>,
         output_language: RewriteOutputLanguage,
+        history_path: PathBuf,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
@@ -3543,6 +3577,8 @@ impl StreamingPrewriteState {
             inflight: Arc::new(AtomicUsize::new(0)),
             last_spawned_at: None,
             last_source_hash: 0,
+            history_path,
+            context_history_count: config.context_history_count,
         }
     }
 
@@ -3582,12 +3618,22 @@ impl StreamingPrewriteState {
         let session_id = session_id.to_string();
         let log_utterance_id = utterance_id.clone();
         let log_session_id = session_id.clone();
+        // Load cross-utterance context from history (disabled when count == 0).
+        let history_context = if self.context_history_count > 0 {
+            let records = crate::history::load_recent(&self.history_path, self.context_history_count.saturating_mul(3)).ok();
+            records.and_then(|r| {
+                let ctx = crate::history::format_recent_context(&r, self.context_history_count);
+                if ctx.trim().is_empty() { None } else { Some(ctx) }
+            })
+        } else {
+            None
+        };
         thread::spawn(move || {
             if stable_ms > 0 {
                 thread::sleep(Duration::from_millis(stable_ms));
             }
             let prompt = rewrite_prompt_for_language(output_language);
-            let mut trace = rewriter.rewrite_with_prompt_trace_enabled(&source_text, &prompt, true);
+            let mut trace = rewriter.rewrite_with_prompt_trace_enabled_ctx(&source_text, &prompt, true, history_context.as_deref());
             if let Some(output) = trace.output.clone() {
                 if let Some(decision) =
                     personal_corrections::guard_rewrite_output(&source_text, &output)

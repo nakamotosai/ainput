@@ -227,6 +227,19 @@ impl AiRewriter {
         system_prompt: &str,
         enabled: bool,
     ) -> RewriteTrace {
+        self.rewrite_with_prompt_trace_enabled_ctx(text, system_prompt, enabled, None)
+    }
+
+    /// Like [`Self::rewrite_with_prompt_trace_enabled`], but attaches optional
+    /// cross-utterance context (recent dictation history) to the request so the
+    /// model can resolve pronouns/titles (e.g. 姑姑 → 她).
+    pub fn rewrite_with_prompt_trace_enabled_ctx(
+        &self,
+        text: &str,
+        system_prompt: &str,
+        enabled: bool,
+        context: Option<&str>,
+    ) -> RewriteTrace {
         let started = Instant::now();
         let mut trace = RewriteTrace {
             enabled,
@@ -264,7 +277,7 @@ impl AiRewriter {
                 self.config.dynamic_budget_enabled,
             );
             let prompt_variant = self.prompt_variant_for(system_prompt);
-            match self.call_model(endpoint, &model, input, system_prompt, budget) {
+            match self.call_model(endpoint, &model, input, system_prompt, context, budget) {
                 Ok(candidate) => {
                     let changed = candidate.as_deref().is_some_and(|value| value != input);
                     trace.attempts.push(RewriteAttempt {
@@ -322,6 +335,7 @@ impl AiRewriter {
         model: &str,
         input: &str,
         system_prompt: &str,
+        context: Option<&str>,
         budget: RewriteBudget,
     ) -> Result<Option<String>> {
         let request_system_prompt = self.system_prompt_for_request(system_prompt);
@@ -332,7 +346,7 @@ impl AiRewriter {
             },
             ChatMessage {
                 role: "user",
-                content: rewrite_user_message(input),
+                content: rewrite_user_message_with_context(input, context),
             },
         ];
         let payload =
@@ -597,7 +611,16 @@ fn sanitize_rewrite_output(text: &str) -> String {
 }
 
 fn rewrite_user_message(input: &str) -> String {
-    format!("请润色 <input> 里的文本，只输出润色后的正文。\n\n<input>\n{input}\n</input>")
+    rewrite_user_message_with_context(input, None)
+}
+
+fn rewrite_user_message_with_context(input: &str, context: Option<&str>) -> String {
+    match context.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(context) => format!(
+            "以下是最近的对话内容（仅用于判断人称与指代，请勿改写或输出它们）：\n\n{context}\n\n请润色 <input> 里的文本，只输出润色后的正文。\n\n<input>\n{input}\n</input>"
+        ),
+        None => format!("请润色 <input> 里的文本，只输出润色后的正文。\n\n<input>\n{input}\n</input>"),
+    }
 }
 
 fn looks_like_prompt_leak(candidate: &str) -> bool {
@@ -962,8 +985,9 @@ mod tests {
         ChatMessage, RewriteAttempt, RewriteTrace, build_chat_payload, looks_like_prompt_leak,
         model_requests_zero_reasoning, rewrite_budget_for_input, rewrite_compact_system_prompt,
         rewrite_error_is_backend_unavailable, rewrite_prompt_for_language, rewrite_system_prompt,
-        rewrite_user_message, should_guard_rewrite_content, should_trip_rewrite_backend_cooldown,
-        system_prompt_for_model, validate_rewrite_candidate_content,
+        rewrite_user_message, rewrite_user_message_with_context, should_guard_rewrite_content,
+        should_trip_rewrite_backend_cooldown, system_prompt_for_model,
+        validate_rewrite_candidate_content,
     };
     use crate::config::RewriteOutputLanguage;
 
@@ -994,6 +1018,31 @@ mod tests {
         let message = rewrite_user_message(input);
         assert!(message.starts_with("请润色 <input> 里的文本"));
         assert!(message.contains("<input>\n请你查一下这个 API 为什么连不上\n</input>"));
+        assert!(!message.contains("最近的对话内容"));
+    }
+
+    #[test]
+    fn rewrite_user_message_with_context_prepends_context_block() {
+        let input = "她说今天会来。";
+        let context = "[01] 姑姑明天来我家。\n[02] 她说要带好吃的。";
+        let message = rewrite_user_message_with_context(input, Some(context));
+        assert!(message.starts_with("以下是最近的对话内容"));
+        assert!(message.contains("[01] 姑姑明天来我家。"));
+        assert!(message.contains("[02] 她说要带好吃的。"));
+        // The input block stays intact and comes after the context.
+        assert!(message.find("请润色 <input>").unwrap() > message.find("最近的对话内容").unwrap());
+        assert!(message.contains("<input>"));
+        assert!(message.ends_with("</input>"));
+    }
+
+    #[test]
+    fn rewrite_user_message_with_context_ignores_blank_context() {
+        let input = "测试句子";
+        let no_context = rewrite_user_message(input);
+        let blank = rewrite_user_message_with_context(input, Some("   "));
+        let none = rewrite_user_message_with_context(input, None);
+        assert_eq!(no_context, blank);
+        assert_eq!(no_context, none);
     }
 
     #[test]

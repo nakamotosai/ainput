@@ -112,6 +112,10 @@ pub struct RewriteConfig {
     pub prewrite_stable_ms: u64,
     pub prewrite_debounce_ms: u64,
     pub prewrite_max_inflight: usize,
+    /// Cross-utterance context: how many recent history entries are attached to
+    /// each AI rewrite request so the model can resolve pronouns/titles
+    /// (e.g. 姑姑 → 她). 0 disables context injection.
+    pub context_history_count: usize,
     pub mode: RewriteMode,
     pub output_language: RewriteOutputLanguage,
     pub endpoint_url: String,
@@ -202,6 +206,12 @@ pub struct OutputConfig {
     pub replacement_preflight_recheck: bool,
     #[allow(dead_code)]
     pub clipboard_restore_delay_ms: u64,
+    /// Process names (case-insensitive, ".exe" suffix optional) that bypass the
+    /// built-in `is_terminal_process_name` safety skip. Use this to opt
+    /// terminals you trust (e.g. `wezterm-gui.exe`) into AI rewrite
+    /// replacement. Default: empty (all listed terminals stay safe-skipped).
+    #[serde(default)]
+    pub rewrite_terminal_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -876,6 +886,7 @@ impl Default for RewriteConfig {
             prewrite_stable_ms: 700,
             prewrite_debounce_ms: 900,
             prewrite_max_inflight: 1,
+            context_history_count: 6,
             mode: RewriteMode::DuringHold,
             output_language: RewriteOutputLanguage::Chinese,
             endpoint_url: String::new(),
@@ -1001,7 +1012,6 @@ impl ClipboardPolicy {
             Self::CopyOnly => "copy_only",
         }
     }
-
     pub fn restores_text_after_success(self) -> bool {
         matches!(self, Self::RestoreTextAfterSuccess)
     }
@@ -1022,6 +1032,7 @@ impl Default for OutputConfig {
             paste_preflight_recheck: true,
             replacement_preflight_recheck: true,
             clipboard_restore_delay_ms: 100,
+            rewrite_terminal_allowlist: Vec::new(),
         }
     }
 }

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::voice_command::{command_system_prompt, VoiceCommandController};
+use crate::voice_command::{command_system_prompt, VoiceCommandController, WAKE_PHRASE};
 use crate::web_ui::{
     escape_html, open_browser_hidden, read_http_request, request_method, request_path,
     validate_loopback_request, write_response,
@@ -173,6 +173,7 @@ fn handle_client(mut stream: TcpStream, state: &ServerState) -> Result<()> {
 struct SaveBody {
     enabled: Option<bool>,
     custom_prompt: Option<String>,
+    wake_phrase: Option<String>,
     use_default: Option<bool>,
 }
 
@@ -182,6 +183,8 @@ fn state_json(state: &ServerState) -> String {
         "custom_prompt": state.voice.custom_prompt(),
         "active_prompt": state.voice.active_prompt(),
         "default_prompt": command_system_prompt(),
+        "wake_phrase": state.voice.active_wake_phrase(),
+        "default_wake_phrase": WAKE_PHRASE,
         "path": state.voice.path().display().to_string(),
     })
     .to_string()
@@ -199,6 +202,9 @@ fn save_from_body(state: &ServerState, body: &[u8]) -> serde_json::Value {
     } else if let Some(custom) = parsed.custom_prompt {
         state.voice.set_custom_prompt(&custom);
     }
+    if let Some(wake) = parsed.wake_phrase {
+        state.voice.set_wake_phrase(&wake);
+    }
     if let Some(enabled) = parsed.enabled {
         state.voice.set_enabled(enabled);
     }
@@ -207,6 +213,7 @@ fn save_from_body(state: &ServerState, body: &[u8]) -> serde_json::Value {
         "enabled": state.voice.enabled(),
         "active_prompt": state.voice.active_prompt(),
         "custom_prompt": state.voice.custom_prompt(),
+        "wake_phrase": state.voice.active_wake_phrase(),
         "message": format!(
             "已保存 · 语音指令{}",
             if state.voice.enabled() { "已开启" } else { "已关闭" }
@@ -218,6 +225,8 @@ fn page_html(state: &ServerState) -> String {
     let active = escape_html(&state.voice.active_prompt());
     let custom = escape_html(&state.voice.custom_prompt());
     let default_prompt = escape_html(command_system_prompt());
+    let wake = escape_html(&state.voice.active_wake_phrase());
+    let default_wake = escape_html(WAKE_PHRASE);
     let enabled = state.voice.enabled();
     format!(
         r#"<!doctype html>
@@ -235,7 +244,7 @@ h1 {{ font-size:20px; font-weight:650; margin:0 0 6px; }}
 .sub {{ color:var(--muted); margin-bottom:18px; }}
 .card {{ background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:14px; }}
 label {{ display:block; margin:0 0 6px; color:var(--muted); font-size:12px; }}
-textarea, button {{ width:100%; font:inherit; color:var(--fg); background:#0c1117; border:1px solid var(--bd); border-radius:8px; padding:10px 12px; }}
+textarea, input[type="text"], button {{ width:100%; font:inherit; color:var(--fg); background:#0c1117; border:1px solid var(--bd); border-radius:8px; padding:10px 12px; }}
 textarea {{ min-height:220px; resize:vertical; line-height:1.55; }}
 button {{ cursor:pointer; background:var(--acc); border:none; font-weight:600; margin-top:10px; }}
 button.secondary {{ background:#243041; }}
@@ -251,14 +260,19 @@ pre {{ white-space:pre-wrap; word-break:break-word; background:#0c1117; border-r
 </head>
 <body>
 <main>
-  <h1>语音指令（老蔡老蔡）</h1>
-  <div class="sub">说「老蔡老蔡 + 指令」会走生成，不走普通听写改写。配置保存在 state/config/voice-command.toml。</div>
+  <h1>语音指令（{wake}）</h1>
+  <div class="sub">说「{wake} + 指令」会走生成，不走普通听写改写。配置保存在 state/config/voice-command.toml。</div>
   <div class="card">
     <label class="toggle">
       <input type="checkbox" id="enabled" {checked}/>
       <span>启用语音指令</span>
     </label>
-    <div class="hint">关闭后，含「老蔡老蔡」的语音按普通听写处理。</div>
+    <div class="hint">关闭后，含「{wake}」的语音按普通听写处理。</div>
+  </div>
+  <div class="card">
+    <label for="wake">唤醒词</label>
+    <input type="text" id="wake" maxlength="12" placeholder="{default_wake}" value="{wake}"/>
+    <div class="hint">留空 = 默认「{default_wake}」。自定义后仅该词（容忍词内空格）触发语音指令。</div>
   </div>
   <div class="card">
     <label for="custom">指令 system prompt（留空=默认）</label>
@@ -281,8 +295,10 @@ pre {{ white-space:pre-wrap; word-break:break-word; background:#0c1117; border-r
 <script>
 const enabledEl = document.getElementById('enabled');
 const customEl = document.getElementById('custom');
+const wakeEl = document.getElementById('wake');
 const statusEl = document.getElementById('status');
 const previewEl = document.getElementById('preview');
+const titleEl = document.querySelector('h1');
 
 async function save(useDefault) {{
   statusEl.className = '';
@@ -290,6 +306,7 @@ async function save(useDefault) {{
   const body = {{
     enabled: enabledEl.checked,
     custom_prompt: customEl.value,
+    wake_phrase: wakeEl.value,
     use_default: !!useDefault,
   }};
   try {{
@@ -305,6 +322,10 @@ async function save(useDefault) {{
     if (data.active_prompt) previewEl.textContent = data.active_prompt;
     if (typeof data.custom_prompt === 'string') customEl.value = data.custom_prompt;
     if (typeof data.enabled === 'boolean') enabledEl.checked = data.enabled;
+    if (typeof data.wake_phrase === 'string') {{
+      wakeEl.value = data.wake_phrase;
+      titleEl.textContent = '语音指令（' + data.wake_phrase + '）';
+    }}
   }} catch (e) {{
     statusEl.textContent = String(e.message || e);
   }}
@@ -324,5 +345,7 @@ document.getElementById('reset').addEventListener('click', () => {{
         custom = custom,
         active = active,
         default_prompt = default_prompt,
+        wake = wake,
+        default_wake = default_wake,
     )
 }

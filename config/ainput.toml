@@ -67,6 +67,9 @@ prewrite_min_chars = 8
 prewrite_stable_ms = 700
 prewrite_debounce_ms = 900
 prewrite_max_inflight = 1
+# 每次 AI 改写附带最近 N 条听写历史作为对话上下文（0=关闭），
+# 帮助模型正确判断人称/指代（如 姑姑→她）。
+context_history_count = 6
 mode = "after_release"
 output_language = "chinese"
 endpoint_url = ""
@@ -138,6 +141,11 @@ clipboard_retry_count = 3
 clipboard_retry_backoff_ms = 35
 paste_preflight_recheck = true
 replacement_preflight_recheck = true
+# Process names (case-insensitive, ".exe" optional) to exempt from the built-in
+# terminal safety skip in output.rs::is_terminal_process_name. Add wezterm-gui.exe
+# so AI rewrite actually replaces ASR text in wezterm (default behavior skips
+# all listed terminals, which wezterm-gui.exe is on).
+rewrite_terminal_allowlist = ["wezterm-gui.exe"]
 
 [hud]
 style = "floating_text"

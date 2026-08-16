@@ -16,7 +16,8 @@
 
 - **Hold-to-talk** (default **CapsLock**; tray can set **MouseX1/X2**, F13–F24, or combos — custom choice is remembered in `state/config/hotkey-user.toml`)
 - Optional **AI rewrite** (non-streaming HTTP) when you configure an API; editable rewrite prompt + light/standard presets
-- **Voice command** wake phrase (optional tray toggle + custom instruction prompt)
+- **Cross-utterance context** — AI rewrite sees your last 6 dictation entries so it correctly resolves pronouns/titles across turns (e.g. 姑姑 → 她). Configurable in `config/ainput.toml [rewrite]` → `context_history_count` (0 = off)
+- **Voice command** wake phrase (optional tray toggle + custom instruction prompt; wake phrase itself editable via the voice-command panel — tray → 语音指令)
 - Tray icon + HUD feedback
 - Local dictation history (raw vs rewrite) under `state/logs/history.jsonl`, viewed via loopback web UI
 - Personal correction rules (local)
@@ -26,12 +27,12 @@
 
 https://input.saaaai.com/
 
-## Download (v0.1.2)
+## Download (v0.1.3)
 
 | Channel | Link |
 |---|---|
-| **GitHub Release** | [ainput-0.1.2-win64.zip](https://github.com/nakamotosai/ainput/releases/download/v0.1.2/ainput-0.1.2-win64.zip) |
-| **Hugging Face mirror** | [ainput-0.1.2-win64.zip](https://huggingface.co/nakamotosai/cnjp-input/resolve/main/ainput-0.1.2-win64.zip) · [repo](https://huggingface.co/nakamotosai/cnjp-input) |
+| **GitHub Release** | [ainput-0.1.3-win64.zip](https://github.com/nakamotosai/ainput/releases/download/v0.1.3/ainput-0.1.3-win64.zip) |
+| **Hugging Face mirror** | [ainput-0.1.3-win64.zip](https://huggingface.co/nakamotosai/cnjp-input/resolve/main/ainput-0.1.3-win64.zip) · [repo](https://huggingface.co/nakamotosai/cnjp-input) |
 | Site | https://input.saaaai.com/ |
 
 ## Quick start
@@ -73,7 +74,7 @@ cargo build --release
 Package a portable folder + zip:
 
 ```powershell
-.\scripts\make-portable.ps1 -Version 0.1.2
+.\scripts\make-portable.ps1 -Version 0.1.3
 ```
 
 ## Privacy

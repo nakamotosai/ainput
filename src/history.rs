@@ -67,6 +67,34 @@ impl HistoryRecord {
     }
 }
 
+/// Compose a compact cross-utterance context block from history records so the
+/// AI rewrite model can resolve pronouns/titles across turns (e.g. 姑姑 → 她).
+/// Keeps at most `max_count` non-empty entries, newest last, oldest first.
+/// Returns empty string when nothing qualifies.
+pub fn format_recent_context(records: &[HistoryRecord], max_count: usize) -> String {
+    if max_count == 0 {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for record in records.iter().rev() {
+        let text = record.preview_text().trim();
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(text.to_string());
+        if lines.len() >= max_count {
+            break;
+        }
+    }
+    lines.reverse(); // chronological order, oldest first
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| format!("[{:02}] {line}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Clone)]
 pub struct HistoryService {
     tx: mpsc::SyncSender<HistoryRecord>,
@@ -379,7 +407,7 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{HistoryRecord, append_record, load_recent, render_history};
+    use super::{HistoryRecord, append_record, format_recent_context, load_recent, render_history};
 
     #[test]
     fn renders_raw_and_rewrite_before_after() {
@@ -414,6 +442,37 @@ mod tests {
         record.rewrite_error = "timeout".to_string();
         let rendered = render_history(&[record]);
         assert!(rendered.contains("改写错误: timeout"));
+    }
+
+    #[test]
+    fn format_context_keeps_recent_nonempty_in_order() {
+        let mut rec = |id: &str, text: &str| {
+            let mut record = HistoryRecord::new(id, "local_nonstreaming", "local_nonstreaming");
+            record.pasted_text = text.to_string();
+            record
+        };
+        let records = vec![
+            rec("a", "姑姑明天来我家。"),
+            rec("b", ""), // empty record must be skipped
+            rec("c", "她说要带好吃的。"),
+            rec("d", "我想买点水果招待她。"),
+        ];
+        let context = format_recent_context(&records, 3);
+        let lines: Vec<&str> = context.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("[01] 姑姑明天来我家。"));
+        assert!(lines[1].starts_with("[02] 她说要带好吃的。"));
+        assert!(lines[2].starts_with("[03] 我想买点水果招待她。"));
+        assert!(lines[0] < lines[1] && lines[1] < lines[2]); // chronological
+    }
+
+    #[test]
+    fn format_context_zero_or_no_records_is_empty() {
+        assert_eq!(format_recent_context(&[], 6), "");
+        let mut record = HistoryRecord::new("x", "local_nonstreaming", "local_nonstreaming");
+        let empty = format_recent_context(&[record.clone()], 6);
+        assert_eq!(empty, "");
+        assert_eq!(format_recent_context(&[record], 0), "");
     }
 
     #[test]
