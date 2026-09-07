@@ -656,27 +656,90 @@ pub fn paste_text_to_target_with_trace(
             text_actions: prepared.actions,
         });
     }
-    thread::sleep(Duration::from_millis(config.paste_stabilize_ms));
-    let input_after_stabilize = InputStateSnapshot::capture();
-    if config.paste_preflight_recheck {
-        if let Some(reason) = current_input_preflight_block_reason(
-            "modifier_still_down_before_paste",
-            "mouse_button_down_before_paste",
-        ) {
-            append_action(&mut prepared.actions, &format!("copy_only_{reason}"));
+    // Transient-block guards retry with a short settle window: slow engines (e.g. qwen3
+    // at ~2.4s) leave a wide window where the user may be mid-click or windows are
+    // switching (HUD Busy, IME), and one-shot checks turn that into silent copy-only.
+    const PASTE_SETTLE_MAX_ATTEMPTS: usize = 6;
+    let mut paste_retry_attempt = 0usize;
+    let mut input_after_stabilize = InputStateSnapshot::capture();
+    loop {
+        thread::sleep(Duration::from_millis(config.paste_stabilize_ms));
+        input_after_stabilize = InputStateSnapshot::capture();
+        if config.paste_preflight_recheck {
+            if let Some(reason) = current_input_preflight_block_reason(
+                "modifier_still_down_before_paste",
+                "mouse_button_down_before_paste",
+            ) {
+                paste_retry_attempt += 1;
+                if paste_retry_attempt < PASTE_SETTLE_MAX_ATTEMPTS {
+                    info!(
+                        utterance_id,
+                        attempt = paste_retry_attempt,
+                        reason,
+                        "paste preflight transiently blocked; waiting to retry"
+                    );
+                    continue;
+                }
+                append_action(&mut prepared.actions, &format!("copy_only_{reason}"));
+                warn!(
+                    utterance_id,
+                    reason,
+                    text_chars = prepared.text.chars().count(),
+                    text_hash = stable_text_hash(&prepared.text),
+                    text_preview = %short_text(&prepared.text, 160),
+                    target_text_actions = %prepared.actions,
+                    target_hwnd = target.fingerprint.hwnd,
+                    target_pid = target.fingerprint.process_id,
+                    target_process = %target.summary.process_name,
+                    target_process_path = %target.process_path,
+                    target_class = %target.summary.class_name,
+                    target_title = %target.summary.title,
+                    modifiers_after_stabilize = %input_after_stabilize.modifiers,
+                    mouse_buttons_after_stabilize = %input_after_stabilize.mouse_buttons,
+                    cursor_after_stabilize = %input_after_stabilize.cursor_label(),
+                    clipboard_set_ms,
+                    clipboard_policy = clipboard_report.policy.as_str(),
+                    clipboard_set_attempts = clipboard_report.set_attempts,
+                    clipboard_set_retries = clipboard_report.set_retries,
+                    clipboard_retained = clipboard_report.clipboard_retained(),
+                    output_action = "copy_only_preflight_blocked",
+                    "paste skipped after clipboard write because input preflight failed; text retained in clipboard"
+                );
+                return Ok(PasteOutcome {
+                    text: prepared.text,
+                    target_context: target.context.clone(),
+                    target_summary: target.summary.clone(),
+                    target_fingerprint: target.fingerprint.clone(),
+                    text_actions: prepared.actions,
+                });
+            }
+        }
+        // FIX-4: BestEffort path re-checks the foreground window immediately before Ctrl+V;
+        // an Alt-Tab inside the stabilize window would otherwise paste into the wrong window.
+        if target.fingerprint.hwnd != 0 && !foreground_matches_target(&target.fingerprint) {
+            paste_retry_attempt += 1;
+            if paste_retry_attempt < PASTE_SETTLE_MAX_ATTEMPTS {
+                info!(
+                    utterance_id,
+                    attempt = paste_retry_attempt,
+                    target_hwnd = target.fingerprint.hwnd,
+                    target_process = %target.summary.process_name,
+                    "paste foreground mismatch; waiting for target to focus before retry"
+                );
+                continue;
+            }
+            append_action(&mut prepared.actions, "copy_only_foreground_changed");
             warn!(
                 utterance_id,
-                reason,
+                target_hwnd = target.fingerprint.hwnd,
+                target_pid = target.fingerprint.process_id,
+                target_process = %target.summary.process_name,
+                target_class = %target.summary.class_name,
+                target_title = %target.summary.title,
                 text_chars = prepared.text.chars().count(),
                 text_hash = stable_text_hash(&prepared.text),
                 text_preview = %short_text(&prepared.text, 160),
                 target_text_actions = %prepared.actions,
-                target_hwnd = target.fingerprint.hwnd,
-                target_pid = target.fingerprint.process_id,
-                target_process = %target.summary.process_name,
-                target_process_path = %target.process_path,
-                target_class = %target.summary.class_name,
-                target_title = %target.summary.title,
                 modifiers_after_stabilize = %input_after_stabilize.modifiers,
                 mouse_buttons_after_stabilize = %input_after_stabilize.mouse_buttons,
                 cursor_after_stabilize = %input_after_stabilize.cursor_label(),
@@ -685,8 +748,8 @@ pub fn paste_text_to_target_with_trace(
                 clipboard_set_attempts = clipboard_report.set_attempts,
                 clipboard_set_retries = clipboard_report.set_retries,
                 clipboard_retained = clipboard_report.clipboard_retained(),
-                output_action = "copy_only_preflight_blocked",
-                "paste skipped after clipboard write because input preflight failed; text retained in clipboard"
+                output_action = "copy_only_foreground_changed",
+                "paste skipped because foreground window changed before Ctrl+V; text retained in clipboard"
             );
             return Ok(PasteOutcome {
                 text: prepared.text,
@@ -696,44 +759,17 @@ pub fn paste_text_to_target_with_trace(
                 text_actions: prepared.actions,
             });
         }
-    }
-    // FIX-4: BestEffort path re-checks the foreground window immediately before Ctrl+V;
-    // an Alt-Tab inside the stabilize window would otherwise paste into the wrong window.
-    if target.fingerprint.hwnd != 0 && !foreground_matches_target(&target.fingerprint) {
-        append_action(&mut prepared.actions, "copy_only_foreground_changed");
-        warn!(
-            utterance_id,
-            target_hwnd = target.fingerprint.hwnd,
-            target_pid = target.fingerprint.process_id,
-            target_process = %target.summary.process_name,
-            target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
-            text_chars = prepared.text.chars().count(),
-            text_hash = stable_text_hash(&prepared.text),
-            text_preview = %short_text(&prepared.text, 160),
-            target_text_actions = %prepared.actions,
-            modifiers_after_stabilize = %input_after_stabilize.modifiers,
-            mouse_buttons_after_stabilize = %input_after_stabilize.mouse_buttons,
-            cursor_after_stabilize = %input_after_stabilize.cursor_label(),
-            clipboard_set_ms,
-            clipboard_policy = clipboard_report.policy.as_str(),
-            clipboard_set_attempts = clipboard_report.set_attempts,
-            clipboard_set_retries = clipboard_report.set_retries,
-            clipboard_retained = clipboard_report.clipboard_retained(),
-            output_action = "copy_only_foreground_changed",
-            "paste skipped because foreground window changed before Ctrl+V; text retained in clipboard"
-        );
-        return Ok(PasteOutcome {
-            text: prepared.text,
-            target_context: target.context.clone(),
-            target_summary: target.summary.clone(),
-            target_fingerprint: target.fingerprint.clone(),
-            text_actions: prepared.actions,
-        });
+        break;
     }
     let paste_result = send_ctrl_v();
     let paste_done_ms = started_at.elapsed().as_millis();
     if paste_result.is_ok() {
+        // 2026-09-07：拆掉 wezterm 读屏复查。它治的是「SendInput 假成功但窗格吞字」，
+        // 代价是每次粘贴后要连环调 wezterm cli 读屏（最坏 13 秒还堵住下一句）。
+        // 用户拍板：宁要自己眼睛确认没贴上再补说，也不要后台排队。
+        if paste_retry_attempt > 0 {
+            append_action(&mut prepared.actions, &format!("paste_settle_retries_{paste_retry_attempt}"));
+        }
         restore_previous_clipboard_text_if_needed(&mut clipboard_report, config);
     }
     if target.is_wezterm() {
@@ -1218,9 +1254,11 @@ impl TargetInsertionContext {
             };
             let focus_class = Some(window_class_name(focus_hwnd)).filter(|value| !value.is_empty());
             if target.is_wezterm() {
+                // 2026-09-03 用户拍板：终端里是口述聊天为主，保留句尾句号；
+                // 此前 NonEmpty+终端安全剥离会让语音句在终端里永远没句号。
                 return Self {
-                    right: TargetRightContext::NonEmpty,
-                    source: "terminal_safe_no_period_no_cli",
+                    right: TargetRightContext::Empty,
+                    source: "terminal_keep_period",
                     focus_class,
                 };
             }
@@ -1404,20 +1442,6 @@ fn is_standard_text_control_class(class_name: &str) -> bool {
 }
 
 #[cfg(test)]
-#[derive(Debug, Deserialize)]
-struct WezTermPane {
-    pane_id: u64,
-    cursor_x: usize,
-    cursor_y: i32,
-    #[serde(default)]
-    is_active: bool,
-}
-
-#[cfg(test)]
-fn parse_wezterm_panes(output: &str) -> Option<Vec<WezTermPane>> {
-    let json_start = output.find('[')?;
-    serde_json::from_str(&output[json_start..]).ok()
-}
 
 #[cfg(test)]
 fn terminal_line_right_context(line: &str, cursor_x: usize) -> TargetRightContext {
@@ -2447,7 +2471,7 @@ mod tests {
         SHIFT_LEFT_CHUNK_SIZE, RewriteOutputRoute, TargetFingerprint, TargetInsertionContext,
         TargetRightContext, apply_target_punctuation_rule, classify_rewrite_output_route,
         contains_terminal_mouse_escape, direct_output_disabled_reason,
-        input_preflight_block_reason, is_standard_text_control_class, parse_wezterm_panes,
+        input_preflight_block_reason, is_standard_text_control_class,
         replacement_candidate_char_count, retry_with_backoff, same_window_identity, short_text,
         stable_text_hash, terminal_line_right_context,
     };
@@ -2570,13 +2594,7 @@ mod tests {
         assert_eq!(short_text("abc", 3), "abc");
     }
 
-    #[test]
-    fn detects_terminal_mouse_escape_like_text() {
-        assert!(contains_terminal_mouse_escape("[<35;100;32M"));
-        assert!(contains_terminal_mouse_escape("\u{1b}[<0;12;8m"));
-        assert!(!contains_terminal_mouse_escape("普通文本 [< 不是鼠标事件"));
-    }
-
+    
     #[test]
     fn target_rule_adds_period_only_when_right_side_is_empty() {
         let empty = apply_target_punctuation_rule("我现在测试", TargetRightContext::Empty);
@@ -2798,17 +2816,7 @@ mod tests {
         assert!(!same_window_identity(&original, &current));
     }
 
-    #[test]
-    fn parses_active_wezterm_pane_json() {
-        let panes =
-            parse_wezterm_panes(r#"[{"pane_id":7,"cursor_x":12,"cursor_y":23,"is_active":true}]"#)
-                .unwrap();
-        assert_eq!(panes[0].pane_id, 7);
-        assert_eq!(panes[0].cursor_x, 12);
-        assert_eq!(panes[0].cursor_y, 23);
-        assert!(panes[0].is_active);
-    }
-
+    
     #[test]
     fn terminal_line_context_ignores_padding_and_box_border() {
         assert_eq!(

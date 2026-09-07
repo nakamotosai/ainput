@@ -7,7 +7,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -16,12 +16,12 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HICON, IDC_ARROW, IDI_APPLICATION, IDI_INFORMATION,
     IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadCursorW, LoadIconW, LoadImageW, MF_CHECKED,
     MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PostQuitMessage, PostThreadMessageW,
-    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CREATE, WM_DESTROY,
+    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, KillTimer, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    PostMessageW, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CREATE, WM_DESTROY, WM_TIMER,
     WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
@@ -42,14 +42,26 @@ use crate::voice_command_panel::VoiceCommandPanelController;
 const TRAY_THREAD_QUIT: u32 = WM_APP + 41;
 const TRAY_CALLBACK: u32 = WM_APP + 42;
 const TRAY_API_NOTIFICATION: u32 = WM_APP + 44;
+// WM_APP+45/46 已被切换动画占用；外部（第二实例/部署脚本）用这个窗口消息
+// 请求托盘走正常退出路径，等同于用户点「退出」。
+pub(crate) const TRAY_REMOTE_QUIT_MSG: u32 = WM_APP + 47;
+const SWITCH_ANIM_TIMER: usize = 0xA302;
+const SWITCH_ANIM_INTERVAL_MS: u32 = 180;
+const MSG_SWITCH_ANIM_START: u32 = WM_APP + 45;
+const MSG_SWITCH_ANIM_STOP: u32 = WM_APP + 46;
 const TRAY_UID: u32 = 1;
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
+static SWITCH_ICON_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SWITCH_BLINK_STATE: AtomicBool = AtomicBool::new(false);
+static CACHED_APP_ICON: Mutex<Option<usize>> = Mutex::new(None);
 static API_NOTIFICATION_QUEUE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static TRAY_HWND: OnceLock<usize> = OnceLock::new();
 
 const MENU_API_SETTINGS: usize = 2010;
 const MENU_HISTORY: usize = 2012;
 const MENU_AUTO_START: usize = 2011;
 const MENU_EXIT: usize = 2005;
+const MENU_RESTART: usize = 2006;
 const MENU_REWRITE_ENABLED: usize = 2700;
 const MENU_PROMPT_STANDARD: usize = 2801;
 const MENU_PROMPT_COMPACT: usize = 2802;
@@ -59,6 +71,9 @@ const MENU_PROMPT_EDIT: usize = 2805;
 const MENU_VOICE_COMMAND_ENABLED: usize = 2901;
 const MENU_VOICE_COMMAND_EDIT: usize = 2902;
 const MENU_HOTKEY_EDIT: usize = 2910;
+const MENU_ENGINE_SENSE_VOICE: usize = 3001;
+const MENU_ENGINE_QWEN3: usize = 3002;
+const MENU_ENGINE_FUNASR_NANO: usize = 3003;
 
 pub struct Tray {
     thread_id: u32,
@@ -78,6 +93,11 @@ impl Tray {
         hotkey_user: HotkeyUserController,
         hotkey_panel: HotkeyPanelController,
         api_config_path: PathBuf,
+        config_path: PathBuf,
+        current_engine: String,
+        shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
+        install_root: PathBuf,
+        local_config: crate::config::LocalNonstreamingConfig,
         api_notifications: mpsc::Receiver<String>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -99,6 +119,12 @@ impl Tray {
                     hotkey_user,
                     hotkey_panel,
                     api_config_path,
+                    config_path,
+                    current_engine,
+                    shared_recognizer,
+                    install_root,
+                    local_config,
+                    switching: Arc::new(AtomicBool::new(false)),
                     shutdown,
                 });
             });
@@ -144,6 +170,12 @@ struct TrayState {
     hotkey_user: HotkeyUserController,
     hotkey_panel: HotkeyPanelController,
     api_config_path: PathBuf,
+    config_path: PathBuf,
+    current_engine: String,
+    shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
+    install_root: PathBuf,
+    local_config: crate::config::LocalNonstreamingConfig,
+    switching: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -159,6 +191,7 @@ unsafe fn run_tray_thread(api_notifications: mpsc::Receiver<String>) -> Result<(
         .map_err(|error| anyhow!("get module handle failed: {error}"))?;
     unsafe { register_tray_class(HINSTANCE(instance.0))? };
     let hwnd = unsafe { create_tray_window(HINSTANCE(instance.0))? };
+    let _ = TRAY_HWND.set(hwnd.0 as usize);
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
     TASKBAR_CREATED_MESSAGE.store(taskbar_created, Ordering::Relaxed);
     info!(
@@ -299,6 +332,35 @@ unsafe fn show_api_setup_balloon(hwnd: HWND, message: &str) {
     }
 }
 
+// 与 local_asr.rs 的 LocalEngine::parse 别名集保持一致
+fn normalize_engine_key(engine: &str) -> String {
+    let lowered = engine.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "qwen3-asr" | "qwen3_asr" | "qwen3asr" | "qwen3" => "qwen3-asr".to_string(),
+        "funasr-nano" | "funasr_nano" | "fun-asr-nano" | "funasrnano" => "funasr-nano".to_string(),
+        "sense-voice" | "sense_voice" | "sensevoice" | "" => "sense-voice".to_string(),
+        _ => lowered,
+    }
+}
+
+fn engine_display_name(engine: &str) -> &'static str {
+    match normalize_engine_key(engine).as_str() {
+        "qwen3-asr" => "Qwen3-ASR",
+        "funasr-nano" => "FunASR-Nano",
+        _ => "SenseVoice",
+    }
+}
+
+fn cached_app_icon() -> HICON {
+    let mut guard = CACHED_APP_ICON.lock().unwrap();
+    if let Some(icon) = *guard {
+        return HICON(icon as *mut std::ffi::c_void);
+    }
+    let icon = load_tray_icon();
+    *guard = Some(icon.0 as usize);
+    icon
+}
+
 fn tray_data(hwnd: HWND, include_icon: bool) -> NOTIFYICONDATAW {
     let mut data = NOTIFYICONDATAW::default();
     data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -307,10 +369,20 @@ fn tray_data(hwnd: HWND, include_icon: bool) -> NOTIFYICONDATAW {
     data.uCallbackMessage = TRAY_CALLBACK;
     if include_icon {
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        data.hIcon = load_tray_icon();
+        data.hIcon = cached_app_icon();
+        let engine_label = TRAY_STATE.with(|state| {
+            state
+                .borrow()
+                .as_ref()
+                .map(|state| engine_display_name(&state.current_engine))
+                .unwrap_or("SenseVoice")
+        });
         write_wide_fixed(
             &mut data.szTip,
-            &format!("ainput {}", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "ainput v{} · 引擎：{engine_label}",
+                env!("CARGO_PKG_VERSION")
+            ),
         );
     }
     data
@@ -320,7 +392,20 @@ fn load_tray_icon() -> HICON {
     if let Some(icon) = load_runtime_icon() {
         return icon;
     }
+    if let Some(icon) = load_embedded_icon() {
+        return icon;
+    }
     unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default()
+}
+
+fn load_embedded_icon() -> Option<HICON> {
+    let module = unsafe { GetModuleHandleW(None) }.ok()?;
+    let instance = HINSTANCE(module.0);
+    let handle = unsafe { LoadIconW(Some(instance), PCWSTR(1 as *const u16)) }
+        .ok()
+        .filter(|icon| !icon.0.is_null())?;
+    info!("loaded tray icon from embedded exe resource");
+    Some(handle)
 }
 
 fn load_runtime_icon() -> Option<HICON> {
@@ -366,6 +451,21 @@ fn write_wide_fixed(target: &mut [u16], text: &str) {
     target[index] = 0;
 }
 
+/// 统一退出路径：标记 shutdown（主循环/各子线程下一轮全部收尾），
+/// 销毁托盘窗口（WM_DESTROY 里删托盘图标），退出消息循环。
+/// 用户点「退出」、点「重启」、以及第二实例发 TRAY_REMOTE_QUIT_MSG 都走这里。
+fn request_app_exit(hwnd: HWND) {
+    TRAY_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.shutdown.store(true, Ordering::Relaxed);
+        }
+    });
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+        PostQuitMessage(0);
+    }
+}
+
 unsafe fn show_tray_menu(hwnd: HWND) {
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
@@ -378,6 +478,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
                 state.rewrite_prompt.preset_label().to_string(),
                 state.voice_command.enabled(),
                 state.hotkey_user.local_nonstreaming(),
+                state.current_engine.clone(),
+                state.switching.load(Ordering::Relaxed),
             )
         })
     });
@@ -387,18 +489,24 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         prompt_label,
         voice_command_enabled,
         voice_hotkey_label,
+        current_engine,
+        switching_engine,
     )) = state_snapshot
     else {
         let _ = unsafe { DestroyMenu(menu) };
         return;
     };
+    let engine_label = engine_display_name(&current_engine);
 
     unsafe {
         append_menu_text(
             menu,
             MF_STRING | MF_GRAYED,
             0,
-            &format!("ainput {}", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "ainput v{} · 引擎：{engine_label}",
+                env!("CARGO_PKG_VERSION")
+            ),
         );
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
@@ -519,12 +627,45 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
+        let engine_flag = if switching_engine { MF_STRING | MF_GRAYED } else { MF_STRING };
+        append_menu_text(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            if switching_engine { "识别引擎 · 正在切换，请稍等…" } else { "识别引擎 · 点选即热切换" },
+        );
+        append_menu_text(
+            menu,
+            engine_flag
+                | if normalize_engine_key(&current_engine) == "sense-voice" {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            MENU_ENGINE_SENSE_VOICE,
+            "SenseVoice（默认·最快）",
+        );
+        append_menu_text(
+            menu,
+            engine_flag
+                | if normalize_engine_key(&current_engine) == "qwen3-asr" {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            MENU_ENGINE_QWEN3,
+            "Qwen3-ASR 0.6B（更准·较慢）",
+        );
+    }
+    let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
+    unsafe {
         let auto_start = is_auto_start_enabled();
         let flag = if auto_start { MF_CHECKED } else { MF_UNCHECKED };
         append_menu_text(menu, MF_STRING | flag, MENU_AUTO_START, "开机自启动");
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
+        append_menu_text(menu, MF_STRING, MENU_RESTART, "重启");
         append_menu_text(menu, MF_STRING, MENU_EXIT, "退出");
     }
 
@@ -554,17 +695,20 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_VOICE_COMMAND_ENABLED => set_voice_command_enabled(!voice_command_enabled),
             MENU_VOICE_COMMAND_EDIT => open_voice_command_panel(),
             MENU_HOTKEY_EDIT => open_hotkey_panel(),
+            MENU_ENGINE_SENSE_VOICE => set_local_engine("sense-voice", "models/sense-voice"),
+            MENU_ENGINE_QWEN3 => set_local_engine("qwen3-asr", "models/qwen3-asr"),
             MENU_AUTO_START => toggle_auto_start(),
-            MENU_EXIT => {
-                TRAY_STATE.with(|state| {
-                    if let Some(state) = state.borrow().as_ref() {
-                        state.shutdown.store(true, Ordering::Relaxed);
-                    }
-                });
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                    PostQuitMessage(0);
+            MENU_RESTART => {
+                // 重启 = 以当前 exe 再拉一个新实例：新实例发现互斥锁被占，
+                // 会给本进程托盘窗口发 TRAY_REMOTE_QUIT_MSG，等老实例收完尾
+                // 释放锁后自动接任。这里只需触发并退出即可。
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).spawn();
                 }
+                request_app_exit(hwnd);
+            }
+            MENU_EXIT => {
+                request_app_exit(hwnd);
             }
             _ => {}
         }
@@ -676,7 +820,151 @@ fn open_hotkey_panel() {
     });
 }
 
+fn set_local_engine(engine: &str, model_dir: &str) {
+    TRAY_STATE.with(|state| {
+        let (slot, install_root, switching_flag, hud, new_config) = {
+            let mut state_cell = state.borrow_mut();
+            let Some(state) = state_cell.as_mut() else {
+                return;
+            };
+            if state.switching.load(Ordering::Relaxed) {
+                state.hud.show_text("正在切换引擎，请稍等完成", false, false);
+                return;
+            }
+            if state.current_engine == engine {
+                state.hud.show_text(&format!("识别引擎已是：{engine}"), false, false);
+                return;
+            }
+            match update_local_engine_config(&state.config_path, engine, model_dir) {
+                Ok(()) => {
+                    state.current_engine = engine.to_string();
+                    state.switching.store(true, Ordering::Relaxed);
+                    if let Some(&addr) = TRAY_HWND.get() {
+                    let hwnd_v = HWND(addr as *mut std::ffi::c_void);
+                    let _ = unsafe { PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_START, WPARAM(0), LPARAM(0)) };
+                }
+                    state.hud.show_text(
+                        &format!("识别引擎切换中：{engine}\n约 5-10 秒后自动生效，不用重启"),
+                        false,
+                        false,
+                    );
+                    info!(engine, config_path = %state.config_path.display(), "local ASR engine switch requested from tray");
+                    let mut cfg = state.local_config.clone();
+                    cfg.engine = engine.to_string();
+                    cfg.model_dir = model_dir.to_string();
+                    (
+                        Arc::clone(&state.shared_recognizer),
+                        state.install_root.clone(),
+                        Arc::clone(&state.switching),
+                        state.hud.clone(),
+                        cfg,
+                    )
+                }
+                Err(error) => {
+                    state.hud.show_text(&format!("切换失败：{error}"), false, false);
+                    warn!(error = %error, engine, "failed to persist local ASR engine switch");
+                    return;
+                }
+            }
+        };
+        let engine_owned = engine.to_string();
+        thread::spawn(move || {
+            let result =
+                crate::local_asr::LocalSenseVoiceRecognizer::create(&new_config, &install_root);
+            let toast = match result {
+                Ok(recognizer) => match slot.lock() {
+                    Ok(mut guard) => {
+                        *guard = Some(recognizer);
+                        format!("识别引擎已切换：{engine_owned}\n立即生效，不用重启")
+                    }
+                    Err(_) => "切换失败：内存槽位异常".to_string(),
+                },
+                Err(error) => format!("切换失败：{error}"),
+            };
+            switching_flag.store(false, Ordering::Relaxed);
+            if let Some(&addr) = TRAY_HWND.get() {
+                let hwnd_v = HWND(addr as *mut std::ffi::c_void);
+                let _ = unsafe { PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_STOP, WPARAM(0), LPARAM(0)) };
+            }
+            hud.show_text(&toast, false, false);
+            info!(engine = %engine_owned, "local ASR engine hot-swap finished");
+        });
+    });
+}
+
+fn update_local_engine_config(config_path: &std::path::Path, engine: &str, model_dir: &str) -> Result<()> {
+    use std::fs;
+
+    if !config_path.exists() {
+        anyhow::bail!("config file not found: {}", config_path.display());
+    }
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("read config {}", config_path.display()))?;
+    let section = "[local_nonstreaming]";
+    let updates = [("engine", engine), ("model_dir", model_dir)];
+    let mut in_section = false;
+    let mut section_seen = false;
+    let mut replaced = [false; 2];
+    let mut output: Vec<String> = Vec::new();
+    let mut append_missing = |output: &mut Vec<String>, replaced: &[bool; 2]| {
+        for (index, (key, value)) in updates.iter().enumerate() {
+            if !replaced[index] {
+                output.push(format!("{key} = \"{value}\""));
+            }
+        }
+    };
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_section {
+                append_missing(&mut output, &replaced);
+                replaced = [true; 2];
+            }
+            if trimmed.eq_ignore_ascii_case(section) {
+                section_seen = true;
+            }
+            in_section = trimmed.eq_ignore_ascii_case(section);
+            output.push(line.to_string());
+            continue;
+        }
+        let mut emitted = false;
+        if in_section {
+            for (index, (key, value)) in updates.iter().enumerate() {
+                let is_key = trimmed.split('=').next().map(str::trim) == Some(*key);
+                if is_key && !replaced[index] {
+                    output.push(format!("{key} = \"{value}\""));
+                    replaced[index] = true;
+                    emitted = true;
+                    break;
+                }
+            }
+        }
+        if !emitted {
+            output.push(line.to_string());
+        }
+    }
+    if in_section {
+        append_missing(&mut output, &replaced);
+    }
+    if !section_seen {
+        output.push(section.to_string());
+        for (key, value) in &updates {
+            output.push(format!("{key} = \"{value}\""));
+        }
+    }
+    let write_target = config_path.with_extension("toml.tmp-write");
+    fs::write(&write_target, format!("{}\n", output.join("\n")))
+        .with_context(|| format!("write config {}", write_target.display()))?;
+    fs::rename(&write_target, config_path)
+        .with_context(|| format!("replace config {}", config_path.display()))
+}
+
+// reg.exe 是控制台程序，不加 CREATE_NO_WINDOW 每次开托盘菜单都会闪黑框
+// （2026-09-03 用户又一次现场抓到：点托盘图标就闪终端窗）。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 fn is_auto_start_enabled() -> bool {
+    use std::os::windows::process::CommandExt;
     std::process::Command::new("reg")
         .args([
             "query",
@@ -684,11 +972,13 @@ fn is_auto_start_enabled() -> bool {
             "/v",
             "ainput",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .is_ok_and(|output| output.status.success())
 }
 
 fn toggle_auto_start() {
+    use std::os::windows::process::CommandExt;
     let enabled = is_auto_start_enabled();
     if enabled {
         let _ = std::process::Command::new("reg")
@@ -699,6 +989,7 @@ fn toggle_auto_start() {
                 "ainput",
                 "/f",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
         info!("auto-start disabled");
     } else {
@@ -721,6 +1012,7 @@ fn toggle_auto_start() {
                 &exe_path,
                 "/f",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
         info!(path = %exe_path, "auto-start enabled");
     }
@@ -744,13 +1036,122 @@ extern "system" fn tray_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_CREATE => {
-            let _ = lparam.0 as *const CREATESTRUCTW;
+            // 不常驻定时器：仅在引擎切换期间 PostMessage 才会拉起来
+            LRESULT(0)
+        }
+        MSG_SWITCH_ANIM_START => {
+            let _ = unsafe {
+                SetTimer(Some(hwnd), SWITCH_ANIM_TIMER, SWITCH_ANIM_INTERVAL_MS, None)
+            };
+            LRESULT(0)
+        }
+        MSG_SWITCH_ANIM_STOP => {
+            let _ = unsafe { KillTimer(Some(hwnd), SWITCH_ANIM_TIMER) };
+            if SWITCH_ICON_ACTIVE.swap(false, Ordering::Relaxed) {
+                let data = tray_data(hwnd, true);
+                let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+            }
+            SWITCH_BLINK_STATE.store(false, Ordering::Relaxed);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == SWITCH_ANIM_TIMER {
+                let switching = TRAY_STATE
+                    .with(|state| state.borrow().as_ref().map(|s| s.switching.load(Ordering::Relaxed)).unwrap_or(false));
+                if !switching {
+                    // 闲时仅在「上一拍刚结束切换」时恢复原图标一次，平时不碰托盘
+                    if SWITCH_ICON_ACTIVE.swap(false, Ordering::Relaxed) {
+                        let data = tray_data(hwnd, true);
+                        let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+                    }
+                    return LRESULT(0);
+                }
+                SWITCH_ICON_ACTIVE.store(true, Ordering::Relaxed);
+                let blink = SWITCH_BLINK_STATE.load(Ordering::Relaxed);
+                let mut data = tray_data(hwnd, true);
+                // 切换中：应用图标与系统信息图标交替闪烁
+                if blink {
+                    unsafe {
+                        data.hIcon = LoadIconW(None, IDI_INFORMATION).unwrap_or(data.hIcon);
+                    }
+                }
+                data.uFlags = NIF_ICON | NIF_TIP;
+                let is_switching_tip = if switching { "｜切换中" } else { "" };
+                let engine_label = TRAY_STATE.with(|state| {
+                    state.borrow().as_ref().map(|s| s.current_engine.clone()).unwrap_or_default()
+                });
+                write_wide_fixed(
+                    &mut data.szTip,
+                    &format!("ainput v{} · 引擎：{}{}", env!("CARGO_PKG_VERSION"), engine_display_name(&engine_label), is_switching_tip),
+                );
+                let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+                SWITCH_BLINK_STATE.store(!blink, Ordering::Relaxed);
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = unsafe { KillTimer(Some(hwnd), SWITCH_ANIM_TIMER) };
             unsafe { delete_tray_icon(hwnd) };
             LRESULT(0)
         }
+        m if m == TRAY_REMOTE_QUIT_MSG => {
+            // 外部进程（第二实例 / 部署脚本）请求退出：走与用户点「退出」
+            // 完全相同的路径，托盘图标和状态都会正常收尾。
+            request_app_exit(hwnd);
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_local_engine_config;
+
+    #[test]
+    fn update_engine_config_present_key_succeeds() {
+        let dir = std::env::temp_dir().join("ainput-tray-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ainput.toml");
+        std::fs::write(
+            &path,
+            "[mode]\ndefault = \"local_nonstreaming\"\n\n[local_nonstreaming]\nengine = \"sense-voice\"\nmodel_dir = \"models/sense-voice\"\nnum_threads = 4\n\n[rewrite]\nenabled = false\n",
+        )
+        .unwrap();
+
+        update_local_engine_config(&path, "qwen3-asr", "models/qwen3-asr").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("engine = \"qwen3-asr\""));
+        assert!(raw.contains("model_dir = \"models/qwen3-asr\""));
+        assert!(raw.contains("num_threads = 4"));
+        assert!(raw.contains("[rewrite]"));
+        assert!(raw.contains("enabled = false"));
+
+        let result = update_local_engine_config(&path, "funasr-nano", "models/funasr-nano");
+        assert!(result.is_ok());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("engine = \"funasr-nano\""));
+    }
+
+    #[test]
+    fn missing_keys_are_filled_in() {
+        // 2026-09-02：update_local_engine_config 容错语义改为「缺键补齐」
+        // （此前要求 is_err 的断言已过时）。
+        let dir = std::env::temp_dir().join("ainput-tray-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missing.toml");
+        std::fs::write(&path, "[local_nonstreaming]\nnum_threads = 4\n").unwrap();
+        update_local_engine_config(&path, "qwen3-asr", "models/qwen3-asr").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("engine = \"qwen3-asr\""));
+        assert!(raw.contains("model_dir = \"models/qwen3-asr\""));
+        assert!(raw.contains("num_threads = 4"));
+    }
+
+    #[test]
+    fn missing_config_file_is_err() {
+        let dir = std::env::temp_dir().join("ainput-tray-test");
+        let path = dir.join("no-such-file.toml");
+        assert!(update_local_engine_config(&path, "qwen3-asr", "models/qwen3-asr").is_err());
     }
 }
