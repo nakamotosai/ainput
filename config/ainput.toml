@@ -47,11 +47,14 @@ min_rms_dbfs = -56.0
 request_timeout_ms = 8000
 
 [local_nonstreaming]
+engine = "sense-voice"
 model_dir = "models/sense-voice"
 provider = "cpu"
 sample_rate_hz = 16000
 language = "auto"
-use_itn = true
+use_itn = false  # 2026-09-02 关掉模型自带ITN（十被吞成1/一点一点变1.1点），数字转写由 pipeline 接管
+punct_enabled = true  # 2026-09-03: 关 ITN 后模型不带标点了；离线标点模型补回
+punct_model_dir = "models/punct"
 num_threads = 4
 release_grace_ms = 80
 min_audio_ms = 800

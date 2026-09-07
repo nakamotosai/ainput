@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
@@ -70,7 +70,10 @@ const STREAMING_DYNAMIC_RELEASE_GRACE_MAX_MS: u64 = 150;
 const STREAMING_DYNAMIC_RELEASE_RECENT_PARTIAL_MS: u64 = 220;
 // Raised: thinking models (step/qwen) often return after 1.5–8s.
 const ASYNC_REWRITE_REPLACEMENT_MAX_AGE_MS: u128 = 12_000;
-const HUD_FIRST_REWRITE_DEADLINE_MS: u64 = 450;
+// HUD-first 低延迟窗口（微信/notepad 等可替换）才需要短 deadline（先贴原文再异步替换）。
+// 终端/不可替换目标走「先改写再上屏」：这里不再用 450ms 抢先贴原文，而是等改写完成
+// （最多 15s，等于改写超时上限），改写结果直接上屏，避免「贴了原文却替换不了」。
+const HUD_FIRST_REWRITE_DEADLINE_MS: u64 = 15_000;
 
 struct AsyncWhisperRewriteJob {
     utterance_id: String,
@@ -305,7 +308,7 @@ pub struct VoiceWorker {
     config: AppConfig,
     asr: CloudAsrClient,
     whisper: WhisperClient,
-    local_recognizer: Option<LocalSenseVoiceRecognizer>,
+    local_recognizer: Arc<Mutex<Option<LocalSenseVoiceRecognizer>>>,
     asr_sessions: AsrSessionPool,
     modes: ModeStore,
     audio: AudioHub,
@@ -324,7 +327,7 @@ impl VoiceWorker {
         config: AppConfig,
         asr: CloudAsrClient,
         whisper: WhisperClient,
-        local_recognizer: Option<LocalSenseVoiceRecognizer>,
+        local_recognizer: Arc<Mutex<Option<LocalSenseVoiceRecognizer>>>,
         asr_sessions: AsrSessionPool,
         modes: ModeStore,
         audio: AudioHub,
@@ -1481,16 +1484,21 @@ impl VoiceWorker {
             return Ok(());
         }
 
-        let recognizer = self
-            .local_recognizer
-            .as_ref()
-            .ok_or_else(|| anyhow!("local non-streaming SenseVoice recognizer is unavailable"))?;
-        let transcribe_started = Instant::now();
-        let response = recognizer
-            .transcribe_samples(sample_rate_hz, &samples)
-            .context("transcribe with local SenseVoice")?;
-        let asr_elapsed_ms = transcribe_started.elapsed().as_millis();
-        let raw_text = prepare_asr_text(&response.text);
+        let (response, asr_elapsed_ms) = {
+            let guard = self
+                .local_recognizer
+                .lock()
+                .map_err(|_| anyhow!("local recognizer lock poisoned"))?;
+            let recognizer = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("local non-streaming recognizer is unavailable"))?;
+            let transcribe_started = Instant::now();
+            let response = recognizer
+                .transcribe_samples(sample_rate_hz, &samples)
+                .context("transcribe with local SenseVoice")?;
+            (response, transcribe_started.elapsed().as_millis())
+        };
+        let mut raw_text = prepare_asr_text(&response.text);
         let output_language = self.rewrite_language.current();
         let rewrite_enabled = self.rewrite_language.rewrite_enabled();
 
@@ -1508,6 +1516,12 @@ impl VoiceWorker {
                     started_at,
                 );
             }
+        }
+
+        // 2026-09-03: SenseVoice 关掉 use_itn 后输出裸文本（标点随 ITN 一起没了）。
+        // 这里用独立的离线标点模型把标点补回来；补不了（没装模型/推理失败）就原样放行。
+        if let Some(punctuated) = self.apply_local_punctuation(&raw_text) {
+            raw_text = punctuated;
         }
 
         let raw_finalized =
@@ -1973,6 +1987,17 @@ impl VoiceWorker {
 
     fn spawn_async_whisper_rewrite(&self, job: AsyncWhisperRewriteJob) {
         self.spawn_async_nonstreaming_rewrite(job, "whisper_zh_async_rewrite", "Whisper 非流式");
+    }
+
+    /// 本地识别后补标点（SenseVoice use_itn=false 场景）。标点器不存在、锁失败或结果
+    /// 无变化时返回 None，调用方保持原文。
+    fn apply_local_punctuation(&self, raw_text: &str) -> Option<String> {
+        let guard = self.local_recognizer.lock().ok()?;
+        let recognizer = guard.as_ref()?;
+        match recognizer.punctuate(raw_text) {
+            Some(punctuated) if punctuated != raw_text => Some(punctuated),
+            _ => None,
+        }
     }
 
     fn spawn_async_nonstreaming_rewrite(
@@ -3930,35 +3955,279 @@ fn normalize_personal_english_terms(text: &str) -> String {
     personal_corrections::normalize_text(&normalized)
 }
 
+/// 把可自证是数字的中文数词转成阿拉伯数字。
+///
+/// 2026-09-02 根因改造：SenseVoice 模型自带的 use_itn 模式会把「十」吞成 1、
+/// 把「一点一点」转成「1.1点」——模型级行为无法规则修复，因此配置默认关掉
+/// use_itn，由本函数兜底完成「说中文数字、出阿拉伯数字」的需求。
+///
+/// 转换纪律（宁可保留中文、不可错转）：
+/// - 纯数字连写 >= 3 位（如一三四 / 二零二六）→ 直接拼接；
+/// - 含十/百/千/万/亿 的整数（十二 / 一百万五千）→ 解析成整数；
+/// - 「X点Y」小数（X 是数、Y 全是数字字）→ X.Y；
+/// - 「十点」式：点 前是合法整数且解析值 >= 10 → 转成「12点」；
+/// - 「十」紧跟常用量词（十块钱/十个字）→ 转成 10；
+/// - 禁区全部原样保留：概数（两三千/十一二）、万一、十全十美、一点一点、
+///   十分之一。解析不出或拿不准的一律原文输出。
 fn normalize_continuous_chinese_digits(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
+    let mut scanned = String::with_capacity(text.len());
     let mut run = String::new();
+    let mut run_prev: Option<char> = None; // run 开始前的那一个字符（语境守卫用）
+    let mut last: Option<char> = None;
     for ch in text.chars() {
-        if chinese_digit_value(ch).is_some() {
+        if is_chinese_number_char(ch) {
+            if run.is_empty() {
+                run_prev = last;
+            }
             run.push(ch);
         } else {
-            flush_chinese_digit_run(&mut result, &mut run);
-            result.push(ch);
+            flush_chinese_digit_run(&mut scanned, &mut run, run_prev);
+            scanned.push(ch);
         }
+        last = scanned.chars().last();
     }
-    flush_chinese_digit_run(&mut result, &mut run);
-    result
+    flush_chinese_digit_run(&mut scanned, &mut run, run_prev);
+    convert_lone_ten_before_measure(&scanned)
 }
 
-fn flush_chinese_digit_run(result: &mut String, run: &mut String) {
+/// 收尾第二步：原生 ITN 模式过去会把「十块钱」转成「10块钱」，模型 ITN 关掉后
+/// 由这里接力——孤立的「十」后面紧跟常用量词时写成 10。
+fn convert_lone_ten_before_measure(text: &str) -> String {
+    // 常用量词白名单；只收「后面那个字 100% 是量词」的字，防误伤「十分」「十足」。
+    // 注意：分/钟/成/折 有意不收——「十分/十成」是坏实词。
+    const MEASURES: &[char] = &[
+        '块', '个', '条', '张', '次', '位', '名', '天', '年', '月', '日', '只', '本', '杯',
+        '碗', '件', '套', '层', '行', '篇', '米', '斤', '克', '岁', '倍', '封',
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut prev_was_lone_ten = false;
+    for ch in text.chars() {
+        if prev_was_lone_ten && MEASURES.contains(&ch) {
+            // 把刚才压着的 十 改成 10
+            out.push('1');
+            out.push('0');
+            out.push(ch);
+            prev_was_lone_ten = false;
+            continue;
+        }
+        if prev_was_lone_ten {
+            out.push('十');
+        }
+        prev_was_lone_ten = ch == '十';
+        if !prev_was_lone_ten {
+            out.push(ch);
+        }
+    }
+    if prev_was_lone_ten {
+        out.push('十');
+    }
+    out
+}
+
+fn is_chinese_number_char(ch: char) -> bool {
+    chinese_digit_value(ch).is_some() || chinese_unit_scale(ch).is_some() || ch == '点'
+}
+
+fn chinese_unit_scale(ch: char) -> Option<u64> {
+    match ch {
+        '十' => Some(10),
+        '百' => Some(100),
+        '千' => Some(1000),
+        '万' => Some(10_000),
+        '亿' => Some(100_000_000),
+        _ => None,
+    }
+}
+
+fn flush_chinese_digit_run(result: &mut String, run: &mut String, run_prev: Option<char>) {
     if run.is_empty() {
         return;
     }
-    if run.chars().count() >= 3 {
-        for ch in run.chars() {
-            if let Some(value) = chinese_digit_value(ch) {
-                result.push(value);
-            }
+    // 语境守卫：紧挨在 几/数/约/近/超/满/好/余 后面的数字词都是概率量（几十万、
+    // 数万元），不是精确数字，整段保留。
+    match run_prev {
+        Some('几' | '数' | '约' | '近' | '超' | '满' | '好' | '余') => {
+            result.push_str(run);
+            run.clear();
+            return;
         }
-    } else {
-        result.push_str(run);
+        _ => {}
+    }
+    match convert_chinese_number_run(run) {
+        Some(converted) => result.push_str(&converted),
+        None => result.push_str(run),
     }
     run.clear();
+}
+
+/// 整串数字词 → 阿拉伯数字；拿不准返回 None（调用方保留原文）。
+fn convert_chinese_number_run(run: &str) -> Option<String> {
+    let chars: Vec<char> = run.chars().collect();
+    // 单字永不转换（孤「十」交给量词兜底；孤「万/亿/一」没有上下文都不是数字）。
+    if chars.len() < 2 {
+        return None;
+    }
+    let digit_count = chars.iter().filter(|c| chinese_digit_value(**c).is_some()).count();
+    let has_dot = chars.contains(&'点');
+    let has_unit = chars.iter().any(|c| chinese_unit_scale(*c).is_some());
+
+    if !has_dot && !has_unit {
+        // 纯数字连写：长度 >= 3 才转（防「一二」「再三」误伤）。
+        if chars.len() >= 3 && digit_count == chars.len() {
+            return Some(chars.iter().filter_map(|c| chinese_digit_value(*c)).collect());
+        }
+        return None;
+    }
+
+    if has_dot && has_unit {
+        // 带单位的点结构只认两种：
+        //  1) 结尾点（十二点 → 12点，整点时刻）
+        //  2) 中间一个点、左边是复合整数、右边纯数字（十二点五 → 12.5）
+        let dot_count = chars.iter().filter(|c| **c == '点').count();
+        if dot_count != 1 {
+            return None;
+        }
+        let dot_pos = chars.iter().position(|c| *c == '点')?;
+        let left = &chars[..dot_pos];
+        let right = &chars[dot_pos + 1..];
+        if left.is_empty() {
+            return None;
+        }
+        let head: String = left.iter().collect();
+        if right.is_empty() {
+            // 整点时刻：值 >= 10 才转（十点→10点；两点保留）。
+            let value = parse_chinese_integer(&head)?;
+            if value >= 10 {
+                return Some(format!("{value}点"));
+            }
+            return None;
+        }
+        if !right.iter().all(|c| chinese_digit_value(*c).is_some()) {
+            return None;
+        }
+        let left_str = if left.iter().all(|c| chinese_digit_value(*c).is_some()) {
+            left.iter()
+                .filter_map(|c| chinese_digit_value(*c))
+                .collect::<String>()
+        } else {
+            parse_chinese_integer(&head)?.to_string()
+        };
+        let right_str: String = right
+            .iter()
+            .filter_map(|c| chinese_digit_value(*c))
+            .collect();
+        return Some(format!("{left_str}.{right_str}"));
+    }
+
+    if has_dot {
+        // 小数：X 点 Y。左右必须非空、右边全是数字字、只允许一个点。
+        let dot_count = chars.iter().filter(|c| **c == '点').count();
+        if dot_count != 1 {
+            return None; // 一点一点 / 一点一点一点 等
+        }
+        let dot_pos = chars.iter().position(|c| *c == '点')?;
+        let left = &chars[..dot_pos];
+        let right = &chars[dot_pos + 1..];
+        if left.is_empty() || right.is_empty() {
+            return None;
+        }
+        if !right.iter().all(|c| chinese_digit_value(*c).is_some()) {
+            return None;
+        }
+        // 「一点一」形态（一点一滴/一步一步式的说话惯性）按口语保留，不当 1.1。
+        if left == ['一'] && right == ['一'] {
+            return None;
+        }
+        let left_str = if left.iter().all(|c| chinese_digit_value(*c).is_some()) {
+            left.iter()
+                .filter_map(|c| chinese_digit_value(*c))
+                .collect::<String>()
+        } else {
+            parse_chinese_integer(&left.iter().collect::<String>())?.to_string()
+        };
+        let right_str: String = right
+            .iter()
+            .filter_map(|c| chinese_digit_value(*c))
+            .collect();
+        return Some(format!("{left_str}.{right_str}"));
+    }
+
+    // 纯复合整数。
+    let value = parse_chinese_integer(run)?;
+    Some(value.to_string())
+}
+
+/// 解析不含「点」的中文整数（含十/百/千/万/亿）；拿不准返回 None。
+/// 规则：万/亿截段求值，十/百/千是段内位值；段内第二个非零数字（概数形态，
+/// 两三/十一二）直接拒绝；零是占位符，允许后跟一位数字（一百零五）。
+fn parse_chinese_integer(s: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut pending: u64 = 0; // 当前段内尚未乘单位的数字
+    let mut seen_digit = false;
+    let mut seen_unit = false;
+    let mut prev_was_zero = false;
+    let mut segment_started = false;
+    // 大单位（万/亿）后直接跟数字、且到串尾都没碰上小单位或 零 → 「一万二」式口语
+    // （实际值 12000，直译会错成 10002），整串拒转；中间有零（一万零五）是合法的。
+    let mut tail_risk_after_big_unit = false;
+    for ch in s.chars() {
+        if let Some(d) = chinese_digit_value(ch) {
+            let v = d.to_digit(10)? as u64;
+            // 段内已经有过非零数字、中间没有 零 过渡 → 「两三」「一二」形，非法。
+            if segment_started && v > 0 && !prev_was_zero {
+                return None;
+            }
+            if v == 0 {
+                tail_risk_after_big_unit = false;
+            }
+            pending = v;
+            seen_digit = true;
+            prev_was_zero = v == 0;
+            segment_started = true;
+        } else if let Some(scale) = chinese_unit_scale(ch) {
+            seen_unit = true;
+            if scale >= 10_000 {
+                tail_risk_after_big_unit = true;
+                // 万/亿：前面必须有已累积的值（十 → 10 临时补齐）。
+                let head = if total == 0 && pending == 0 {
+                    if !seen_digit {
+                        return None; // 「万一」「亿万」裸开头
+                    }
+                    1
+                } else {
+                    total.checked_add(pending)?
+                };
+                total = head.checked_mul(scale)?;
+                pending = 0;
+            } else {
+                tail_risk_after_big_unit = false;
+                // 十/百/千：段内无数字时 十 按一十算，百/千 不接零值。
+                // 注意裸「十」不记 seen_digit：「十万」整体会因缺数字字而拒转，
+                // 保住「十万火急」这类成语；「十二/十点」这类真正数字不受影响。
+                let n = if pending > 0 {
+                    pending
+                } else if ch == '十' && !segment_started {
+                    1
+                } else {
+                    0
+                };
+                total = total.checked_add(n.checked_mul(scale)?)?;
+                pending = 0;
+            }
+            segment_started = false;
+            prev_was_zero = false;
+        } else {
+            return None;
+        }
+    }
+    total = total.checked_add(pending)?;
+    if !seen_unit || !seen_digit || total == 0 {
+        return None;
+    }
+    if tail_risk_after_big_unit && pending > 0 {
+        return None; // 「一万二」式悬空尾数
+    }
+    Some(total)
 }
 
 fn chinese_digit_value(ch: char) -> Option<char> {
@@ -4725,6 +4994,60 @@ mod tests {
             "现在是2026年。"
         );
         assert_eq!(finalize_asr_text_for_paste("一两句话").text, "一两句话。");
+    }
+
+    /// 2026-09-02 数字修复回归：模型 ITN 已关，这些场景由本地规则接管。
+    /// 复现来源：user dictation history（一点一点 → 1.1点，十 → 1）。
+    #[test]
+    fn finalizer_chinese_number_conversion() {
+        use super::convert_chinese_number_run as conv;
+        fn t(s: &str) -> String {
+            super::normalize_continuous_chinese_digits(s)
+        }
+        // 复合整数
+        assert_eq!(t("十二个小时"), "12个小时");
+        assert_eq!(t("二十五个"), "25个");
+        assert_eq!(t("一百条记录"), "100条记录");
+        assert_eq!(t("二百五十页"), "250页");
+        assert_eq!(t("一千零一个"), "1001个");
+        assert_eq!(t("二十万行代码"), "200000行代码");
+        assert_eq!(t("一百五十万"), "1500000");
+        assert_eq!(t("二百六十亿"), "26000000000");
+        assert_eq!(conv("十万"), None); // 裸十万拒转，保住「十万火急」类成语
+        assert_eq!(t("十万块"), "十万块");
+        assert_eq!(t("十万火急"), "十万火急");
+        assert_eq!(t("几十万"), "几十万"); // 几/数/约/近 等概数前缀守卫
+        assert_eq!(t("约是十万"), "约是十万");
+        assert_eq!(t("一万二"), "一万二"); // 口语省略（=12000），直译会错 → 保留
+        assert_eq!(t("一万二千"), "12000");
+        assert_eq!(t("一万零五"), "10005");
+        assert_eq!(conv("万一"), None); // 固定词
+        assert_eq!(t("一万二千金"), "12000金");
+        // 概数拒转
+        assert_eq!(conv("两三千"), None);
+        assert_eq!(conv("十一二"), None);
+        assert_eq!(t("三四天"), "三四天");
+        // 小数
+        assert_eq!(t("零点五秒"), "0.5秒");
+        assert_eq!(t("三点五小时"), "3.5小时");
+        assert_eq!(t("一百零一点五"), "101.5");
+        assert_eq!(t("十二点五"), "12.5");
+        // 口语「一点一点」「一点一滴」绝不转
+        assert_eq!(t("记忆一点一点消失"), "记忆一点一点消失");
+        assert_eq!(t("一点一点一点"), "一点一点一点");
+        assert_eq!(t("一点一滴"), "一点一滴");
+        // 整点时刻
+        assert_eq!(t("十二点了"), "12点了");
+        assert_eq!(t("下午三点"), "下午三点"); // <10 不转，保留中文
+        // 孤十量词
+        assert_eq!(t("十块钱"), "10块钱");
+        assert_eq!(t("十来个人"), "十来个人"); // 来 不是量词，保留
+        assert_eq!(t("十分感谢"), "十分感谢"); // 分 不在量词白名单
+        assert_eq!(t("十全十美"), "十全十美");
+        // 孤十不是数字
+        assert_eq!(t("说到十的时候"), "说到十的时候");
+        // 再保险：数字前后内容不受影响
+        assert_eq!(t("三点五的版本"), "3.5的版本");
     }
 
     #[test]

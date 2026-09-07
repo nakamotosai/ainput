@@ -88,11 +88,17 @@ pub struct WhisperConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LocalNonstreamingConfig {
+    pub engine: String,
     pub model_dir: String,
     pub provider: String,
     pub sample_rate_hz: u32,
     pub language: String,
     pub use_itn: bool,
+    /// 2026-09-03: use_itn=false 后 SenseVoice 不再输出标点（标点是 ITN 一起产出的），
+    /// 因此用 sherpa-onnx 离线 ct-transformer 标点模型在终句后补标点。
+    pub punct_enabled: bool,
+    /// 相对 install_root 或绝对路径；目录内需有 model.onnx 或 model.int8.onnx。
+    pub punct_model_dir: String,
     pub num_threads: i32,
     pub release_grace_ms: u64,
     pub min_audio_ms: u64,
@@ -861,11 +867,16 @@ impl Default for WhisperConfig {
 impl Default for LocalNonstreamingConfig {
     fn default() -> Self {
         Self {
+            engine: "sense-voice".to_string(),
             model_dir: "models/sense-voice".to_string(),
             provider: "cpu".to_string(),
             sample_rate_hz: 16_000,
             language: "auto".to_string(),
-            use_itn: true,
+            // 2026-09-02: SenseVoice 自带 ITN 会把「十」吞成 1、「一点一点」转成
+            // 「1.1点」，默认关闭；数字转写在 pipeline 的 normalize 层自己做。
+            use_itn: false,
+            punct_enabled: true,
+            punct_model_dir: "models/punct".to_string(),
             num_threads: 4,
             release_grace_ms: 80,
             min_audio_ms: 800,
@@ -1072,7 +1083,7 @@ impl Default for HudConfig {
             background_color: "#071014".to_string(),
             background_alpha: 230,
             corner_radius_px: 16,
-            display_hold_ms: 650,
+            display_hold_ms: 3000,
         }
     }
 }

@@ -33,7 +33,7 @@ mod worker;
 
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -61,8 +61,20 @@ fn main() {
     let _single_instance_mutex = match acquire_single_instance_lock() {
         Ok(Some(handle)) => handle,
         Ok(None) => {
-            show_already_running();
-            std::process::exit(0);
+            // 已在运行：请老实例体面退出（等同用户点托盘「退出」），然后死等锁。
+            // 顺序坑（2026-09-03 用户实测「点重启→弹已在运行→两个都没了」）：
+            // 老实例收尾时先拆托盘窗口、后放互斥锁；此间 FindWindowW 已找不到
+            // 窗口，但锁还占着。旧代码此时直接弹「已在运行」退出 → 老实例随后
+            // 退干净 → 一个不剩。所以无论第一发退出请求有没有送出去，都进等待
+            // 循环，循环里周期性补发请求，直到拿到锁或 30 秒超时。
+            let _ = request_existing_instance_quit();
+            match wait_for_single_instance_lock(std::time::Duration::from_secs(30)) {
+                Ok(Some(handle)) => handle,
+                Ok(None) | Err(_) => {
+                    show_already_running();
+                    std::process::exit(0);
+                }
+            }
         }
         Err(error) => {
             eprintln!("ainput: single-instance lock failed: {error:#}");
@@ -253,6 +265,8 @@ fn run_app() -> Result<()> {
         Arc::clone(&shutdown),
     )
     .context("start hotkey panel")?;
+    let shared_recognizer: Arc<Mutex<Option<local_asr::LocalSenseVoiceRecognizer>>> =
+        Arc::new(Mutex::new(None));
     let _tray = tray::Tray::start(
         hud.clone(),
         api_settings,
@@ -265,6 +279,11 @@ fn run_app() -> Result<()> {
         hotkey_user.clone(),
         hotkey_panel,
         api_connections.path.clone(),
+        config_path.clone(),
+        config.local_nonstreaming.engine.clone(),
+        Arc::clone(&shared_recognizer),
+        install_root.clone(),
+        config.local_nonstreaming.clone(),
         api_notification_rx,
         Arc::clone(&shutdown),
     )
@@ -284,6 +303,11 @@ fn run_app() -> Result<()> {
         &install_root,
     )
     .context("create local SenseVoice recognizer (required)")?;
+    {
+        *shared_recognizer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recognizer slot poisoned at startup"))? = Some(local_recognizer);
+    }
     info!(
         model_dir = %config.local_nonstreaming.model_dir,
         "local SenseVoice recognizer ready"
@@ -302,7 +326,7 @@ fn run_app() -> Result<()> {
         config,
         asr,
         whisper,
-        Some(local_recognizer),
+        Arc::clone(&shared_recognizer),
         asr_sessions,
         modes,
         audio,
@@ -318,6 +342,54 @@ fn run_app() -> Result<()> {
     let result = worker.run(hotkey_rx);
     hotkey_monitor.stop();
     result
+}
+
+/// 找到正在运行的老实例托盘窗口，请它走正常退出流程（等同用户点「退出」）。
+#[cfg(windows)]
+fn request_existing_instance_quit() -> bool {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+    use windows::core::w;
+
+    let hwnd = unsafe { FindWindowW(w!("ainput_tray_window"), None) };
+    let hwnd = match hwnd {
+        Ok(h) if h != HWND::default() => h,
+        _ => return false,
+    };
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd),
+            tray::TRAY_REMOTE_QUIT_MSG,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+    true
+}
+
+/// 老实例退出期间轮询单实例锁，直到拿到或超时。
+#[cfg(windows)]
+fn wait_for_single_instance_lock(
+    timeout: std::time::Duration,
+) -> Result<Option<windows::Win32::Foundation::HANDLE>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut waited_ms = 0u64;
+    loop {
+        match acquire_single_instance_lock()? {
+            Some(handle) => return Ok(Some(handle)),
+            None => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        waited_ms += 200;
+        // 第一发 PostMessage 可能正撞上老实例拆窗/重建的缝隙而落空；
+        // 每 2 秒补发一次退出请求兜底，别让等待空转满 30 秒。
+        if waited_ms % 2000 == 0 {
+            let _ = request_existing_instance_quit();
+        }
+    }
 }
 
 fn install_panic_hook() {

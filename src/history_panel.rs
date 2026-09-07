@@ -18,7 +18,9 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::history::{self, HistoryRecord};
-use crate::web_ui::{escape_html, open_browser_hidden, validate_loopback_request, write_response};
+use crate::web_ui::{
+    escape_html, open_browser_hidden, request_method, validate_loopback_request, write_response,
+};
 
 #[derive(Clone)]
 pub struct HistoryPanelController {
@@ -196,6 +198,25 @@ fn handle_client(mut stream: TcpStream, history_path: &Path) -> Result<()> {
         }
         _ if path.starts_with("/open-folder") => {
             open_folder(history_path);
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                br#"{"ok":true}"#,
+            )?;
+        }
+        "/api/clear" => {
+            if request_method(first_line) != "POST" {
+                write_response(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "text/plain; charset=utf-8",
+                    b"method not allowed",
+                )?;
+                return Ok(());
+            }
+            history::clear(history_path)
+                .with_context(|| format!("clear history {}", history_path.display()))?;
             write_response(
                 &mut stream,
                 "200 OK",
@@ -487,6 +508,7 @@ fn render_html_page(path: &Path, records: &[HistoryRecord]) -> String {
     <button type="button" onclick="location.reload()">刷新</button>
     <button type="button" onclick="openFolder()">打开存档目录</button>
     <a class="btn" href="/api/history.json" target="_blank" rel="noreferrer">原始 JSON</a>
+    <button type="button" onclick="clearHistory()" style="border-color:#6e3a3a;color:#e06c75">清空全部</button>
   </div>
 </header>
 <main>
@@ -497,6 +519,15 @@ fn render_html_page(path: &Path, records: &[HistoryRecord]) -> String {
 async function openFolder() {{
   try {{
     await fetch('/open-folder');
+  }} catch (e) {{
+    console.warn(e);
+  }}
+}}
+async function clearHistory() {{
+  if (!confirm('确定清空全部听写历史？此操作不可恢复。')) return;
+  try {{
+    const r = await fetch('/api/clear', {{ method: 'POST' }});
+    if (r.ok) location.reload();
   }} catch (e) {{
     console.warn(e);
   }}

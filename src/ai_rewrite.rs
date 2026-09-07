@@ -293,8 +293,10 @@ impl AiRewriter {
                     // FIX-2: 模型返回空内容（HTTP 成功但 candidate 为 None）时
                     // 不提前 return，继续尝试下一个 fallback 模型；
                     // 仅拿到有效候选才选中并返回。
+                    // 无论是否有改动，都记录本次成功响应的模型，避免 nochange 时
+                    // trace.selected_model 为空、历史面板误显示「模型:(未记)」。
+                    trace.selected_model = model.clone();
                     if let Some(candidate) = candidate {
-                        trace.selected_model = model;
                         trace.output = Some(candidate);
                         trace.elapsed_ms = started.elapsed().as_millis();
                         return trace;
