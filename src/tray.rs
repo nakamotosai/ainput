@@ -1054,7 +1054,7 @@ fn set_funasr_gguf_backend() {
             Ok(()) => {
                 state.current_engine = ENGINE.to_string();
                 state.hud.show_text(
-                    "识别引擎已切换：FunASR-GGUF\n边车未就绪时自动回退本地，不用重启",
+                    "识别引擎已切换：FunASR-GGUF\n先跑 scripts/start_gguf_sidecar.ps1 起边车\n边车没起会如实报错，不用重启",
                     false,
                     false,
                 );
@@ -1089,7 +1089,7 @@ fn set_nim_whisper_backend() {
                 state.current_engine = ENGINE.to_string();
                 let endpoint = state.nim_config.endpoint_url.clone();
                 state.hud.show_text(
-                    &format!("识别引擎已切换：Whisper云端\n{endpoint}\n连不上自动回退本地，不用重启"),
+                    &format!("识别引擎已切换：Whisper云端\n{endpoint}\n连不上会如实报错（需本地 NIM 容器或云授权），不用重启"),
                     false,
                     false,
                 );

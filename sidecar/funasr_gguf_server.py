@@ -77,6 +77,9 @@ def model_status():
     for name in (REQUIRED_GGUF, REQUIRED_TOKENS):
         if not os.path.exists(os.path.join(MODEL_DIR, name)):
             missing.append(name)
+    return missing
+
+
 _engine = None
 _engine_error = "not initialized"
 _engine_lock = threading.Lock()
