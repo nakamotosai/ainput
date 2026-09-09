@@ -76,6 +76,7 @@ const MENU_ENGINE_QWEN3: usize = 3002;
 const MENU_ENGINE_FUNASR_NANO: usize = 3003;
 const MENU_ENGINE_FUNASR_GGUF: usize = 3004;
 const MENU_ENGINE_PARAFORMER_STREAMING: usize = 3005;
+const MENU_ENGINE_WHISPER_TURBO: usize = 3007;
 // 2026-09-10 云端档收起：编号保留，Docker 回归时恢复菜单。
 #[allow(dead_code)]
 const MENU_ENGINE_NIM_WHISPER: usize = 3006;
@@ -110,6 +111,7 @@ impl Tray {
         paraformer_config: crate::config::ParaformerStreamingConfig,
         gguf_config: crate::config::FunasrGgufConfig,
         nim_config: crate::config::NimWhisperConfig,
+        turbo_config: crate::config::WhisperTurboConfig,
         api_notifications: mpsc::Receiver<String>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -141,6 +143,7 @@ impl Tray {
                     paraformer_config,
                     gguf_config,
                     nim_config,
+                    turbo_config,
                     switching: Arc::new(AtomicBool::new(false)),
                     shutdown,
                 });
@@ -198,6 +201,7 @@ struct TrayState {
     paraformer_config: crate::config::ParaformerStreamingConfig,
     gguf_config: crate::config::FunasrGgufConfig,
     nim_config: crate::config::NimWhisperConfig,
+    turbo_config: crate::config::WhisperTurboConfig,
     switching: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
@@ -368,6 +372,9 @@ fn normalize_engine_key(engine: &str) -> String {
         "nim-whisper" | "nim_whisper" | "whisper-nim" | "whisper-large-v3" | "whisper_cloud" => {
             "nim-whisper".to_string()
         }
+        "whisper-turbo" | "whisper_turbo" | "turbo" | "whisper-turbo-streaming" => {
+            "whisper-turbo".to_string()
+        }
         "sense-voice" | "sense_voice" | "sensevoice" | "" => "sense-voice".to_string(),
         _ => lowered,
     }
@@ -380,6 +387,7 @@ fn engine_display_name(engine: &str) -> &'static str {
         "funasr-gguf" => "FunASR-GGUF",
         "paraformer-streaming" => "Paraformer流式",
         "nim-whisper" => "Whisper云端",
+        "whisper-turbo" => "Whisper-Turbo",
         _ => "SenseVoice",
     }
 }
@@ -712,6 +720,17 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             "Paraformer流式（边说边出）",
         );
         // 2026-09-10 云端档收起：hosted 语音已下架，入口隐藏（Docker 回归时恢复）。
+        append_menu_text(
+            menu,
+            engine_flag
+                | if normalize_engine_key(&current_engine) == "whisper-turbo" {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                },
+            MENU_ENGINE_WHISPER_TURBO,
+            "Whisper-Turbo（显卡流式）",
+        );
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
@@ -752,6 +771,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_VOICE_COMMAND_EDIT => open_voice_command_panel(),
             MENU_HOTKEY_EDIT => open_hotkey_panel(),
             MENU_ENGINE_SENSE_VOICE => set_local_engine("sense-voice", "models/sense-voice"),
+            MENU_ENGINE_WHISPER_TURBO => set_whisper_turbo_backend(),
             MENU_ENGINE_QWEN3 => set_local_engine("qwen3-asr", "models/qwen3-asr"),
             MENU_ENGINE_FUNASR_GGUF => set_funasr_gguf_backend(),
             MENU_ENGINE_PARAFORMER_STREAMING => set_paraformer_backend(),
@@ -1066,6 +1086,44 @@ fn set_funasr_gguf_backend() {
             Err(error) => {
                 state.hud.show_text(&format!("切换失败：{error}"), false, false);
                 warn!(error = %error, engine = ENGINE, "failed to persist gguf switch");
+            }
+        }
+    });
+}
+
+fn set_whisper_turbo_backend() {
+    const ENGINE: &str = "whisper-turbo";
+    const MODEL_DIR: &str = "models/whisper-turbo";
+    TRAY_STATE.with(|state| {
+        let mut state_cell = state.borrow_mut();
+        let Some(state) = state_cell.as_mut() else {
+            return;
+        };
+        if state.switching.load(Ordering::Relaxed) {
+            state.hud.show_text("正在切换引擎，请稍等完成", false, false);
+            return;
+        }
+        if normalize_engine_key(&state.current_engine) == ENGINE {
+            state.hud.show_text("识别引擎已是：whisper-turbo", true, false);
+            return;
+        }
+        match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
+            Ok(()) => {
+                state.current_engine = ENGINE.to_string();
+                if let Ok(mut live) = state.shared_engine.lock() {
+                    *live = ENGINE.to_string();
+                }
+                let endpoint = state.turbo_config.endpoint_url.clone();
+                state.hud.show_text(
+                    &format!("识别引擎已切换：Whisper-Turbo（显卡流式）\n{endpoint}\n先跑 scripts/start_turbo_sidecar.ps1 起边车\n边车没起会如实报错，不用重启"),
+                    true,
+                    false,
+                );
+                info!(engine = ENGINE, config_path = %state.config_path.display(), "whisper-turbo switch from tray");
+            }
+            Err(error) => {
+                state.hud.show_text(&format!("切换失败：{error}"), false, false);
+                warn!(error = %error, engine = ENGINE, "failed to persist turbo switch");
             }
         }
     });

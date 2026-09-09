@@ -32,6 +32,7 @@ mod tray;
 mod voice_command;
 mod voice_command_panel;
 mod web_ui;
+mod whisper_turbo;
 mod worker;
 
 use std::path::PathBuf;
@@ -336,6 +337,7 @@ fn run_app() -> Result<()> {
         config.paraformer_streaming.clone(),
         config.funasr_gguf.clone(),
         config.nim_whisper.clone(),
+        config.whisper_turbo.clone(),
         api_notification_rx,
         Arc::clone(&shutdown),
     )

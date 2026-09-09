@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ainput"
-version = "0.1.10-preview"
+version = "0.1.11-preview"
 dependencies = [
  "anyhow",
  "arboard",

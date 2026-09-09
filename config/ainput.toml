@@ -92,6 +92,14 @@ api_key = ""
 min_audio_ms = 800
 min_rms_dbfs = -56.0
 
+[whisper_turbo]
+enabled = false
+endpoint_url = "http://127.0.0.1:8766"
+model = "turbo"
+sample_rate_hz = 16000
+append_timeout_ms = 15000
+finish_timeout_ms = 60000
+
 [rewrite]
 enabled = false
 streaming_enabled = false

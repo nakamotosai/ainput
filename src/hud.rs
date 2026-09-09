@@ -55,6 +55,9 @@ const METER_WIDTH_PX: i32 = 160;
 const METER_HEIGHT_PX: i32 = 160;
 /// Sit clearly above the taskbar (work-area bottom margin).
 const METER_BOTTOM_MARGIN_PX: i32 = 56;
+/// Text HUD with a taskbar anchor docks above the taskbar strip (2026-09-10:
+/// 不再居中压进条带里，否则被任务栏挡住）。
+const HUD_TASKBAR_LIFT_PX: i32 = 12;
 const METER_BOUNCE_AMP_PX: f32 = 28.0;
 /// Exit bounce duration (pop back down, mirror of enter spring).
 const METER_EXIT_DUR_SEC: f32 = 0.42;
@@ -1511,7 +1514,7 @@ impl HudWindow {
             HudAnchor::TaskbarRight => layout_area.right - hud_width - HUD_SCREEN_MARGIN_PX,
         };
         let base_y = if is_taskbar_anchor(self.style.anchor) {
-            layout_area.top + ((area_height - hud_height) / 2)
+            layout_area.top - hud_height - HUD_TASKBAR_LIFT_PX
         } else {
             layout_area.bottom - hud_height - HUD_SCREEN_MARGIN_PX
         };

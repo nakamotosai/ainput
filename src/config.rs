@@ -20,6 +20,7 @@ pub struct AppConfig {
     pub funasr_gguf: FunasrGgufConfig,
     pub paraformer_streaming: ParaformerStreamingConfig,
     pub nim_whisper: NimWhisperConfig,
+    pub whisper_turbo: WhisperTurboConfig,
     pub rewrite: RewriteConfig,
     #[serde(default = "RewriteConfig::prompt_studio_default")]
     pub prompt_studio: RewriteConfig,
@@ -146,6 +147,16 @@ pub struct NimWhisperConfig {
     pub api_key: String,
     pub min_audio_ms: u64,
     pub min_rms_dbfs: f32,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WhisperTurboConfig {
+    pub enabled: bool,
+    pub endpoint_url: String,
+    pub model: String,
+    pub sample_rate_hz: u32,
+    pub append_timeout_ms: u64,
+    pub finish_timeout_ms: u64,
 }
 
 #[allow(dead_code)]
@@ -801,6 +812,7 @@ impl Default for AppConfig {
             funasr_gguf: FunasrGgufConfig::default(),
             paraformer_streaming: ParaformerStreamingConfig::default(),
             nim_whisper: NimWhisperConfig::default(),
+            whisper_turbo: WhisperTurboConfig::default(),
             rewrite: RewriteConfig::default(),
             prompt_studio: RewriteConfig::prompt_studio_default(),
             suspect_terms: SuspectTermsConfig::default(),
@@ -973,6 +985,18 @@ impl Default for NimWhisperConfig {
             api_key: String::new(),
             min_audio_ms: 800,
             min_rms_dbfs: -56.0,
+        }
+    }
+}
+impl Default for WhisperTurboConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint_url: "http://127.0.0.1:8766".to_string(),
+            model: "turbo".to_string(),
+            sample_rate_hz: 16_000,
+            append_timeout_ms: 15_000,
+            finish_timeout_ms: 60_000,
         }
     }
 }

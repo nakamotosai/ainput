@@ -1555,6 +1555,122 @@ impl VoiceWorker {
         }
     }
 
+    ///显卡 turbo 流式：会话式边车，500ms 一块往上送，stable+provisional 回来就上屏；
+    ///松开收尾调 finish 定稿。边车没起 → start_session 直接 Err，如实报错。
+    #[allow(clippy::too_many_arguments)]
+    fn run_turbo_live_loop(
+        &self,
+        hotkey_rx: &mpsc::Receiver<HotkeyEvent>,
+        audio_rx: &mpsc::Receiver<Vec<f32>>,
+        resampler: &mut LinearResampler,
+        samples: &mut Vec<f32>,
+        sample_rate_hz: u32,
+        profile_id: VoiceProfileId,
+        utterance_id: &str,
+    ) -> Result<(bool, String, PathBuf, u128)> {
+        let started = Instant::now();
+        let cancelled = (false, String::new(), PathBuf::new(), 0u128);
+        let client = crate::whisper_turbo::TurboClient::new(&self.config.whisper_turbo)
+            .context("whisper-turbo sidecar not configured")?;
+        let session_id = client.start_session()?;
+        let root = PathBuf::from("models/whisper-turbo");
+        let mut last_shown = String::new();
+        // 500ms 攒一块再送：边车 0.5 秒新音频才重算，送太碎只是多跑 HTTP。
+        let tick_samples = (sample_rate_hz.max(1) as usize / 2).max(800);
+        let mut pending = Vec::<f32>::new();
+        let release_grace_ms = self.config.local_nonstreaming.release_grace_ms;
+        let finish_now = |client: &crate::whisper_turbo::TurboClient,
+                          session_id: &str,
+                          last_shown: &str,
+                          started: Instant,
+                          root: PathBuf|
+         -> Result<(bool, String, PathBuf, u128)> {
+            let text = client.finish(session_id)?;
+            let text = if text.trim().is_empty() {
+                last_shown.to_string()
+            } else {
+                text
+            };
+            let elapsed_ms = started.elapsed().as_millis();
+            info!(
+                utterance_id,
+                engine = "whisper-turbo",
+                transcribe_ms = elapsed_ms,
+                "turbo live loop finalized on release"
+            );
+            Ok((true, text, root, elapsed_ms))
+        };
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                client.cancel(&session_id);
+                return Ok(cancelled);
+            }
+            let mut released_now = false;
+            while let Ok(event) = hotkey_rx.try_recv() {
+                let HotkeyEvent::Voice(voice_event) = event;
+                if voice_event.profile_id == profile_id
+                    && voice_event.phase == TriggerPhase::Released
+                {
+                    released_now = true;
+                    break;
+                }
+            }
+            if released_now {
+                // 松开：尾巴收完（同 release_grace_ms），整包送 finish 定稿。
+                let deadline = Instant::now() + Duration::from_millis(release_grace_ms);
+                while Instant::now() < deadline {
+                    match audio_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(chunk) => {
+                            resampler.push(&chunk);
+                            let available = resampler.take_available();
+                            samples.extend_from_slice(&available);
+                            pending.extend_from_slice(&available);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                while let Ok(chunk) = audio_rx.try_recv() {
+                    resampler.push(&chunk);
+                }
+                let available = resampler.take_available();
+                samples.extend_from_slice(&available);
+                pending.extend_from_slice(&available);
+                if !pending.is_empty() {
+                    let (stable, provisional) = client.append(&session_id, &pending)?;
+                    let shown = format!("{stable}{provisional}");
+                    if !shown.trim().is_empty() {
+                        last_shown = shown.clone();
+                        self.hud.show_text(&shown, true, false);
+                    }
+                }
+                return finish_now(&client, &session_id, &last_shown, started, root);
+            }
+            match audio_rx.recv_timeout(Duration::from_millis(12)) {
+                Ok(chunk) => {
+                    resampler.push(&chunk);
+                    let available = resampler.take_available();
+                    samples.extend_from_slice(&available);
+                    pending.extend_from_slice(&available);
+                    if pending.len() >= tick_samples {
+                        let batch: Vec<f32> = std::mem::take(&mut pending);
+                        let (stable, provisional) = client.append(&session_id, &batch)?;
+                        let shown = format!("{stable}{provisional}");
+                        if !shown.trim().is_empty() && shown != last_shown {
+                            last_shown = shown.clone();
+                            self.hud.show_text(&shown, true, false);
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    warn!("resident microphone subscription disconnected during turbo live session");
+                    return finish_now(&client, &session_id, &last_shown, started, root);
+                }
+            }
+        }
+    }
+
     fn run_local_nonstreaming_session(
         &self,
         hotkey_rx: &mpsc::Receiver<HotkeyEvent>,
@@ -1600,13 +1716,33 @@ impl VoiceWorker {
 
         // 2026-09-10 真实时：paraformer 且槽位有模型 → 按住即解（live 循环）；
         // 槽位空（刚切过来还在加载）走老路，分发处会如实报错。
-        let paraformer_live = (engine_key == "paraformer-streaming" || engine_key == "paraformer")
+        // 2026-09-10 turbo：显卡边车会话式流式，无槽位，边车没起则如实报错。
+        let turbo_live =
+            engine_key == "whisper-turbo" || engine_key == "whisper_turbo";
+        let paraformer_live = !turbo_live
+            && (engine_key == "paraformer-streaming" || engine_key == "paraformer")
             && self
                 .shared_paraformer
                 .lock()
                 .map(|guard| guard.is_some())
                 .unwrap_or(false);
-        let live_outcome: Option<(String, PathBuf, u128)> = if paraformer_live {
+        let live_outcome: Option<(String, PathBuf, u128)> = if turbo_live {
+            self.hud.show_text("聆听中…", true, false);
+            let (released, text, root, elapsed_ms) = self.run_turbo_live_loop(
+                hotkey_rx,
+                &audio.rx,
+                &mut resampler,
+                &mut samples,
+                sample_rate_hz,
+                profile_id,
+                &utterance_id,
+            )?;
+            if !released {
+                self.hud.clear();
+                return Ok(());
+            }
+            Some((text, root, elapsed_ms))
+        } else if paraformer_live {
             self.hud.show_text("聆听中…", true, false);
             let (released, text, root, elapsed_ms) = self.run_paraformer_live_loop(
                 hotkey_rx,

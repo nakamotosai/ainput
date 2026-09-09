@@ -321,18 +321,25 @@ mod tests {
         let block = (sample_rate_hz.max(1) as usize / 10).max(1);
         let stream = recognizer.create_live_stream();
         let mut saw_partial = false;
+        let mut first_partial_at_audio_ms = 0u64;
+        let mut fed = 0usize;
         let mut offset = 0usize;
         while offset < samples.len() {
             let end = (offset + block).min(samples.len());
+            fed = end;
             let partial =
                 recognizer.accept_live_audio(&stream, sample_rate_hz, &samples[offset..end]);
             if !partial.trim().is_empty() {
-                saw_partial = true;
+                if !saw_partial {
+                    saw_partial = true;
+                    first_partial_at_audio_ms =
+                        (fed as u64 * 1000) / sample_rate_hz.max(1) as u64;
+                }
             }
             offset = end;
         }
         let final_text = recognizer.finish_live_audio(&stream);
-        eprintln!("live saw_partial={saw_partial} final={final_text:?}");
+        eprintln!("live saw_partial={saw_partial} first_partial_at_audio_ms={first_partial_at_audio_ms} final={final_text:?}");
         assert!(saw_partial, "no partial hypothesis during live feed");
         assert!(!final_text.trim().is_empty(), "empty final transcription");
     }
