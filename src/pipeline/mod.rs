@@ -313,6 +313,8 @@ pub struct VoiceWorker {
         Arc<Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>>,
     ///托盘切换的活线：分发每句读它，不读启动快照（2026-09-10 真切换修复）。
     shared_engine: Arc<Mutex<String>>,
+    ///Turbo直贴实验活线：托盘开关，句读它（默认关）。
+    shared_turbo_direct: Arc<AtomicBool>,
     asr_sessions: AsrSessionPool,
     modes: ModeStore,
     audio: AudioHub,
@@ -336,6 +338,7 @@ impl VoiceWorker {
             Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>,
         >,
         shared_engine: Arc<Mutex<String>>,
+        shared_turbo_direct: Arc<AtomicBool>,
         asr_sessions: AsrSessionPool,
         modes: ModeStore,
         audio: AudioHub,
@@ -355,6 +358,7 @@ impl VoiceWorker {
             local_recognizer,
             shared_paraformer,
             shared_engine,
+            shared_turbo_direct,
             asr_sessions,
             modes,
             audio,
@@ -1567,24 +1571,44 @@ impl VoiceWorker {
         sample_rate_hz: u32,
         profile_id: VoiceProfileId,
         utterance_id: &str,
-    ) -> Result<(bool, String, PathBuf, u128)> {
+        direct_wanted: bool,
+    ) -> Result<crate::turbo_direct::TurboLiveResult> {
+        use crate::turbo_direct::{DirectSession, TickOutcome, TurboLiveResult};
         let started = Instant::now();
-        let cancelled = (false, String::new(), PathBuf::new(), 0u128);
         let client = crate::whisper_turbo::TurboClient::new(&self.config.whisper_turbo)
             .context("whisper-turbo sidecar not configured")?;
         let session_id = client.start_session()?;
         let root = PathBuf::from("models/whisper-turbo");
         let mut last_shown = String::new();
+        // 直贴实验：开关开着才试；目标不合适 begin 直接回 None，老路不变。
+        let mut direct: Option<DirectSession> =
+            if direct_wanted && self.shared_turbo_direct.load(Ordering::Relaxed) {
+                DirectSession::begin(
+                    &self.config.output.rewrite_terminal_allowlist,
+                    &self.config.output,
+                    utterance_id,
+                )
+            } else {
+                None
+            };
+        if direct.is_some() {
+            // 隐身：只留无字呼吸灯，不弹字。
+            self.hud.show_meter_listening();
+        } else {
+            self.hud.show_text("聆听中…", true, false);
+        }
         // 500ms 攒一块再送：边车 0.5 秒新音频才重算，送太碎只是多跑 HTTP。
         let tick_samples = (sample_rate_hz.max(1) as usize / 2).max(800);
         let mut pending = Vec::<f32>::new();
         let release_grace_ms = self.config.local_nonstreaming.release_grace_ms;
+        // 句中显示走下面的 show_turbo_hypothesis 方法（直贴只喂 stable）。
         let finish_now = |client: &crate::whisper_turbo::TurboClient,
                           session_id: &str,
                           last_shown: &str,
                           started: Instant,
-                          root: PathBuf|
-         -> Result<(bool, String, PathBuf, u128)> {
+                          root: PathBuf,
+                          direct: Option<DirectSession>|
+         -> Result<TurboLiveResult> {
             let text = client.finish(session_id)?;
             let text = if text.trim().is_empty() {
                 last_shown.to_string()
@@ -1598,12 +1622,32 @@ impl VoiceWorker {
                 transcribe_ms = elapsed_ms,
                 "turbo live loop finalized on release"
             );
-            Ok((true, text, root, elapsed_ms))
+            Ok(TurboLiveResult {
+                released: true,
+                text,
+                root,
+                elapsed_ms,
+                direct,
+            })
         };
         loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 client.cancel(&session_id);
-                return Ok(cancelled);
+                if let Some(session) = direct.as_ref() {
+                    // 退出时不玩 replace（可能惊扰用户）：如实记一笔，字留文档里。
+                    warn!(
+                        utterance_id,
+                        committed = %session.committed(),
+                        "turbo直贴实验：关机取消，已贴片段留在文档"
+                    );
+                }
+                return Ok(TurboLiveResult {
+                    released: false,
+                    text: String::new(),
+                    root: PathBuf::new(),
+                    elapsed_ms: 0,
+                    direct: None,
+                });
             }
             let mut released_now = false;
             while let Ok(event) = hotkey_rx.try_recv() {
@@ -1640,11 +1684,10 @@ impl VoiceWorker {
                     let (stable, provisional) = client.append(&session_id, &pending)?;
                     let shown = format!("{stable}{provisional}");
                     if !shown.trim().is_empty() {
-                        last_shown = shown.clone();
-                        self.hud.show_text(&shown, true, false);
+                        self.show_turbo_hypothesis(&mut direct, &mut last_shown, &shown, &stable);
                     }
                 }
-                return finish_now(&client, &session_id, &last_shown, started, root);
+                return finish_now(&client, &session_id, &last_shown, started, root, direct.take());
             }
             match audio_rx.recv_timeout(Duration::from_millis(12)) {
                 Ok(chunk) => {
@@ -1657,16 +1700,111 @@ impl VoiceWorker {
                         let (stable, provisional) = client.append(&session_id, &batch)?;
                         let shown = format!("{stable}{provisional}");
                         if !shown.trim().is_empty() && shown != last_shown {
-                            last_shown = shown.clone();
-                            self.hud.show_text(&shown, true, false);
+                            self.show_turbo_hypothesis(&mut direct, &mut last_shown, &shown, &stable);
                         }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     warn!("resident microphone subscription disconnected during turbo live session");
-                    return finish_now(&client, &session_id, &last_shown, started, root);
+                    return finish_now(&client, &session_id, &last_shown, started, root, direct.take());
                 }
+            }
+        }
+    }
+
+    /// 句中显示：直贴会话只喂 stable（定稿区），provisional 草稿不落盘；
+    /// 直贴停手后才弹 HUD，老路直接上屏。
+    fn show_turbo_hypothesis(
+        &self,
+        direct: &mut Option<crate::turbo_direct::DirectSession>,
+        last_shown: &mut String,
+        shown: &str,
+        stable: &str,
+    ) {
+        use crate::turbo_direct::TickOutcome;
+        *last_shown = shown.to_string();
+        if let Some(session) = direct.as_mut() {
+            let stable_prepared = prepare_asr_text(stable);
+            match session.offer_stable(&stable_prepared, shown) {
+                TickOutcome::Advanced | TickOutcome::Unchanged => {}
+                TickOutcome::Aborted { fallback, .. } => {
+                    self.hud.show_text(&fallback, true, false);
+                }
+            }
+        } else {
+            self.hud.show_text(shown, true, false);
+        }
+    }
+
+    /// Turbo直贴收尾：句中已落盘，这里只对账。返回 true=已处理，false=一个字没贴上，调用方走老路。
+    #[allow(clippy::too_many_arguments)]
+    fn finish_turbo_direct_if_inserted(
+        &self,
+        utterance_id: &str,
+        profile_id: VoiceProfileId,
+        raw_text: &str,
+        direct: crate::turbo_direct::DirectSession,
+        audio_ms: u64,
+        asr_elapsed_ms: u128,
+        started_at: Instant,
+    ) -> Result<bool> {
+        use crate::turbo_direct::ReconcileOutcome;
+        let raw_finalized =
+            finalize_asr_text_for_paste_for_language(raw_text, RewriteOutputLanguage::Chinese);
+        let final_paste = raw_finalized.text.clone();
+        match direct.reconcile(&final_paste, &self.config.output, utterance_id) {
+            ReconcileOutcome::NothingInserted => Ok(false),
+            ReconcileOutcome::Reconciled { pasted } => {
+                let summary = direct.target_summary();
+                let mut record =
+                    HistoryRecord::new(utterance_id, profile_id.as_str(), "local_nonstreaming");
+                record.raw_text = raw_text.to_string();
+                record.finalized_text = raw_finalized.text.clone();
+                record.pasted_text = pasted.clone();
+                record.target_process = summary.process_name.clone();
+                record.target_class = summary.class_name.clone();
+                record.target_title = summary.title.clone();
+                record.target_context_source = direct.target_context_source().to_string();
+                record.target_right_context = direct.target_right_context().as_str().to_string();
+                record.finalizer_actions = raw_finalized.actions.clone();
+                record.output_actions = "turbo_direct_paste".to_string();
+                record.audio_ms = audio_ms;
+                record.asr_elapsed_ms = asr_elapsed_ms;
+                record.total_elapsed_ms = started_at.elapsed().as_millis();
+                record.skipped_reason = "turbo_direct_insert_reconciled".to_string();
+                self.history.record(record);
+                self.hud.clear();
+                info!(
+                    utterance_id,
+                    audio_ms,
+                    text = %short_text(&pasted, 500),
+                    transcribe_ms = asr_elapsed_ms,
+                    total_elapsed_ms = started_at.elapsed().as_millis(),
+                    mode = "local_nonstreaming",
+                    "turbo直贴实验：松开对账成功，无HUD"
+                );
+                Ok(true)
+            }
+            ReconcileOutcome::Failed { fallback, reason } => {
+                // 对账失败不再整段粘贴（会复读已贴片段）：HUD 兜底显示定稿，历史记错。
+                let mut record =
+                    HistoryRecord::new(utterance_id, profile_id.as_str(), "local_nonstreaming");
+                record.raw_text = raw_text.to_string();
+                record.finalized_text = raw_finalized.text.clone();
+                record.finalizer_actions = raw_finalized.actions.clone();
+                record.audio_ms = audio_ms;
+                record.asr_elapsed_ms = asr_elapsed_ms;
+                record.total_elapsed_ms = started_at.elapsed().as_millis();
+                record.error = format!("turbo_direct_reconcile_failed:{reason}");
+                self.history.record(record);
+                self.hud.show_text(&fallback, false, false);
+                warn!(
+                    utterance_id,
+                    reason,
+                    "turbo直贴实验：对账失败，文档留stable片段，HUD兜底"
+                );
+                Ok(true)
             }
         }
     }
@@ -1726,9 +1864,20 @@ impl VoiceWorker {
                 .lock()
                 .map(|guard| guard.is_some())
                 .unwrap_or(false);
-        let live_outcome: Option<(String, PathBuf, u128)> = if turbo_live {
-            self.hud.show_text("聆听中…", true, false);
-            let (released, text, root, elapsed_ms) = self.run_turbo_live_loop(
+        // Turbo直贴实验只在“改写关 + 调试面板关 + 语音指令关”时试：
+        // 改写会改字、指令不落字，都跟“句中落盘”犯冲，直接走 HUD 老路。
+        let direct_wanted = turbo_live
+            && !self.rewrite_language.rewrite_enabled()
+            && !self.debug_panel.is_enabled()
+            && !self.voice_command.enabled();
+        let live_outcome: Option<(
+            String,
+            PathBuf,
+            u128,
+            Option<crate::turbo_direct::DirectSession>,
+        )> = if turbo_live {
+            // “聆听中…”由循环里按直贴与否自己决定（直贴隐身，只留呼吸灯）。
+            let outcome = self.run_turbo_live_loop(
                 hotkey_rx,
                 &audio.rx,
                 &mut resampler,
@@ -1736,12 +1885,13 @@ impl VoiceWorker {
                 sample_rate_hz,
                 profile_id,
                 &utterance_id,
+                direct_wanted,
             )?;
-            if !released {
+            if !outcome.released {
                 self.hud.clear();
                 return Ok(());
             }
-            Some((text, root, elapsed_ms))
+            Some((outcome.text, outcome.root, outcome.elapsed_ms, outcome.direct))
         } else if paraformer_live {
             self.hud.show_text("聆听中…", true, false);
             let (released, text, root, elapsed_ms) = self.run_paraformer_live_loop(
@@ -1757,7 +1907,7 @@ impl VoiceWorker {
                 self.hud.clear();
                 return Ok(());
             }
-            Some((text, root, elapsed_ms))
+            Some((text, root, elapsed_ms, None))
         } else {
             None
         };
@@ -1818,9 +1968,13 @@ impl VoiceWorker {
 
         // 分发：live_outcome 有值 = 刚才 live 循环已出终句，直接用；
         // 否则按 engine 走各后端（paraformer 老路=整段模拟流式，作托盘切换中途的兜底）。
-        let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) =
-            if let Some((text, root, elapsed_ms)) = live_outcome {
-                (text, root, elapsed_ms)
+        let (backend_text, backend_model_root, asr_elapsed_ms, turbo_direct_session): (
+            String,
+            PathBuf,
+            u128,
+            Option<crate::turbo_direct::DirectSession>,
+        ) = if let Some((text, root, elapsed_ms, direct)) = live_outcome {
+            (text, root, elapsed_ms, direct)
             } else if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
                 let chunk_ms = self.config.paraformer_streaming.chunk_ms;
                 let guard = self
@@ -1838,7 +1992,7 @@ impl VoiceWorker {
                     })
                     .context("transcribe with paraformer-streaming")?;
                 let root = recognizer.root_dir().to_path_buf();
-                (text, root, transcribe_started.elapsed().as_millis())
+                (text, root, transcribe_started.elapsed().as_millis(), None)
             } else if engine_key == "funasr-gguf" || engine_key == "funasr_gguf" {
                 let client = crate::funasr_gguf::GgufClient::new(&self.config.funasr_gguf)
                     .context("funasr-gguf sidecar not configured")?;
@@ -1847,7 +2001,7 @@ impl VoiceWorker {
                     .transcribe(sample_rate_hz, &samples)
                     .context("transcribe with funasr-gguf sidecar (边车没起？先跑 sidecar/funasr_gguf_server.py)")?;
                 let root = PathBuf::from(&self.config.funasr_gguf.model_dir);
-                (text, root, transcribe_started.elapsed().as_millis())
+                (text, root, transcribe_started.elapsed().as_millis(), None)
             } else if engine_key == "nim-whisper" || engine_key == "nim_whisper" {
                 let client = crate::nim_whisper::NimWhisperClient::new(&self.config.nim_whisper)
                     .context("nim-whisper not configured")?;
@@ -1856,7 +2010,7 @@ impl VoiceWorker {
                     .transcribe(sample_rate_hz, &samples)
                     .context("transcribe with NIM whisper (服务没起或密钥不对？)")?;
                 let root = PathBuf::from(&self.config.nim_whisper.endpoint_url);
-                (text, root, transcribe_started.elapsed().as_millis())
+                (text, root, transcribe_started.elapsed().as_millis(), None)
             } else {
                 let guard = self
                     .local_recognizer
@@ -1870,7 +2024,7 @@ impl VoiceWorker {
                     .transcribe_samples(sample_rate_hz, &samples)
                     .context("transcribe with local SenseVoice")?;
                 let root = response.model_root.clone();
-                (response.text, root, transcribe_started.elapsed().as_millis())
+                (response.text, root, transcribe_started.elapsed().as_millis(), None)
             };
         info!(
             engine = %engine_key,
@@ -1884,6 +2038,22 @@ impl VoiceWorker {
             model_root: backend_model_root,
         };
         let mut raw_text = prepare_asr_text(&response.text);
+        // Turbo直贴实验：句中已增量落盘，这里只做收尾对账，不再整段粘贴。
+        // （语音指令/改写开着时 direct_wanted 本来就是 false，到不了这里。）
+        if let Some(direct_session) = turbo_direct_session {
+            if self.finish_turbo_direct_if_inserted(
+                &utterance_id,
+                profile_id,
+                &raw_text,
+                direct_session,
+                audio_ms,
+                asr_elapsed_ms,
+                started_at,
+            )? {
+                return Ok(());
+            }
+            // 句中一个字都没贴上：掉回老路，整段粘贴。
+        }
         let output_language = self.rewrite_language.current();
         let rewrite_enabled = self.rewrite_language.rewrite_enabled();
 

@@ -29,6 +29,7 @@ mod rewrite_prompt_panel;
 mod suspect_terms;
 mod term_embeddings;
 mod tray;
+mod turbo_direct;
 mod voice_command;
 mod voice_command_panel;
 mod web_ui;
@@ -280,6 +281,9 @@ fn run_app() -> Result<()> {
     // paraformer-streaming 走独立在线识别槽 shared_paraformer；
     // gguf/nim 是 HTTP 后端（每次转写现建客户端），失败直接报错、不回退；
     // 非本地三引擎时槽里放 SenseVoice，保证老链路不断（不是给 gguf/nim 兜底）。
+    // Turbo直贴实验活线：托盘开关 ↔ worker 句读它，默认关。
+    let shared_turbo_direct: Arc<AtomicBool> =
+        Arc::new(AtomicBool::new(config.whisper_turbo.direct_paste_experiment));
     let shared_engine: Arc<Mutex<String>> =
         Arc::new(Mutex::new(config.local_nonstreaming.engine.clone()));
     let engine_key = config.local_nonstreaming.engine.trim().to_ascii_lowercase();
@@ -338,6 +342,7 @@ fn run_app() -> Result<()> {
         config.funasr_gguf.clone(),
         config.nim_whisper.clone(),
         config.whisper_turbo.clone(),
+        Arc::clone(&shared_turbo_direct),
         api_notification_rx,
         Arc::clone(&shutdown),
     )
@@ -384,6 +389,7 @@ fn run_app() -> Result<()> {
         Arc::clone(&shared_recognizer),
         Arc::clone(&shared_paraformer),
         Arc::clone(&shared_engine),
+        Arc::clone(&shared_turbo_direct),
         asr_sessions,
         modes,
         audio,

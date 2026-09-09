@@ -77,6 +77,7 @@ const MENU_ENGINE_FUNASR_NANO: usize = 3003;
 const MENU_ENGINE_FUNASR_GGUF: usize = 3004;
 const MENU_ENGINE_PARAFORMER_STREAMING: usize = 3005;
 const MENU_ENGINE_WHISPER_TURBO: usize = 3007;
+const MENU_TURBO_DIRECT_PASTE: usize = 3008;
 // 2026-09-10 云端档收起：编号保留，Docker 回归时恢复菜单。
 #[allow(dead_code)]
 const MENU_ENGINE_NIM_WHISPER: usize = 3006;
@@ -112,6 +113,7 @@ impl Tray {
         gguf_config: crate::config::FunasrGgufConfig,
         nim_config: crate::config::NimWhisperConfig,
         turbo_config: crate::config::WhisperTurboConfig,
+        shared_turbo_direct: Arc<AtomicBool>,
         api_notifications: mpsc::Receiver<String>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -144,6 +146,7 @@ impl Tray {
                     gguf_config,
                     nim_config,
                     turbo_config,
+                    shared_turbo_direct,
                     switching: Arc::new(AtomicBool::new(false)),
                     shutdown,
                 });
@@ -202,6 +205,7 @@ struct TrayState {
     gguf_config: crate::config::FunasrGgufConfig,
     nim_config: crate::config::NimWhisperConfig,
     turbo_config: crate::config::WhisperTurboConfig,
+    shared_turbo_direct: Arc<AtomicBool>,
     switching: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
@@ -521,6 +525,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
                 state.hotkey_user.local_nonstreaming(),
                 state.current_engine.clone(),
                 state.switching.load(Ordering::Relaxed),
+                state.shared_turbo_direct.load(Ordering::Relaxed),
             )
         })
     });
@@ -532,6 +537,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         voice_hotkey_label,
         current_engine,
         switching_engine,
+        turbo_direct,
     )) = state_snapshot
     else {
         let _ = unsafe { DestroyMenu(menu) };
@@ -731,6 +737,12 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_ENGINE_WHISPER_TURBO,
             "Whisper-Turbo（显卡流式）",
         );
+        append_menu_text(
+            menu,
+            MF_STRING | if turbo_direct { MF_CHECKED } else { MF_UNCHECKED },
+            MENU_TURBO_DIRECT_PASTE,
+            "Turbo直贴实验（只贴定稿增量·默认关）",
+        );
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
@@ -775,6 +787,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_ENGINE_QWEN3 => set_local_engine("qwen3-asr", "models/qwen3-asr"),
             MENU_ENGINE_FUNASR_GGUF => set_funasr_gguf_backend(),
             MENU_ENGINE_PARAFORMER_STREAMING => set_paraformer_backend(),
+            MENU_TURBO_DIRECT_PASTE => toggle_turbo_direct_paste(),
             MENU_AUTO_START => toggle_auto_start(),
             MENU_RESTART => {
                 // 重启 = 以当前 exe 再拉一个新实例：新实例发现互斥锁被占，
@@ -1129,6 +1142,89 @@ fn set_whisper_turbo_backend() {
     });
 }
 
+/// Turbo直贴实验开关：托盘点选即翻转，活线立刻生效，落盘 [whisper_turbo] 方便下次记住。
+fn toggle_turbo_direct_paste() {
+    TRAY_STATE.with(|state| {
+        let mut state_cell = state.borrow_mut();
+        let Some(state) = state_cell.as_mut() else {
+            return;
+        };
+        let next = !state.shared_turbo_direct.load(Ordering::Relaxed);
+        match update_whisper_turbo_flag(&state.config_path, "direct_paste_experiment", next) {
+            Ok(()) => {
+                state.shared_turbo_direct.store(next, Ordering::Relaxed);
+                state.turbo_config.direct_paste_experiment = next;
+                state.hud.show_text(
+                    if next {
+                        "Turbo直贴实验：开\n只贴定稿增量，草稿还不贴；改写/终端/换窗口自动退回HUD"
+                    } else {
+                        "Turbo直贴实验：关\n回到HUD看草稿、松开粘贴"
+                    },
+                    true,
+                    false,
+                );
+                info!(enabled = next, "turbo direct-paste experiment toggled from tray");
+            }
+            Err(error) => {
+                state.hud.show_text(&format!("开关没存上：{error}"), false, false);
+                warn!(error = %error, "failed to persist turbo direct-paste toggle");
+            }
+        }
+    });
+}
+
+/// 给 [whisper_turbo] 写一个裸 bool 键（true/false 不加引号），段不存在就补段。
+fn update_whisper_turbo_flag(
+    config_path: &std::path::Path,
+    key: &str,
+    value: bool,
+) -> Result<()> {
+    use std::fs;
+
+    if !config_path.exists() {
+        anyhow::bail!("config file not found: {}", config_path.display());
+    }
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("read config {}", config_path.display()))?;
+    let section = "[whisper_turbo]";
+    let wanted = value.to_string();
+    let mut in_section = false;
+    let mut section_seen = false;
+    let mut replaced = false;
+    let mut output: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_section && !replaced {
+                output.push(format!("{key} = {wanted}"));
+                replaced = true;
+            }
+            section_seen = section_seen || trimmed.eq_ignore_ascii_case(section);
+            in_section = trimmed.eq_ignore_ascii_case(section);
+            output.push(line.to_string());
+            continue;
+        }
+        if in_section && !replaced && trimmed.split('=').next().map(str::trim) == Some(key) {
+            output.push(format!("{key} = {wanted}"));
+            replaced = true;
+            continue;
+        }
+        output.push(line.to_string());
+    }
+    if in_section && !replaced {
+        output.push(format!("{key} = {wanted}"));
+    }
+    if !section_seen {
+        output.push(section.to_string());
+        output.push(format!("{key} = {wanted}"));
+    }
+    let write_target = config_path.with_extension("toml.tmp-write");
+    fs::write(&write_target, format!("{}\n", output.join("\n")))
+        .with_context(|| format!("write config {}", write_target.display()))?;
+    fs::rename(&write_target, config_path)
+        .with_context(|| format!("replace config {}", config_path.display()))?;
+    Ok(())
+}
 #[allow(dead_code)]
 fn set_nim_whisper_backend() {
     const ENGINE: &str = "nim-whisper";

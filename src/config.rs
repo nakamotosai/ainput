@@ -157,6 +157,8 @@ pub struct WhisperTurboConfig {
     pub sample_rate_hz: u32,
     pub append_timeout_ms: u64,
     pub finish_timeout_ms: u64,
+    /// Turbo直贴实验：按住时把 stable 增量直接贴进文档，不弹 HUD。默认关。
+    pub direct_paste_experiment: bool,
 }
 
 #[allow(dead_code)]
@@ -997,6 +999,7 @@ impl Default for WhisperTurboConfig {
             sample_rate_hz: 16_000,
             append_timeout_ms: 15_000,
             finish_timeout_ms: 60_000,
+            direct_paste_experiment: false,
         }
     }
 }
@@ -1268,6 +1271,7 @@ mod tests {
         );
         assert_eq!(config.prompt_studio.model, "");
         assert!(config.prompt_studio.fallback_models.is_empty());
+        assert!(!config.whisper_turbo.direct_paste_experiment);
         assert_eq!(config.whisper.sample_rate_hz, 16000);
         assert!(config.output.prefer_direct_paste);
         assert_eq!(config.output.paste_stabilize_ms, 25);

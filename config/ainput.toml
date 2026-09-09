@@ -99,6 +99,8 @@ model = "turbo"
 sample_rate_hz = 16000
 append_timeout_ms = 15000
 finish_timeout_ms = 60000
+# 直贴实验：按住说话时把 stable 增量直接贴进文档、不弹 HUD。默认关，托盘可点开。
+direct_paste_experiment = false
 
 [rewrite]
 enabled = false
