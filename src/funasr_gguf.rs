@@ -80,3 +80,38 @@ fn encode_wav_bytes(sample_rate_hz: u32, samples: &[f32]) -> Result<Vec<u8>> {
     }
     Ok(cursor.into_inner())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FunasrGgufConfig;
+
+    /// 边车端到端：需要本机 sidecar 在跑（python sidecar/funasr_gguf_server.py）。
+    /// 地址由 GGUF_TEST_URL 传入，不设则跳过。断言 rag_math 级中文能出字。
+    #[test]
+    #[ignore]
+    fn transcribes_against_sidecar() {
+        let url = std::env::var("GGUF_TEST_URL").unwrap_or_default();
+        if url.trim().is_empty() {
+            eprintln!("GGUF_TEST_URL unset; skip");
+            return;
+        }
+        let wav = std::env::var("GGUF_TEST_WAV").unwrap_or_default();
+        assert!(!wav.trim().is_empty(), "GGUF_TEST_WAV must point at a 16k wav");
+        let mut config = FunasrGgufConfig::default();
+        config.endpoint_url = url;
+        config.request_timeout_ms = 120_000;
+        let client = GgufClient::new(&config).expect("build client");
+        let mut reader = hound::WavReader::open(&wav).expect("open wav");
+        let spec = reader.spec();
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| (s.unwrap_or(0) as f32) / 32768.0)
+            .collect();
+        let text = client
+            .transcribe(spec.sample_rate, &samples)
+            .expect("sidecar transcribe");
+        eprintln!("gguf text={text:?}");
+        assert!(text.contains("微分") || text.contains("你好"), "unexpected text");
+    }
+}
