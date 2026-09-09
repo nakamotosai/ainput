@@ -911,6 +911,33 @@ fn open_hotkey_panel() {
     });
 }
 
+/// 切换动画最短可见时长（毫秒）：写配置即生效的快切换也闪够约 0.9 秒，否则人眼根本看不见。
+const SWITCH_ANIM_MIN_VISIBLE_MS: u64 = 900;
+
+fn post_switch_anim(message: u32) {
+    if let Some(&addr) = TRAY_HWND.get() {
+        let hwnd = HWND(addr as *mut std::ffi::c_void);
+        let _ = unsafe { PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// 快切换收尾：动画至少播满最短时长再停，另起线程等，不堵托盘菜单。
+fn release_switch_anim_after_min_visible(
+    switching: Arc<AtomicBool>,
+    started: std::time::Instant,
+) {
+    thread::spawn(move || {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms < SWITCH_ANIM_MIN_VISIBLE_MS {
+            thread::sleep(Duration::from_millis(
+                SWITCH_ANIM_MIN_VISIBLE_MS - elapsed_ms,
+            ));
+        }
+        switching.store(false, Ordering::Relaxed);
+        post_switch_anim(MSG_SWITCH_ANIM_STOP);
+    });
+}
+
 fn set_local_engine(engine: &str, model_dir: &str) {
     TRAY_STATE.with(|state| {
         let (slot, install_root, switching_flag, hud, new_config) = {
@@ -933,10 +960,7 @@ fn set_local_engine(engine: &str, model_dir: &str) {
                         *live = engine.to_string();
                     }
                     state.switching.store(true, Ordering::Relaxed);
-                    if let Some(&addr) = TRAY_HWND.get() {
-                    let hwnd_v = HWND(addr as *mut std::ffi::c_void);
-                    let _ = unsafe { PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_START, WPARAM(0), LPARAM(0)) };
-                }
+                    post_switch_anim(MSG_SWITCH_ANIM_START);
                     state.hud.show_text(
                         &format!("识别引擎切换中：{engine}\n约 5-10 秒后自动生效，不用重启"),
                         false,
@@ -976,10 +1000,7 @@ fn set_local_engine(engine: &str, model_dir: &str) {
                 Err(error) => format!("切换失败：{error}"),
             };
             switching_flag.store(false, Ordering::Relaxed);
-            if let Some(&addr) = TRAY_HWND.get() {
-                let hwnd_v = HWND(addr as *mut std::ffi::c_void);
-                let _ = unsafe { PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_STOP, WPARAM(0), LPARAM(0)) };
-            }
+            post_switch_anim(MSG_SWITCH_ANIM_STOP);
             hud.show_text(&toast, true, false);
             info!(engine = %engine_owned, "local ASR engine hot-swap finished");
         });
@@ -1009,12 +1030,7 @@ fn set_paraformer_backend() {
                         *live = ENGINE.to_string();
                     }
                     state.switching.store(true, Ordering::Relaxed);
-                    if let Some(&addr) = TRAY_HWND.get() {
-                        let hwnd_v = HWND(addr as *mut std::ffi::c_void);
-                        let _ = unsafe {
-                            PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_START, WPARAM(0), LPARAM(0))
-                        };
-                    }
+                    post_switch_anim(MSG_SWITCH_ANIM_START);
                     state.hud.show_text(
                         "识别引擎切换中：paraformer-streaming\n约 5-10 秒后自动生效，不用重启",
                         false,
@@ -1055,12 +1071,7 @@ fn set_paraformer_backend() {
                 Err(error) => format!("切换失败：{error}"),
             };
             switching_flag.store(false, Ordering::Relaxed);
-            if let Some(&addr) = TRAY_HWND.get() {
-                let hwnd_v = HWND(addr as *mut std::ffi::c_void);
-                let _ = unsafe {
-                    PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_STOP, WPARAM(0), LPARAM(0))
-                };
-            }
+            post_switch_anim(MSG_SWITCH_ANIM_STOP);
             hud.show_text(&toast, true, false);
             info!("paraformer streaming hot-swap finished");
         });
@@ -1083,6 +1094,10 @@ fn set_funasr_gguf_backend() {
             state.hud.show_text("识别引擎已是：funasr-gguf", true, false);
             return;
         }
+        // 快切换也给动画：占位即闪，播够约 0.9 秒再还，不堵托盘。
+        state.switching.store(true, Ordering::Relaxed);
+        post_switch_anim(MSG_SWITCH_ANIM_START);
+        let anim_started = std::time::Instant::now();
         match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
             Ok(()) => {
                 state.current_engine = ENGINE.to_string();
@@ -1095,10 +1110,16 @@ fn set_funasr_gguf_backend() {
                     false,
                 );
                 info!(engine = ENGINE, config_path = %state.config_path.display(), "funasr-gguf switch from tray");
+                release_switch_anim_after_min_visible(
+                    Arc::clone(&state.switching),
+                    anim_started,
+                );
             }
             Err(error) => {
                 state.hud.show_text(&format!("切换失败：{error}"), false, false);
                 warn!(error = %error, engine = ENGINE, "failed to persist gguf switch");
+                state.switching.store(false, Ordering::Relaxed);
+                post_switch_anim(MSG_SWITCH_ANIM_STOP);
             }
         }
     });
@@ -1120,6 +1141,10 @@ fn set_whisper_turbo_backend() {
             state.hud.show_text("识别引擎已是：whisper-turbo", true, false);
             return;
         }
+        // 快切换也给动画：占位即闪，播够约 0.9 秒再还，不堵托盘。
+        state.switching.store(true, Ordering::Relaxed);
+        post_switch_anim(MSG_SWITCH_ANIM_START);
+        let anim_started = std::time::Instant::now();
         match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
             Ok(()) => {
                 state.current_engine = ENGINE.to_string();
@@ -1133,10 +1158,16 @@ fn set_whisper_turbo_backend() {
                     false,
                 );
                 info!(engine = ENGINE, config_path = %state.config_path.display(), "whisper-turbo switch from tray");
+                release_switch_anim_after_min_visible(
+                    Arc::clone(&state.switching),
+                    anim_started,
+                );
             }
             Err(error) => {
                 state.hud.show_text(&format!("切换失败：{error}"), false, false);
                 warn!(error = %error, engine = ENGINE, "failed to persist turbo switch");
+                state.switching.store(false, Ordering::Relaxed);
+                post_switch_anim(MSG_SWITCH_ANIM_STOP);
             }
         }
     });
@@ -1149,6 +1180,14 @@ fn toggle_turbo_direct_paste() {
         let Some(state) = state_cell.as_mut() else {
             return;
         };
+        if state.switching.load(Ordering::Relaxed) {
+            state.hud.show_text("正在切换引擎，请稍等完成", false, false);
+            return;
+        }
+        // 开关也闪一下：占位即闪，播够约 0.9 秒再还，不堵托盘。
+        state.switching.store(true, Ordering::Relaxed);
+        post_switch_anim(MSG_SWITCH_ANIM_START);
+        let anim_started = std::time::Instant::now();
         let next = !state.shared_turbo_direct.load(Ordering::Relaxed);
         match update_whisper_turbo_flag(&state.config_path, "direct_paste_experiment", next) {
             Ok(()) => {
@@ -1164,10 +1203,16 @@ fn toggle_turbo_direct_paste() {
                     false,
                 );
                 info!(enabled = next, "turbo direct-paste experiment toggled from tray");
+                release_switch_anim_after_min_visible(
+                    Arc::clone(&state.switching),
+                    anim_started,
+                );
             }
             Err(error) => {
                 state.hud.show_text(&format!("开关没存上：{error}"), false, false);
                 warn!(error = %error, "failed to persist turbo direct-paste toggle");
+                state.switching.store(false, Ordering::Relaxed);
+                post_switch_anim(MSG_SWITCH_ANIM_STOP);
             }
         }
     });
