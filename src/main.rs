@@ -274,9 +274,10 @@ fn run_app() -> Result<()> {
         Mutex<Option<paraformer_streaming::ParaformerStreamingRecognizer>>,
     > = Arc::new(Mutex::new(None));
     // 2026-09-09 三后端：engine 字符串即后端 id（沿用托盘现有切换通道）。
-    // 本地三引擎走 shared_recognizer；paraformer 走独立在线识别槽；
-    // gguf/nim 是 HTTP 后端，转写时失败自动回退到本地 SenseVoice，所以这里
-    // 先准备一个 SenseVoice 兜底。
+    // sense-voice/qwen3/funasr-nano 走 shared_recognizer；
+    // paraformer-streaming 走独立在线识别槽 shared_paraformer；
+    // gguf/nim 是 HTTP 后端（每次转写现建客户端），失败直接报错、不回退；
+    // 非本地三引擎时槽里放 SenseVoice，保证老链路不断（不是给 gguf/nim 兜底）。
     let engine_key = config.local_nonstreaming.engine.trim().to_ascii_lowercase();
     let engine_key = engine_key.as_str();
     if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
