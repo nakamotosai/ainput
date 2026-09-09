@@ -1905,8 +1905,13 @@ impl VoiceWorker {
 
         // 2026-09-03: SenseVoice 关掉 use_itn 后输出裸文本（标点随 ITN 一起没了）。
         // 这里用独立的离线标点模型把标点补回来；补不了（没装模型/推理失败）就原样放行。
-        if let Some(punctuated) = self.apply_local_punctuation(&raw_text) {
-            raw_text = punctuated;
+        // 2026-09-10: turbo/GGUF 自带标点，跳过离线标点模型（省一次 CPU 推理）。
+        let native_punct =
+            engine_key == "whisper-turbo" || engine_key == "funasr-gguf";
+        if !native_punct {
+            if let Some(punctuated) = self.apply_local_punctuation(&raw_text) {
+                raw_text = punctuated;
+            }
         }
 
         let raw_finalized =

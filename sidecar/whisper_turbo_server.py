@@ -27,8 +27,9 @@ SAMPLE_RATE = 16000
 MODEL_NAME = "turbo"
 DEVICE = "cuda"
 COMPUTE = "float16"
-# 两次解码之间至少新增这么多音频才重算（秒）。
-MIN_NEW_AUDIO_SEC = 0.8
+# 两次解码之间至少新增这么多音频才重算（秒）。0.5 秒一拍：
+# 小 buffer 上 GPU 一次只花 0.1-0.2 秒，跟得上；再密就是空烧显卡。
+MIN_NEW_AUDIO_SEC = 0.5
 # whisper 窗口 30 秒，输入法按住很少超；超了如实报错不截断欺骗。
 MAX_BUFFER_SEC = 30.0
 MAX_SESSIONS = 8
