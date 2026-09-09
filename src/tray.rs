@@ -76,6 +76,8 @@ const MENU_ENGINE_QWEN3: usize = 3002;
 const MENU_ENGINE_FUNASR_NANO: usize = 3003;
 const MENU_ENGINE_FUNASR_GGUF: usize = 3004;
 const MENU_ENGINE_PARAFORMER_STREAMING: usize = 3005;
+// 2026-09-10 云端档收起：编号保留，Docker 回归时恢复菜单。
+#[allow(dead_code)]
 const MENU_ENGINE_NIM_WHISPER: usize = 3006;
 
 pub struct Tray {
@@ -706,17 +708,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_ENGINE_PARAFORMER_STREAMING,
             "Paraformer流式（边说边出）",
         );
-        append_menu_text(
-            menu,
-            engine_flag
-                | if normalize_engine_key(&current_engine) == "nim-whisper" {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_ENGINE_NIM_WHISPER,
-            "Whisper云端（英伟达）",
-        );
+        // 2026-09-10 云端档收起：hosted 语音已下架，入口隐藏（Docker 回归时恢复）。
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
@@ -760,7 +752,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_ENGINE_QWEN3 => set_local_engine("qwen3-asr", "models/qwen3-asr"),
             MENU_ENGINE_FUNASR_GGUF => set_funasr_gguf_backend(),
             MENU_ENGINE_PARAFORMER_STREAMING => set_paraformer_backend(),
-            MENU_ENGINE_NIM_WHISPER => set_nim_whisper_backend(),
             MENU_AUTO_START => toggle_auto_start(),
             MENU_RESTART => {
                 // 重启 = 以当前 exe 再拉一个新实例：新实例发现互斥锁被占，
@@ -1068,6 +1059,7 @@ fn set_funasr_gguf_backend() {
     });
 }
 
+#[allow(dead_code)]
 fn set_nim_whisper_backend() {
     const ENGINE: &str = "nim-whisper";
     const MODEL_DIR: &str = "models/nim-whisper";
