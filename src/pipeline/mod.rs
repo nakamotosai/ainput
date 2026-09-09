@@ -1419,6 +1419,142 @@ impl VoiceWorker {
         Ok(())
     }
 
+    ///真·实时：按住说话时每来一块麦克风音频就解一步，有新字立刻上屏；
+    ///松开后收尾定稿。一次按住就是一句话，不做端点切分（release 即边界）。
+    ///写法照官方 streaming-paraformer-asr-microphone.py + 自家 streaming_hold_loop。
+    #[allow(clippy::too_many_arguments)]
+    fn accept_paraformer_live_chunk(
+        &self,
+        recognizer: &crate::paraformer_streaming::ParaformerStreamingRecognizer,
+        stream: &sherpa_onnx::OnlineStream,
+        resampler: &mut LinearResampler,
+        samples: &mut Vec<f32>,
+        sample_rate_hz: u32,
+        chunk: &[f32],
+        last_partial: &mut String,
+    ) {
+        resampler.push(chunk);
+        let available = resampler.take_available();
+        if available.is_empty() {
+            return;
+        }
+        samples.extend_from_slice(&available);
+        let partial = recognizer.accept_live_audio(stream, sample_rate_hz, &available);
+        if !partial.trim().is_empty() && partial != *last_partial {
+            *last_partial = partial.clone();
+            self.hud.show_text(&partial, true, false);
+        }
+    }
+
+    ///返回（是否松开、终句文本、模型目录、用时毫秒）。
+    #[allow(clippy::too_many_arguments)]
+    fn run_paraformer_live_loop(
+        &self,
+        hotkey_rx: &mpsc::Receiver<HotkeyEvent>,
+        audio_rx: &mpsc::Receiver<Vec<f32>>,
+        resampler: &mut LinearResampler,
+        samples: &mut Vec<f32>,
+        sample_rate_hz: u32,
+        profile_id: VoiceProfileId,
+        utterance_id: &str,
+    ) -> Result<(bool, String, PathBuf, u128)> {
+        let started = Instant::now();
+        let cancelled = (false, String::new(), PathBuf::new(), 0u128);
+        // 整个按住期间借住槽位；此时托盘切引擎会短暂等锁，不会死锁。
+        let guard = self
+            .shared_paraformer
+            .lock()
+            .map_err(|_| anyhow!("paraformer recognizer lock poisoned"))?;
+        let recognizer = guard.as_ref().ok_or_else(|| {
+            anyhow!("paraformer-streaming recognizer is unavailable (model missing?切回其它引擎重试)")
+        })?;
+        let root = recognizer.root_dir().to_path_buf();
+        let stream = recognizer.create_live_stream();
+        let mut last_partial = String::new();
+        let release_grace_ms = self.config.local_nonstreaming.release_grace_ms;
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Ok(cancelled);
+            }
+            let mut released_now = false;
+            while let Ok(event) = hotkey_rx.try_recv() {
+                let HotkeyEvent::Voice(voice_event) = event;
+                if voice_event.profile_id == profile_id
+                    && voice_event.phase == TriggerPhase::Released
+                {
+                    released_now = true;
+                    break;
+                }
+            }
+            if released_now {
+                // 松开：和 drain_release_audio 同等待把尾巴收完，再冲尾定稿。
+                let deadline = Instant::now() + Duration::from_millis(release_grace_ms);
+                while Instant::now() < deadline {
+                    match audio_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(chunk) => self.accept_paraformer_live_chunk(
+                            recognizer,
+                            &stream,
+                            resampler,
+                            samples,
+                            sample_rate_hz,
+                            &chunk,
+                            &mut last_partial,
+                        ),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                while let Ok(chunk) = audio_rx.try_recv() {
+                    self.accept_paraformer_live_chunk(
+                        recognizer,
+                        &stream,
+                        resampler,
+                        samples,
+                        sample_rate_hz,
+                        &chunk,
+                        &mut last_partial,
+                    );
+                }
+                let final_text = recognizer.finish_live_audio(&stream);
+                let text = if final_text.trim().is_empty() {
+                    last_partial
+                } else {
+                    final_text
+                };
+                let elapsed_ms = started.elapsed().as_millis();
+                info!(
+                    utterance_id,
+                    engine = "paraformer-streaming",
+                    transcribe_ms = elapsed_ms,
+                    "paraformer live loop finalized on release"
+                );
+                return Ok((true, text, root, elapsed_ms));
+            }
+            match audio_rx.recv_timeout(Duration::from_millis(12)) {
+                Ok(chunk) => self.accept_paraformer_live_chunk(
+                    recognizer,
+                    &stream,
+                    resampler,
+                    samples,
+                    sample_rate_hz,
+                    &chunk,
+                    &mut last_partial,
+                ),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    warn!("resident microphone subscription disconnected during paraformer live session");
+                    let final_text = recognizer.finish_live_audio(&stream);
+                    let text = if final_text.trim().is_empty() {
+                        last_partial
+                    } else {
+                        final_text
+                    };
+                    return Ok((true, text, root, started.elapsed().as_millis()));
+                }
+            }
+        }
+    }
+
     fn run_local_nonstreaming_session(
         &self,
         hotkey_rx: &mpsc::Receiver<HotkeyEvent>,
@@ -1432,34 +1568,84 @@ impl VoiceWorker {
         let sample_rate_hz = self.config.local_nonstreaming.sample_rate_hz.max(1);
         let mut resampler = LinearResampler::new(self.audio.sample_rate_hz, sample_rate_hz);
         let mut samples = Vec::<f32>::new();
+        // 2026-09-09 三后端分发：engine 字符串即后端 id（托盘切换通道）。
+        // gguf/nim 是 HTTP 后端，失败如实报错（HUD + 历史），绝不静默回退成本地。
+        // 2026-09-10 真切换修复：读托盘活线，不读启动快照；锁坏时回退启动快照。
+        // 2026-09-10 真实时：paraformer 且槽位有模型 → 按住即解（live 循环）；
+        // 其它引擎走老路（按住攒音，松开再算）。
+        let engine_key = self
+            .shared_engine
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            .trim()
+            .to_ascii_lowercase();
+        let engine_key = if engine_key.is_empty() {
+            self.config
+                .local_nonstreaming
+                .engine
+                .trim()
+                .to_ascii_lowercase()
+        } else {
+            engine_key
+        };
         info!(
             utterance_id,
             input_sample_rate_hz = self.audio.sample_rate_hz,
             local_sample_rate_hz = sample_rate_hz,
             pre_roll_ms = self.config.asr.pre_roll_ms,
             mode = "local_nonstreaming",
-            "local non-streaming SenseVoice session started"
+            "local non-streaming session started (engine routed later via live channel)"
         );
 
-        let released = self.whisper_hold_loop(
-            hotkey_rx,
-            &audio.rx,
-            &mut resampler,
-            &mut samples,
-            profile_id,
-        )?;
-        if !released {
-            self.hud.clear();
-            return Ok(());
+        // 2026-09-10 真实时：paraformer 且槽位有模型 → 按住即解（live 循环）；
+        // 槽位空（刚切过来还在加载）走老路，分发处会如实报错。
+        let paraformer_live = (engine_key == "paraformer-streaming" || engine_key == "paraformer")
+            && self
+                .shared_paraformer
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false);
+        let live_outcome: Option<(String, PathBuf, u128)> = if paraformer_live {
+            self.hud.show_text("聆听中…", true, false);
+            let (released, text, root, elapsed_ms) = self.run_paraformer_live_loop(
+                hotkey_rx,
+                &audio.rx,
+                &mut resampler,
+                &mut samples,
+                sample_rate_hz,
+                profile_id,
+                &utterance_id,
+            )?;
+            if !released {
+                self.hud.clear();
+                return Ok(());
+            }
+            Some((text, root, elapsed_ms))
+        } else {
+            None
+        };
+        if live_outcome.is_none() {
+            let released = self.whisper_hold_loop(
+                hotkey_rx,
+                &audio.rx,
+                &mut resampler,
+                &mut samples,
+                profile_id,
+            )?;
+            if !released {
+                self.hud.clear();
+                return Ok(());
+            }
+            self.drain_release_audio(
+                &audio.rx,
+                &mut resampler,
+                &mut samples,
+                self.config.local_nonstreaming.release_grace_ms,
+            );
+            self.hud.show_meter_busy();
         }
-        self.drain_release_audio(
-            &audio.rx,
-            &mut resampler,
-            &mut samples,
-            self.config.local_nonstreaming.release_grace_ms,
-        );
         drop(audio);
-        self.hud.show_meter_busy();
 
         let audio_ms = audio_ms(samples.len(), sample_rate_hz);
         let rms_dbfs = rms_dbfs(&samples);
@@ -1494,29 +1680,12 @@ impl VoiceWorker {
             return Ok(());
         }
 
-        // 2026-09-09 三后端分发：engine 字符串即后端 id（托盘切换通道）。
-        // gguf/nim 是 HTTP 后端，失败如实报错（HUD + 历史），绝不静默回退成本地，
-        // 否则用户会把 SenseVoice 的结果误当新后端的效果。
-        // 2026-09-10 真切换修复：读托盘活线，不读启动快照；
-        // 锁坏时回退启动快照，保证不断流。
-        let engine_key = self
-            .shared_engine
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
-            .trim()
-            .to_ascii_lowercase();
-        let engine_key = if engine_key.is_empty() {
-            self.config
-                .local_nonstreaming
-                .engine
-                .trim()
-                .to_ascii_lowercase()
-        } else {
-            engine_key
-        };
+        // 分发：live_outcome 有值 = 刚才 live 循环已出终句，直接用；
+        // 否则按 engine 走各后端（paraformer 老路=整段模拟流式，作托盘切换中途的兜底）。
         let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) =
-            if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
+            if let Some((text, root, elapsed_ms)) = live_outcome {
+                (text, root, elapsed_ms)
+            } else if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
                 let chunk_ms = self.config.paraformer_streaming.chunk_ms;
                 let guard = self
                     .shared_paraformer

@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use sherpa_onnx::{OnlineParaformerModelConfig, OnlineRecognizer, OnlineRecognizerConfig};
 use tracing::info;
+use sherpa_onnx::{OnlineParaformerModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 
 use crate::config::ParaformerStreamingConfig;
 
@@ -170,6 +170,51 @@ impl ParaformerStreamingRecognizer {
         &self.root_dir
     }
 
+    ///真·实时循环三件套（照官方 streaming-paraformer-asr-microphone.py 写法）：
+    ///按住说话时外面每收到一块麦克风音频就调 accept_live_audio，
+    ///里面解一步、有新字就回 partial，HUD 当场上屏；
+    ///松开后调 finish_live_audio 冲尾拿终句。
+    ///一次按住就是一句话，不做端点切分（release 即边界）。
+    pub fn create_live_stream(&self) -> OnlineStream {
+        self.recognizer.create_stream()
+    }
+
+    pub fn accept_live_audio(
+        &self,
+        stream: &OnlineStream,
+        sample_rate_hz: u32,
+        samples: &[f32],
+    ) -> String {
+        if !samples.is_empty() {
+            stream.accept_waveform(sample_rate_hz.max(1) as i32, samples);
+            while self.recognizer.is_ready(stream) {
+                self.recognizer.decode(stream);
+            }
+        }
+        self.live_partial(stream)
+    }
+
+    pub fn live_partial(&self, stream: &OnlineStream) -> String {
+        self.recognizer
+            .get_result(stream)
+            .map(|result| result.text.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn finish_live_audio(&self, stream: &OnlineStream) -> String {
+        let partial = self.live_partial(stream);
+        stream.input_finished();
+        while self.recognizer.is_ready(stream) {
+            self.recognizer.decode(stream);
+        }
+        let final_text = self.live_partial(stream);
+        if final_text.trim().is_empty() {
+            partial
+        } else {
+            final_text
+        }
+    }
+
     ///整段音频模拟流式喂入，按 chunk_ms 切块；每出一句新部分字就调 on_partial，
     ///调用方拿它往 HUD 上屏，返回终句文本。
     pub fn transcribe_streaming(
@@ -249,6 +294,47 @@ mod tests {
         eprintln!("paraformer text={text:?} rtf={rtf:.3}");
         assert!(!text.trim().is_empty(), "empty transcription");
         assert!(rtf < 1.0, "too slow for input method: rtf={rtf}");
+    }
+
+    /// 真·实时三件套冒烟：把 1.wav 按 100ms 块喂 live stream，
+    /// 中途必须出过非空 partial，终句非空（跑法同上，加 --ignored）。
+    #[test]
+    #[ignore]
+    fn live_stream_emits_partials_on_bundled_wav() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models")
+            .join("paraformer-streaming");
+        let wav_path = dir
+            .join("sherpa-onnx-streaming-paraformer-bilingual-zh-en")
+            .join("test_wavs")
+            .join("1.wav");
+        assert!(wav_path.exists(), "missing test wav {}", wav_path.display());
+        let mut config = ParaformerStreamingConfig::default();
+        config.model_dir = "models/paraformer-streaming".to_string();
+        config.provider = "cpu".to_string();
+        config.num_threads = 4;
+        let recognizer =
+            ParaformerStreamingRecognizer::create(&config, Path::new(env!("CARGO_MANIFEST_DIR")))
+                .expect("create paraformer recognizer");
+        let (sample_rate_hz, samples) = read_wav_mono16(&wav_path);
+        // 100ms 一块，模拟麦克风实时到来。
+        let block = (sample_rate_hz.max(1) as usize / 10).max(1);
+        let stream = recognizer.create_live_stream();
+        let mut saw_partial = false;
+        let mut offset = 0usize;
+        while offset < samples.len() {
+            let end = (offset + block).min(samples.len());
+            let partial =
+                recognizer.accept_live_audio(&stream, sample_rate_hz, &samples[offset..end]);
+            if !partial.trim().is_empty() {
+                saw_partial = true;
+            }
+            offset = end;
+        }
+        let final_text = recognizer.finish_live_audio(&stream);
+        eprintln!("live saw_partial={saw_partial} final={final_text:?}");
+        assert!(saw_partial, "no partial hypothesis during live feed");
+        assert!(!final_text.trim().is_empty(), "empty final transcription");
     }
 
     fn read_wav_mono16(path: &Path) -> (u32, Vec<f32>) {
