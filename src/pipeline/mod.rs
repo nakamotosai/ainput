@@ -311,6 +311,8 @@ pub struct VoiceWorker {
     local_recognizer: Arc<Mutex<Option<LocalSenseVoiceRecognizer>>>,
     shared_paraformer:
         Arc<Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>>,
+    ///托盘切换的活线：分发每句读它，不读启动快照（2026-09-10 真切换修复）。
+    shared_engine: Arc<Mutex<String>>,
     asr_sessions: AsrSessionPool,
     modes: ModeStore,
     audio: AudioHub,
@@ -333,6 +335,7 @@ impl VoiceWorker {
         shared_paraformer: Arc<
             Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>,
         >,
+        shared_engine: Arc<Mutex<String>>,
         asr_sessions: AsrSessionPool,
         modes: ModeStore,
         audio: AudioHub,
@@ -351,6 +354,7 @@ impl VoiceWorker {
             whisper,
             local_recognizer,
             shared_paraformer,
+            shared_engine,
             asr_sessions,
             modes,
             audio,
@@ -1493,12 +1497,24 @@ impl VoiceWorker {
         // 2026-09-09 三后端分发：engine 字符串即后端 id（托盘切换通道）。
         // gguf/nim 是 HTTP 后端，失败如实报错（HUD + 历史），绝不静默回退成本地，
         // 否则用户会把 SenseVoice 的结果误当新后端的效果。
+        // 2026-09-10 真切换修复：读托盘活线，不读启动快照；
+        // 锁坏时回退启动快照，保证不断流。
         let engine_key = self
-            .config
-            .local_nonstreaming
-            .engine
+            .shared_engine
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
             .trim()
             .to_ascii_lowercase();
+        let engine_key = if engine_key.is_empty() {
+            self.config
+                .local_nonstreaming
+                .engine
+                .trim()
+                .to_ascii_lowercase()
+        } else {
+            engine_key
+        };
         let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) =
             if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
                 let chunk_ms = self.config.paraformer_streaming.chunk_ms;
@@ -1510,8 +1526,11 @@ impl VoiceWorker {
                     anyhow!("paraformer-streaming recognizer is unavailable (model missing?切回其它引擎重试)")
                 })?;
                 let transcribe_started = Instant::now();
+                let hud = self.hud.clone();
                 let text = recognizer
-                    .transcribe_streaming(sample_rate_hz, &samples, chunk_ms)
+                    .transcribe_streaming(sample_rate_hz, &samples, chunk_ms, &|partial| {
+                        hud.show_text(partial, true, false);
+                    })
                     .context("transcribe with paraformer-streaming")?;
                 let root = recognizer.root_dir().to_path_buf();
                 (text, root, transcribe_started.elapsed().as_millis())
@@ -1548,6 +1567,13 @@ impl VoiceWorker {
                 let root = response.model_root.clone();
                 (response.text, root, transcribe_started.elapsed().as_millis())
             };
+        info!(
+            engine = %engine_key,
+            model_root = %backend_model_root.display(),
+            transcribe_ms = asr_elapsed_ms,
+            audio_ms = audio_ms,
+            "local_nonstreaming dispatch (engine comes from tray live channel)"
+        );
         let response = crate::local_asr::LocalTranscription {
             text: backend_text,
             model_root: backend_model_root,

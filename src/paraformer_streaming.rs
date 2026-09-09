@@ -170,12 +170,14 @@ impl ParaformerStreamingRecognizer {
         &self.root_dir
     }
 
-    ///整段音频模拟流式喂入，按 chunk_ms 切块，返回终句文本。
+    ///整段音频模拟流式喂入，按 chunk_ms 切块；每出一句新部分字就调 on_partial，
+    ///调用方拿它往 HUD 上屏，返回终句文本。
     pub fn transcribe_streaming(
         &self,
         sample_rate_hz: u32,
         samples: &[f32],
         chunk_ms: u32,
+        on_partial: &dyn Fn(&str),
     ) -> Result<String> {
         let stream = self.recognizer.create_stream();
         let chunk_ms = chunk_ms.max(50) as usize;
@@ -191,8 +193,10 @@ impl ParaformerStreamingRecognizer {
                 self.recognizer.decode(&stream);
             }
             if let Some(result) = self.recognizer.get_result(&stream) {
-                if !result.text.trim().is_empty() {
-                    last_text = result.text;
+                let text = result.text.trim().to_string();
+                if !text.is_empty() && text != last_text {
+                    last_text = text.clone();
+                    on_partial(&text);
                 }
             }
         }
@@ -239,7 +243,7 @@ mod tests {
         let audio_secs = samples.len() as f32 / sample_rate_hz.max(1) as f32;
         let started = Instant::now();
         let text = recognizer
-            .transcribe_streaming(sample_rate_hz, &samples, 200)
+            .transcribe_streaming(sample_rate_hz, &samples, 200, &|_| {})
             .expect("transcribe");
         let rtf = started.elapsed().as_secs_f32() / audio_secs.max(0.01);
         eprintln!("paraformer text={text:?} rtf={rtf:.3}");

@@ -274,10 +274,13 @@ fn run_app() -> Result<()> {
         Mutex<Option<paraformer_streaming::ParaformerStreamingRecognizer>>,
     > = Arc::new(Mutex::new(None));
     // 2026-09-09 三后端：engine 字符串即后端 id（沿用托盘现有切换通道）。
-    // sense-voice/qwen3/funasr-nano 走 shared_recognizer；
+    // 2026-09-10 真切换修复：托盘→worker 加 shared_engine 活线，分发每句读它；
+    // sense-voice/qwen3/funasr-nano 走 shared_recognizer（托盘热换槽）；
     // paraformer-streaming 走独立在线识别槽 shared_paraformer；
     // gguf/nim 是 HTTP 后端（每次转写现建客户端），失败直接报错、不回退；
     // 非本地三引擎时槽里放 SenseVoice，保证老链路不断（不是给 gguf/nim 兜底）。
+    let shared_engine: Arc<Mutex<String>> =
+        Arc::new(Mutex::new(config.local_nonstreaming.engine.clone()));
     let engine_key = config.local_nonstreaming.engine.trim().to_ascii_lowercase();
     let engine_key = engine_key.as_str();
     if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
@@ -325,6 +328,7 @@ fn run_app() -> Result<()> {
         api_connections.path.clone(),
         config_path.clone(),
         config.local_nonstreaming.engine.clone(),
+        Arc::clone(&shared_engine),
         Arc::clone(&shared_recognizer),
         Arc::clone(&shared_paraformer),
         install_root.clone(),
@@ -377,6 +381,7 @@ fn run_app() -> Result<()> {
         whisper,
         Arc::clone(&shared_recognizer),
         Arc::clone(&shared_paraformer),
+        Arc::clone(&shared_engine),
         asr_sessions,
         modes,
         audio,

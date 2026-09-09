@@ -100,6 +100,7 @@ impl Tray {
         api_config_path: PathBuf,
         config_path: PathBuf,
         current_engine: String,
+        shared_engine: Arc<Mutex<String>>,
         shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
         shared_paraformer: Arc<
             Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>,
@@ -132,6 +133,7 @@ impl Tray {
                     api_config_path,
                     config_path,
                     current_engine,
+                    shared_engine,
                     shared_recognizer,
                     shared_paraformer,
                     install_root,
@@ -187,6 +189,7 @@ struct TrayState {
     api_config_path: PathBuf,
     config_path: PathBuf,
     current_engine: String,
+    shared_engine: Arc<Mutex<String>>,
     shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
     shared_paraformer:
         Arc<Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>>,
@@ -887,12 +890,15 @@ fn set_local_engine(engine: &str, model_dir: &str) {
                 return;
             }
             if state.current_engine == engine {
-                state.hud.show_text(&format!("识别引擎已是：{engine}"), false, false);
+                state.hud.show_text(&format!("识别引擎已是：{engine}"), true, false);
                 return;
             }
             match update_local_engine_config(&state.config_path, engine, model_dir) {
                 Ok(()) => {
                     state.current_engine = engine.to_string();
+                    if let Ok(mut live) = state.shared_engine.lock() {
+                        *live = engine.to_string();
+                    }
                     state.switching.store(true, Ordering::Relaxed);
                     if let Some(&addr) = TRAY_HWND.get() {
                     let hwnd_v = HWND(addr as *mut std::ffi::c_void);
@@ -941,7 +947,7 @@ fn set_local_engine(engine: &str, model_dir: &str) {
                 let hwnd_v = HWND(addr as *mut std::ffi::c_void);
                 let _ = unsafe { PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_STOP, WPARAM(0), LPARAM(0)) };
             }
-            hud.show_text(&toast, false, false);
+            hud.show_text(&toast, true, false);
             info!(engine = %engine_owned, "local ASR engine hot-swap finished");
         });
     });
@@ -960,12 +966,15 @@ fn set_paraformer_backend() {
                 return;
             }
             if normalize_engine_key(&state.current_engine) == ENGINE {
-                state.hud.show_text("识别引擎已是：paraformer-streaming", false, false);
+                state.hud.show_text("识别引擎已是：paraformer-streaming", true, false);
                 return;
             }
             match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
                 Ok(()) => {
                     state.current_engine = ENGINE.to_string();
+                    if let Ok(mut live) = state.shared_engine.lock() {
+                        *live = ENGINE.to_string();
+                    }
                     state.switching.store(true, Ordering::Relaxed);
                     if let Some(&addr) = TRAY_HWND.get() {
                         let hwnd_v = HWND(addr as *mut std::ffi::c_void);
@@ -1019,7 +1028,7 @@ fn set_paraformer_backend() {
                     PostMessageW(Some(hwnd_v), MSG_SWITCH_ANIM_STOP, WPARAM(0), LPARAM(0))
                 };
             }
-            hud.show_text(&toast, false, false);
+            hud.show_text(&toast, true, false);
             info!("paraformer streaming hot-swap finished");
         });
     });
@@ -1038,15 +1047,18 @@ fn set_funasr_gguf_backend() {
             return;
         }
         if normalize_engine_key(&state.current_engine) == ENGINE {
-            state.hud.show_text("识别引擎已是：funasr-gguf", false, false);
+            state.hud.show_text("识别引擎已是：funasr-gguf", true, false);
             return;
         }
         match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
             Ok(()) => {
                 state.current_engine = ENGINE.to_string();
+                if let Ok(mut live) = state.shared_engine.lock() {
+                    *live = ENGINE.to_string();
+                }
                 state.hud.show_text(
                     "识别引擎已切换：FunASR-GGUF\n先跑 scripts/start_gguf_sidecar.ps1 起边车\n边车没起会如实报错，不用重启",
-                    false,
+                    true,
                     false,
                 );
                 info!(engine = ENGINE, config_path = %state.config_path.display(), "funasr-gguf switch from tray");
@@ -1073,16 +1085,19 @@ fn set_nim_whisper_backend() {
             return;
         }
         if normalize_engine_key(&state.current_engine) == ENGINE {
-            state.hud.show_text("识别引擎已是：nim-whisper", false, false);
+            state.hud.show_text("识别引擎已是：nim-whisper", true, false);
             return;
         }
         match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
             Ok(()) => {
                 state.current_engine = ENGINE.to_string();
+                if let Ok(mut live) = state.shared_engine.lock() {
+                    *live = ENGINE.to_string();
+                }
                 let endpoint = state.nim_config.endpoint_url.clone();
                 state.hud.show_text(
                     &format!("识别引擎已切换：Whisper云端\n{endpoint}\n连不上会如实报错（需本地 NIM 容器或云授权），不用重启"),
-                    false,
+                    true,
                     false,
                 );
                 info!(engine = ENGINE, config_path = %state.config_path.display(), "nim-whisper switch from tray");
