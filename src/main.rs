@@ -7,6 +7,8 @@ mod asr_pool;
 mod audio;
 mod cloud_asr;
 mod config;
+mod funasr_gguf;
+mod nim_whisper;
 mod debug_panel;
 mod history;
 mod history_panel;
@@ -15,6 +17,7 @@ mod hotkey_panel;
 mod hotkey_user;
 mod hud;
 mod local_asr;
+mod paraformer_streaming;
 mod modes;
 mod output;
 mod personal_corrections;
@@ -267,6 +270,46 @@ fn run_app() -> Result<()> {
     .context("start hotkey panel")?;
     let shared_recognizer: Arc<Mutex<Option<local_asr::LocalSenseVoiceRecognizer>>> =
         Arc::new(Mutex::new(None));
+    let shared_paraformer: Arc<
+        Mutex<Option<paraformer_streaming::ParaformerStreamingRecognizer>>,
+    > = Arc::new(Mutex::new(None));
+    // 2026-09-09 三后端：engine 字符串即后端 id（沿用托盘现有切换通道）。
+    // 本地三引擎走 shared_recognizer；paraformer 走独立在线识别槽；
+    // gguf/nim 是 HTTP 后端，转写时失败自动回退到本地 SenseVoice，所以这里
+    // 先准备一个 SenseVoice 兜底。
+    let engine_key = config.local_nonstreaming.engine.trim().to_ascii_lowercase();
+    let engine_key = engine_key.as_str();
+    if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
+        match paraformer_streaming::ParaformerStreamingRecognizer::create(
+            &config.paraformer_streaming,
+            &install_root,
+        ) {
+            Ok(recognizer) => {
+                info!(
+                    provider = recognizer.provider_used(),
+                    "paraformer-streaming recognizer ready at startup"
+                );
+                *shared_paraformer.lock().map_err(|_| {
+                    anyhow::anyhow!("paraformer slot poisoned at startup")
+                })? = Some(recognizer);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "paraformer recognizer failed at startup; continuing without it (tray switch will retry)");
+            }
+        }
+    }
+    let local_cfg_for_slot = if matches!(
+        engine_key,
+        "sense-voice" | "sensevoice" | "qwen3-asr" | "qwen3_asr" | "funasr-nano" | ""
+    ) {
+        config.local_nonstreaming.clone()
+    } else {
+        // HTTP 后端（gguf/nim）或未知键：槽里放 SenseVoice 兜底，保证老链路不断。
+        let mut fallback = config.local_nonstreaming.clone();
+        fallback.engine = "sense-voice".to_string();
+        fallback.model_dir = "models/sense-voice".to_string();
+        fallback
+    };
     let _tray = tray::Tray::start(
         hud.clone(),
         api_settings,
@@ -282,8 +325,12 @@ fn run_app() -> Result<()> {
         config_path.clone(),
         config.local_nonstreaming.engine.clone(),
         Arc::clone(&shared_recognizer),
+        Arc::clone(&shared_paraformer),
         install_root.clone(),
         config.local_nonstreaming.clone(),
+        config.paraformer_streaming.clone(),
+        config.funasr_gguf.clone(),
+        config.nim_whisper.clone(),
         api_notification_rx,
         Arc::clone(&shutdown),
     )
@@ -299,18 +346,19 @@ fn run_app() -> Result<()> {
     let whisper =
         cloud_asr::WhisperClient::new(&config.whisper).context("create cloud Whisper client")?;
     let local_recognizer = local_asr::LocalSenseVoiceRecognizer::create(
-        &config.local_nonstreaming,
+        &local_cfg_for_slot,
         &install_root,
     )
-    .context("create local SenseVoice recognizer (required)")?;
+    .context("create local recognizer (required)")?;
     {
         *shared_recognizer
             .lock()
             .map_err(|_| anyhow::anyhow!("recognizer slot poisoned at startup"))? = Some(local_recognizer);
     }
     info!(
-        model_dir = %config.local_nonstreaming.model_dir,
-        "local SenseVoice recognizer ready"
+        engine = %local_cfg_for_slot.engine,
+        model_dir = %local_cfg_for_slot.model_dir,
+        "local recognizer ready"
     );
 
     let (hotkey_tx, hotkey_rx) = mpsc::channel();
@@ -327,6 +375,7 @@ fn run_app() -> Result<()> {
         asr,
         whisper,
         Arc::clone(&shared_recognizer),
+        Arc::clone(&shared_paraformer),
         asr_sessions,
         modes,
         audio,

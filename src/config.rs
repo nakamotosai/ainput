@@ -17,6 +17,9 @@ pub struct AppConfig {
     pub asr: AsrConfig,
     pub whisper: WhisperConfig,
     pub local_nonstreaming: LocalNonstreamingConfig,
+    pub funasr_gguf: FunasrGgufConfig,
+    pub paraformer_streaming: ParaformerStreamingConfig,
+    pub nim_whisper: NimWhisperConfig,
     pub rewrite: RewriteConfig,
     #[serde(default = "RewriteConfig::prompt_studio_default")]
     pub prompt_studio: RewriteConfig,
@@ -101,6 +104,46 @@ pub struct LocalNonstreamingConfig {
     pub punct_model_dir: String,
     pub num_threads: i32,
     pub release_grace_ms: u64,
+    pub min_audio_ms: u64,
+    pub min_rms_dbfs: f32,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FunasrGgufConfig {
+    pub enabled: bool,
+    pub endpoint_url: String,
+    pub model_dir: String,
+    pub sample_rate_hz: u32,
+    pub language: String,
+    pub request_timeout_ms: u64,
+    pub min_audio_ms: u64,
+    pub min_rms_dbfs: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ParaformerStreamingConfig {
+    pub enabled: bool,
+    pub model_dir: String,
+    pub provider: String,
+    pub sample_rate_hz: u32,
+    pub num_threads: i32,
+    pub chunk_ms: u32,
+    pub min_audio_ms: u64,
+    pub min_rms_dbfs: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NimWhisperConfig {
+    pub enabled: bool,
+    pub endpoint_url: String,
+    pub model: String,
+    pub language: String,
+    pub sample_rate_hz: u32,
+    pub request_timeout_ms: u64,
+    pub api_key_env: String,
+    pub api_key: String,
     pub min_audio_ms: u64,
     pub min_rms_dbfs: f32,
 }
@@ -755,6 +798,9 @@ impl Default for AppConfig {
             asr: AsrConfig::default(),
             whisper: WhisperConfig::default(),
             local_nonstreaming: LocalNonstreamingConfig::default(),
+            funasr_gguf: FunasrGgufConfig::default(),
+            paraformer_streaming: ParaformerStreamingConfig::default(),
+            nim_whisper: NimWhisperConfig::default(),
             rewrite: RewriteConfig::default(),
             prompt_studio: RewriteConfig::prompt_studio_default(),
             suspect_terms: SuspectTermsConfig::default(),
@@ -879,6 +925,52 @@ impl Default for LocalNonstreamingConfig {
             punct_model_dir: "models/punct".to_string(),
             num_threads: 4,
             release_grace_ms: 80,
+            min_audio_ms: 800,
+            min_rms_dbfs: -56.0,
+        }
+    }
+}
+impl Default for FunasrGgufConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint_url: "http://127.0.0.1:8765/transcribe".to_string(),
+            model_dir: "models/funasr-gguf".to_string(),
+            sample_rate_hz: 16_000,
+            language: "auto".to_string(),
+            request_timeout_ms: 30_000,
+            min_audio_ms: 800,
+            min_rms_dbfs: -56.0,
+        }
+    }
+}
+
+impl Default for ParaformerStreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_dir: "models/paraformer-streaming".to_string(),
+            provider: "cpu".to_string(),
+            sample_rate_hz: 16_000,
+            num_threads: 4,
+            chunk_ms: 200,
+            min_audio_ms: 500,
+            min_rms_dbfs: -56.0,
+        }
+    }
+}
+
+impl Default for NimWhisperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint_url: "http://127.0.0.1:9000/v1/audio/transcriptions".to_string(),
+            model: "openai/whisper-large-v3".to_string(),
+            language: "zh-CN".to_string(),
+            sample_rate_hz: 16_000,
+            request_timeout_ms: 30_000,
+            api_key_env: "NGC_API_KEY".to_string(),
+            api_key: String::new(),
             min_audio_ms: 800,
             min_rms_dbfs: -56.0,
         }

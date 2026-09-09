@@ -60,6 +60,38 @@ release_grace_ms = 80
 min_audio_ms = 800
 min_rms_dbfs = -56.0
 
+[funasr_gguf]
+enabled = false
+endpoint_url = "http://127.0.0.1:8765/transcribe"
+model_dir = "models/funasr-gguf"
+sample_rate_hz = 16000
+language = "auto"
+request_timeout_ms = 30000
+min_audio_ms = 800
+min_rms_dbfs = -56.0
+
+[paraformer_streaming]
+enabled = false
+model_dir = "models/paraformer-streaming"
+provider = "cpu"
+sample_rate_hz = 16000
+num_threads = 4
+chunk_ms = 200
+min_audio_ms = 500
+min_rms_dbfs = -56.0
+
+[nim_whisper]
+enabled = false
+endpoint_url = "http://127.0.0.1:9000/v1/audio/transcriptions"
+model = "openai/whisper-large-v3"
+language = "zh-CN"
+sample_rate_hz = 16000
+request_timeout_ms = 30000
+api_key_env = "NGC_API_KEY"
+api_key = ""
+min_audio_ms = 800
+min_rms_dbfs = -56.0
+
 [rewrite]
 enabled = false
 streaming_enabled = false

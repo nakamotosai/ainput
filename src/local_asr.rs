@@ -99,10 +99,21 @@ impl Qwen3AsrModelBundle {
 impl FunAsrNanoModelBundle {
     fn from_dir(dir: &Path) -> Option<Self> {
         let encoder_int8 = dir.join("encoder_adaptor.int8.onnx");
-        let llm_int8 = dir.join("llm.int8.onnx");
         let embedding_int8 = dir.join("embedding.int8.onnx");
         let tokenizer_dir = dir.join("Qwen3-0.6B");
-        if !(encoder_int8.exists() && llm_int8.exists() && embedding_int8.exists()) {
+        // 2026-09-09: sherpa 官方新增 fp16 包（llm.fp16.onnx），精度与 int8 同源、
+        // 在部分 AMD 机器上可绕开 llm.int8.onnx 的静默空输出 bug（sherpa#828）。
+        // 优先 int8（更快），其次 fp16。
+        let llm_int8 = dir.join("llm.int8.onnx");
+        let llm_fp16 = dir.join("llm.fp16.onnx");
+        let llm_file = if llm_int8.exists() {
+            llm_int8
+        } else if llm_fp16.exists() {
+            llm_fp16
+        } else {
+            return None;
+        };
+        if !(encoder_int8.exists() && embedding_int8.exists()) {
             return None;
         }
         if !tokenizer_dir.is_dir() {
@@ -111,7 +122,7 @@ impl FunAsrNanoModelBundle {
         Some(Self {
             root_dir: dir.to_path_buf(),
             encoder_adaptor_file: encoder_int8,
-            llm_file: llm_int8,
+            llm_file,
             embedding_file: embedding_int8,
             tokenizer_dir,
         })
@@ -140,7 +151,7 @@ fn discover_funasr_nano_bundle(root_dir: &Path) -> Result<FunAsrNanoModelBundle>
         }
     }
     bail!(
-        "no funasr-nano model bundle found under {} (need encoder_adaptor.int8.onnx + llm.int8.onnx + embedding.int8.onnx + Qwen3-0.6B/)",
+        "no funasr-nano model bundle found under {} (need encoder_adaptor.int8.onnx + embedding.int8.onnx + llm.int8.onnx/llm.fp16.onnx + Qwen3-0.6B/)",
         root_dir.display()
     );
 }

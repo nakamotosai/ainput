@@ -22,6 +22,12 @@ models/**/*.onnx
 models/**/*.tar.bz2
 models/**/*.tar.gz
 models/**/test_wavs/
+models/funasr-gguf-origin/
+models/funasr-gguf/
+models/paraformer-streaming/*.tar.bz2
+models/funasr-nano-fp16/*.tar.bz2
+*.gguf
+*.pt
 !models/**/LICENSE
 !models/**/README.md
 scripts/_*.py
@@ -34,3 +40,7 @@ docs/validation/
 PLAN.md
 SPEC.md
 tmp-*.log
+sidecar/_upstream/
+sidecar/funasr-gguf-bin/
+sidecar/export-venv/
+sidecar/_conv_b10876/

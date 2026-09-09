@@ -309,6 +309,8 @@ pub struct VoiceWorker {
     asr: CloudAsrClient,
     whisper: WhisperClient,
     local_recognizer: Arc<Mutex<Option<LocalSenseVoiceRecognizer>>>,
+    shared_paraformer:
+        Arc<Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>>,
     asr_sessions: AsrSessionPool,
     modes: ModeStore,
     audio: AudioHub,
@@ -328,6 +330,9 @@ impl VoiceWorker {
         asr: CloudAsrClient,
         whisper: WhisperClient,
         local_recognizer: Arc<Mutex<Option<LocalSenseVoiceRecognizer>>>,
+        shared_paraformer: Arc<
+            Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>,
+        >,
         asr_sessions: AsrSessionPool,
         modes: ModeStore,
         audio: AudioHub,
@@ -345,6 +350,7 @@ impl VoiceWorker {
             asr,
             whisper,
             local_recognizer,
+            shared_paraformer,
             asr_sessions,
             modes,
             audio,
@@ -1484,19 +1490,67 @@ impl VoiceWorker {
             return Ok(());
         }
 
-        let (response, asr_elapsed_ms) = {
-            let guard = self
-                .local_recognizer
-                .lock()
-                .map_err(|_| anyhow!("local recognizer lock poisoned"))?;
-            let recognizer = guard
-                .as_ref()
-                .ok_or_else(|| anyhow!("local non-streaming recognizer is unavailable"))?;
-            let transcribe_started = Instant::now();
-            let response = recognizer
-                .transcribe_samples(sample_rate_hz, &samples)
-                .context("transcribe with local SenseVoice")?;
-            (response, transcribe_started.elapsed().as_millis())
+        // 2026-09-09 三后端分发：engine 字符串即后端 id（托盘切换通道）。
+        // gguf/nim 是 HTTP 后端，失败如实报错（HUD + 历史），绝不静默回退成本地，
+        // 否则用户会把 SenseVoice 的结果误当新后端的效果。
+        let engine_key = self
+            .config
+            .local_nonstreaming
+            .engine
+            .trim()
+            .to_ascii_lowercase();
+        let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) =
+            if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
+                let chunk_ms = self.config.paraformer_streaming.chunk_ms;
+                let guard = self
+                    .shared_paraformer
+                    .lock()
+                    .map_err(|_| anyhow!("paraformer recognizer lock poisoned"))?;
+                let recognizer = guard.as_ref().ok_or_else(|| {
+                    anyhow!("paraformer-streaming recognizer is unavailable (model missing?切回其它引擎重试)")
+                })?;
+                let transcribe_started = Instant::now();
+                let text = recognizer
+                    .transcribe_streaming(sample_rate_hz, &samples, chunk_ms)
+                    .context("transcribe with paraformer-streaming")?;
+                let root = recognizer.root_dir().to_path_buf();
+                (text, root, transcribe_started.elapsed().as_millis())
+            } else if engine_key == "funasr-gguf" || engine_key == "funasr_gguf" {
+                let client = crate::funasr_gguf::GgufClient::new(&self.config.funasr_gguf)
+                    .context("funasr-gguf sidecar not configured")?;
+                let transcribe_started = Instant::now();
+                let text = client
+                    .transcribe(sample_rate_hz, &samples)
+                    .context("transcribe with funasr-gguf sidecar (边车没起？先跑 sidecar/funasr_gguf_server.py)")?;
+                let root = PathBuf::from(&self.config.funasr_gguf.model_dir);
+                (text, root, transcribe_started.elapsed().as_millis())
+            } else if engine_key == "nim-whisper" || engine_key == "nim_whisper" {
+                let client = crate::nim_whisper::NimWhisperClient::new(&self.config.nim_whisper)
+                    .context("nim-whisper not configured")?;
+                let transcribe_started = Instant::now();
+                let text = client
+                    .transcribe(sample_rate_hz, &samples)
+                    .context("transcribe with NIM whisper (服务没起或密钥不对？)")?;
+                let root = PathBuf::from(&self.config.nim_whisper.endpoint_url);
+                (text, root, transcribe_started.elapsed().as_millis())
+            } else {
+                let guard = self
+                    .local_recognizer
+                    .lock()
+                    .map_err(|_| anyhow!("local recognizer lock poisoned"))?;
+                let recognizer = guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("local non-streaming recognizer is unavailable"))?;
+                let transcribe_started = Instant::now();
+                let response = recognizer
+                    .transcribe_samples(sample_rate_hz, &samples)
+                    .context("transcribe with local SenseVoice")?;
+                let root = response.model_root.clone();
+                (response.text, root, transcribe_started.elapsed().as_millis())
+            };
+        let response = crate::local_asr::LocalTranscription {
+            text: backend_text,
+            model_root: backend_model_root,
         };
         let mut raw_text = prepare_asr_text(&response.text);
         let output_language = self.rewrite_language.current();
