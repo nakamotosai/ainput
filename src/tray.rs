@@ -862,7 +862,7 @@ fn set_local_engine(engine: &str, model_dir: &str) {
                 return;
             }
             if state.current_engine == engine {
-                state.hud.show_text(&format!("识别引擎已是：{engine}"), true, false);
+                state.hud.show_text(&format!("已是 {engine}"), true, false);
                 return;
             }
             match update_local_engine_config(&state.config_path, engine, model_dir) {
@@ -874,7 +874,7 @@ fn set_local_engine(engine: &str, model_dir: &str) {
                     state.switching.store(true, Ordering::Relaxed);
                     post_switch_anim(MSG_SWITCH_ANIM_START);
                     state.hud.show_text(
-                        &format!("识别引擎切换中：{engine}\n约 5-10 秒后自动生效，不用重启"),
+                        &format!("切换中：{engine}"),
                         false,
                         false,
                     );
@@ -905,7 +905,7 @@ fn set_local_engine(engine: &str, model_dir: &str) {
                 Ok(recognizer) => match slot.lock() {
                     Ok(mut guard) => {
                         *guard = Some(recognizer);
-                        format!("识别引擎已切换：{engine_owned}\n立即生效，不用重启")
+                        format!("已切换 {engine_owned}，立即生效")
                     }
                     Err(_) => "切换失败：内存槽位异常".to_string(),
                 },
@@ -932,7 +932,7 @@ fn set_funasr_gguf_backend() {
             return;
         }
         if normalize_engine_key(&state.current_engine) == ENGINE {
-            state.hud.show_text("识别引擎已是：funasr-gguf", true, false);
+            state.hud.show_text("已是 FunASR-GGUF", true, false);
             return;
         }
         // 快切换也给动画：占位即闪，播够约 0.9 秒再还，不堵托盘。
@@ -945,11 +945,7 @@ fn set_funasr_gguf_backend() {
                 if let Ok(mut live) = state.shared_engine.lock() {
                     *live = ENGINE.to_string();
                 }
-                state.hud.show_text(
-                    "识别引擎已切换：FunASR-GGUF\n先跑 scripts/start_gguf_sidecar.ps1 起边车\n边车没起会如实报错，不用重启",
-                    true,
-                    false,
-                );
+                state.hud.show_text("已切换 FunASR-GGUF", true, false);
                 info!(engine = ENGINE, config_path = %state.config_path.display(), "funasr-gguf switch from tray");
                 release_switch_anim_after_min_visible(
                     Arc::clone(&state.switching),

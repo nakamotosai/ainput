@@ -1100,7 +1100,7 @@ impl Default for HudConfig {
             text_color: "#FFFFFF".to_string(),
             text_alpha: 255,
             text_effect: HudTextEffect::Solid,
-            shadow_enabled: false,
+            shadow_enabled: true,
             shadow_color: "#000000".to_string(),
             shadow_alpha: 160,
             shadow_offset_x_px: 1,
@@ -1109,7 +1109,7 @@ impl Default for HudConfig {
             rainbow_lightness_percent: 78,
             rainbow_step_degree: 28,
             background_color: "#071014".to_string(),
-            background_alpha: 230,
+            background_alpha: 0,
             corner_radius_px: 16,
             display_hold_ms: 3000,
         }
