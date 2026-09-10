@@ -1864,12 +1864,25 @@ impl VoiceWorker {
                 .lock()
                 .map(|guard| guard.is_some())
                 .unwrap_or(false);
-        // Turbo直贴实验只在“改写关 + 调试面板关 + 语音指令关”时试：
-        // 改写会改字、指令不落字，都跟“句中落盘”犯冲，直接走 HUD 老路。
-        let direct_wanted = turbo_live
-            && !self.rewrite_language.rewrite_enabled()
-            && !self.debug_panel.is_enabled()
-            && !self.voice_command.enabled();
+        // Turbo直贴实验只在"改写关 + 调试面板关 + 语音指令关"时试：
+        // 改写会改字、指令命中整句走指令通道，都跟"句中落盘"犯冲，直接走 HUD 老路。
+        // 2026-09-10 复盘：语音指令默认开，曾把直贴静默否决且零日志；
+        // turbo 会话每次打一行门状态，以后哪个门拦的一查便知。
+        let rewrite_off = !self.rewrite_language.rewrite_enabled();
+        let debug_off = !self.debug_panel.is_enabled();
+        let voice_off = !self.voice_command.enabled();
+        let direct_wanted = turbo_live && rewrite_off && debug_off && voice_off;
+        if turbo_live {
+            info!(
+                utterance_id,
+                rewrite_off,
+                debug_off,
+                voice_off,
+                shared_direct = self.shared_turbo_direct.load(Ordering::Relaxed),
+                direct_wanted,
+                "turbo直贴实验门状态"
+            );
+        }
         let live_outcome: Option<(
             String,
             PathBuf,
@@ -2039,7 +2052,8 @@ impl VoiceWorker {
         };
         let mut raw_text = prepare_asr_text(&response.text);
         // Turbo直贴实验：句中已增量落盘，这里只做收尾对账，不再整段粘贴。
-        // （语音指令/改写开着时 direct_wanted 本来就是 false，到不了这里。）
+        // （改写/语音指令开着时 direct_wanted 为 false，到不了这里；
+        // 门状态见本文件上面的 turbo直贴实验门状态日志。）
         if let Some(direct_session) = turbo_direct_session {
             if self.finish_turbo_direct_if_inserted(
                 &utterance_id,

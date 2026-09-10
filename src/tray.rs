@@ -1193,9 +1193,14 @@ fn toggle_turbo_direct_paste() {
             Ok(()) => {
                 state.shared_turbo_direct.store(next, Ordering::Relaxed);
                 state.turbo_config.direct_paste_experiment = next;
+                let voice_on = state.voice_command.enabled();
                 state.hud.show_text(
                     if next {
-                        "Turbo直贴实验：开\n只贴定稿增量，草稿还不贴；改写/终端/换窗口自动退回HUD"
+                        if voice_on {
+                            "Turbo直贴实验：开\n但语音指令（老蔡老蔡）开着，直贴被否决仍走HUD；\n托盘取消勾选语音指令即生效"
+                        } else {
+                            "Turbo直贴实验：开\n只贴定稿增量，草稿还不贴；改写/终端/换窗口自动退回HUD"
+                        }
                     } else {
                         "Turbo直贴实验：关\n回到HUD看草稿、松开粘贴"
                     },
