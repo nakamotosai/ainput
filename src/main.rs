@@ -8,7 +8,6 @@ mod audio;
 mod cloud_asr;
 mod config;
 mod funasr_gguf;
-mod nim_whisper;
 mod debug_panel;
 mod history;
 mod history_panel;
@@ -17,7 +16,6 @@ mod hotkey_panel;
 mod hotkey_user;
 mod hud;
 mod local_asr;
-mod paraformer_streaming;
 mod modes;
 mod output;
 mod personal_corrections;
@@ -29,11 +27,9 @@ mod rewrite_prompt_panel;
 mod suspect_terms;
 mod term_embeddings;
 mod tray;
-mod turbo_direct;
 mod voice_command;
 mod voice_command_panel;
 mod web_ui;
-mod whisper_turbo;
 mod worker;
 
 use std::path::PathBuf;
@@ -272,48 +268,18 @@ fn run_app() -> Result<()> {
     .context("start hotkey panel")?;
     let shared_recognizer: Arc<Mutex<Option<local_asr::LocalSenseVoiceRecognizer>>> =
         Arc::new(Mutex::new(None));
-    let shared_paraformer: Arc<
-        Mutex<Option<paraformer_streaming::ParaformerStreamingRecognizer>>,
-    > = Arc::new(Mutex::new(None));
-    // 2026-09-09 三后端：engine 字符串即后端 id（沿用托盘现有切换通道）。
-    // 2026-09-10 真切换修复：托盘→worker 加 shared_engine 活线，分发每句读它；
-    // sense-voice/qwen3/funasr-nano 走 shared_recognizer（托盘热换槽）；
-    // paraformer-streaming 走独立在线识别槽 shared_paraformer；
-    // gguf/nim 是 HTTP 后端（每次转写现建客户端），失败直接报错、不回退；
-    // 非本地三引擎时槽里放 SenseVoice，保证老链路不断（不是给 gguf/nim 兜底）。
-    // Turbo直贴实验活线：托盘开关 ↔ worker 句读它，默认关。
-    let shared_turbo_direct: Arc<AtomicBool> =
-        Arc::new(AtomicBool::new(config.whisper_turbo.direct_paste_experiment));
+    // engine 字符串即后端 id（沿用托盘现有切换通道）。
+    // 托盘→worker 加 shared_engine 活线，分发每句读它；
+    // sense-voice 走 shared_recognizer（托盘热换槽）；
+    // gguf 是 HTTP 边车（每次转写现建客户端），失败直接报错、不回退。
     let shared_engine: Arc<Mutex<String>> =
         Arc::new(Mutex::new(config.local_nonstreaming.engine.clone()));
     let engine_key = config.local_nonstreaming.engine.trim().to_ascii_lowercase();
     let engine_key = engine_key.as_str();
-    if engine_key == "paraformer-streaming" || engine_key == "paraformer" {
-        match paraformer_streaming::ParaformerStreamingRecognizer::create(
-            &config.paraformer_streaming,
-            &install_root,
-        ) {
-            Ok(recognizer) => {
-                info!(
-                    provider = recognizer.provider_used(),
-                    "paraformer-streaming recognizer ready at startup"
-                );
-                *shared_paraformer.lock().map_err(|_| {
-                    anyhow::anyhow!("paraformer slot poisoned at startup")
-                })? = Some(recognizer);
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "paraformer recognizer failed at startup; continuing without it (tray switch will retry)");
-            }
-        }
-    }
-    let local_cfg_for_slot = if matches!(
-        engine_key,
-        "sense-voice" | "sensevoice" | "qwen3-asr" | "qwen3_asr" | "funasr-nano" | ""
-    ) {
+    let local_cfg_for_slot = if matches!(engine_key, "sense-voice" | "sensevoice" | "") {
         config.local_nonstreaming.clone()
     } else {
-        // HTTP 后端（gguf/nim）或未知键：槽里放 SenseVoice 兜底，保证老链路不断。
+        // HTTP 边车（gguf）或未知键：槽里放 SenseVoice 兜底，保证老链路不断。
         let mut fallback = config.local_nonstreaming.clone();
         fallback.engine = "sense-voice".to_string();
         fallback.model_dir = "models/sense-voice".to_string();
@@ -335,14 +301,9 @@ fn run_app() -> Result<()> {
         config.local_nonstreaming.engine.clone(),
         Arc::clone(&shared_engine),
         Arc::clone(&shared_recognizer),
-        Arc::clone(&shared_paraformer),
         install_root.clone(),
         config.local_nonstreaming.clone(),
-        config.paraformer_streaming.clone(),
         config.funasr_gguf.clone(),
-        config.nim_whisper.clone(),
-        config.whisper_turbo.clone(),
-        Arc::clone(&shared_turbo_direct),
         api_notification_rx,
         Arc::clone(&shutdown),
     )
@@ -387,9 +348,7 @@ fn run_app() -> Result<()> {
         asr,
         whisper,
         Arc::clone(&shared_recognizer),
-        Arc::clone(&shared_paraformer),
         Arc::clone(&shared_engine),
-        Arc::clone(&shared_turbo_direct),
         asr_sessions,
         modes,
         audio,

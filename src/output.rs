@@ -656,7 +656,7 @@ pub fn paste_text_to_target_with_trace(
             text_actions: prepared.actions,
         });
     }
-    // Transient-block guards retry with a short settle window: slow engines (e.g. qwen3
+    // Transient-block guards retry with a short settle window: slow engines
     // at ~2.4s) leave a wide window where the user may be mid-click or windows are
     // switching (HUD Busy, IME), and one-shot checks turn that into silent copy-only.
     const PASTE_SETTLE_MAX_ATTEMPTS: usize = 6;

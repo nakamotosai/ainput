@@ -72,15 +72,7 @@ const MENU_VOICE_COMMAND_ENABLED: usize = 2901;
 const MENU_VOICE_COMMAND_EDIT: usize = 2902;
 const MENU_HOTKEY_EDIT: usize = 2910;
 const MENU_ENGINE_SENSE_VOICE: usize = 3001;
-const MENU_ENGINE_QWEN3: usize = 3002;
-const MENU_ENGINE_FUNASR_NANO: usize = 3003;
 const MENU_ENGINE_FUNASR_GGUF: usize = 3004;
-const MENU_ENGINE_PARAFORMER_STREAMING: usize = 3005;
-const MENU_ENGINE_WHISPER_TURBO: usize = 3007;
-const MENU_TURBO_DIRECT_PASTE: usize = 3008;
-// 2026-09-10 云端档收起：编号保留，Docker 回归时恢复菜单。
-#[allow(dead_code)]
-const MENU_ENGINE_NIM_WHISPER: usize = 3006;
 
 pub struct Tray {
     thread_id: u32,
@@ -104,16 +96,9 @@ impl Tray {
         current_engine: String,
         shared_engine: Arc<Mutex<String>>,
         shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
-        shared_paraformer: Arc<
-            Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>,
-        >,
         install_root: PathBuf,
         local_config: crate::config::LocalNonstreamingConfig,
-        paraformer_config: crate::config::ParaformerStreamingConfig,
         gguf_config: crate::config::FunasrGgufConfig,
-        nim_config: crate::config::NimWhisperConfig,
-        turbo_config: crate::config::WhisperTurboConfig,
-        shared_turbo_direct: Arc<AtomicBool>,
         api_notifications: mpsc::Receiver<String>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -139,14 +124,9 @@ impl Tray {
                     current_engine,
                     shared_engine,
                     shared_recognizer,
-                    shared_paraformer,
                     install_root,
                     local_config,
-                    paraformer_config,
                     gguf_config,
-                    nim_config,
-                    turbo_config,
-                    shared_turbo_direct,
                     switching: Arc::new(AtomicBool::new(false)),
                     shutdown,
                 });
@@ -197,15 +177,9 @@ struct TrayState {
     current_engine: String,
     shared_engine: Arc<Mutex<String>>,
     shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
-    shared_paraformer:
-        Arc<Mutex<Option<crate::paraformer_streaming::ParaformerStreamingRecognizer>>>,
     install_root: PathBuf,
     local_config: crate::config::LocalNonstreamingConfig,
-    paraformer_config: crate::config::ParaformerStreamingConfig,
     gguf_config: crate::config::FunasrGgufConfig,
-    nim_config: crate::config::NimWhisperConfig,
-    turbo_config: crate::config::WhisperTurboConfig,
-    shared_turbo_direct: Arc<AtomicBool>,
     switching: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
@@ -367,18 +341,7 @@ unsafe fn show_api_setup_balloon(hwnd: HWND, message: &str) {
 fn normalize_engine_key(engine: &str) -> String {
     let lowered = engine.trim().to_ascii_lowercase();
     match lowered.as_str() {
-        "qwen3-asr" | "qwen3_asr" | "qwen3asr" | "qwen3" => "qwen3-asr".to_string(),
-        "funasr-nano" | "funasr_nano" | "fun-asr-nano" | "funasrnano" => "funasr-nano".to_string(),
         "funasr-gguf" | "funasr_gguf" | "fun-asr-gguf" | "funasrgguf" => "funasr-gguf".to_string(),
-        "paraformer-streaming" | "paraformer_streaming" | "paraformer" | "paraformer-large" => {
-            "paraformer-streaming".to_string()
-        }
-        "nim-whisper" | "nim_whisper" | "whisper-nim" | "whisper-large-v3" | "whisper_cloud" => {
-            "nim-whisper".to_string()
-        }
-        "whisper-turbo" | "whisper_turbo" | "turbo" | "whisper-turbo-streaming" => {
-            "whisper-turbo".to_string()
-        }
         "sense-voice" | "sense_voice" | "sensevoice" | "" => "sense-voice".to_string(),
         _ => lowered,
     }
@@ -386,12 +349,7 @@ fn normalize_engine_key(engine: &str) -> String {
 
 fn engine_display_name(engine: &str) -> &'static str {
     match normalize_engine_key(engine).as_str() {
-        "qwen3-asr" => "Qwen3-ASR",
-        "funasr-nano" => "FunASR-Nano",
         "funasr-gguf" => "FunASR-GGUF",
-        "paraformer-streaming" => "Paraformer流式",
-        "nim-whisper" => "Whisper云端",
-        "whisper-turbo" => "Whisper-Turbo",
         _ => "SenseVoice",
     }
 }
@@ -525,7 +483,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
                 state.hotkey_user.local_nonstreaming(),
                 state.current_engine.clone(),
                 state.switching.load(Ordering::Relaxed),
-                state.shared_turbo_direct.load(Ordering::Relaxed),
             )
         })
     });
@@ -537,7 +494,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         voice_hotkey_label,
         current_engine,
         switching_engine,
-        turbo_direct,
     )) = state_snapshot
     else {
         let _ = unsafe { DestroyMenu(menu) };
@@ -695,17 +651,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         append_menu_text(
             menu,
             engine_flag
-                | if normalize_engine_key(&current_engine) == "qwen3-asr" {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_ENGINE_QWEN3,
-            "Qwen3-ASR 0.6B（更准·较慢）",
-        );
-        append_menu_text(
-            menu,
-            engine_flag
                 | if normalize_engine_key(&current_engine) == "funasr-gguf" {
                     MF_CHECKED
                 } else {
@@ -713,35 +658,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
                 },
             MENU_ENGINE_FUNASR_GGUF,
             "FunASR-GGUF（更准·本地）",
-        );
-        append_menu_text(
-            menu,
-            engine_flag
-                | if normalize_engine_key(&current_engine) == "paraformer-streaming" {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_ENGINE_PARAFORMER_STREAMING,
-            "Paraformer流式（边说边出）",
-        );
-        // 2026-09-10 云端档收起：hosted 语音已下架，入口隐藏（Docker 回归时恢复）。
-        append_menu_text(
-            menu,
-            engine_flag
-                | if normalize_engine_key(&current_engine) == "whisper-turbo" {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_ENGINE_WHISPER_TURBO,
-            "Whisper-Turbo（显卡流式）",
-        );
-        append_menu_text(
-            menu,
-            MF_STRING | if turbo_direct { MF_CHECKED } else { MF_UNCHECKED },
-            MENU_TURBO_DIRECT_PASTE,
-            "Turbo直贴实验（只贴定稿增量·默认关）",
         );
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
@@ -783,11 +699,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_VOICE_COMMAND_EDIT => open_voice_command_panel(),
             MENU_HOTKEY_EDIT => open_hotkey_panel(),
             MENU_ENGINE_SENSE_VOICE => set_local_engine("sense-voice", "models/sense-voice"),
-            MENU_ENGINE_WHISPER_TURBO => set_whisper_turbo_backend(),
-            MENU_ENGINE_QWEN3 => set_local_engine("qwen3-asr", "models/qwen3-asr"),
             MENU_ENGINE_FUNASR_GGUF => set_funasr_gguf_backend(),
-            MENU_ENGINE_PARAFORMER_STREAMING => set_paraformer_backend(),
-            MENU_TURBO_DIRECT_PASTE => toggle_turbo_direct_paste(),
             MENU_AUTO_START => toggle_auto_start(),
             MENU_RESTART => {
                 // 重启 = 以当前 exe 再拉一个新实例：新实例发现互斥锁被占，
@@ -1006,77 +918,6 @@ fn set_local_engine(engine: &str, model_dir: &str) {
         });
     });
 }
-fn set_paraformer_backend() {
-    const ENGINE: &str = "paraformer-streaming";
-    const MODEL_DIR: &str = "models/paraformer-streaming";
-    TRAY_STATE.with(|state| {
-        let (slot, install_root, switching_flag, hud, new_config) = {
-            let mut state_cell = state.borrow_mut();
-            let Some(state) = state_cell.as_mut() else {
-                return;
-            };
-            if state.switching.load(Ordering::Relaxed) {
-                state.hud.show_text("正在切换引擎，请稍等完成", false, false);
-                return;
-            }
-            if normalize_engine_key(&state.current_engine) == ENGINE {
-                state.hud.show_text("识别引擎已是：paraformer-streaming", true, false);
-                return;
-            }
-            match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
-                Ok(()) => {
-                    state.current_engine = ENGINE.to_string();
-                    if let Ok(mut live) = state.shared_engine.lock() {
-                        *live = ENGINE.to_string();
-                    }
-                    state.switching.store(true, Ordering::Relaxed);
-                    post_switch_anim(MSG_SWITCH_ANIM_START);
-                    state.hud.show_text(
-                        "识别引擎切换中：paraformer-streaming\n约 5-10 秒后自动生效，不用重启",
-                        false,
-                        false,
-                    );
-                    info!(engine = ENGINE, config_path = %state.config_path.display(), "paraformer streaming switch requested from tray");
-                    let mut cfg = state.paraformer_config.clone();
-                    cfg.model_dir = MODEL_DIR.to_string();
-                    (
-                        Arc::clone(&state.shared_paraformer),
-                        state.install_root.clone(),
-                        Arc::clone(&state.switching),
-                        state.hud.clone(),
-                        cfg,
-                    )
-                }
-                Err(error) => {
-                    state.hud.show_text(&format!("切换失败：{error}"), false, false);
-                    warn!(error = %error, engine = ENGINE, "failed to persist paraformer switch");
-                    return;
-                }
-            }
-        };
-        thread::spawn(move || {
-            let result = crate::paraformer_streaming::ParaformerStreamingRecognizer::create(
-                &new_config,
-                &install_root,
-            );
-            let toast = match result {
-                Ok(recognizer) => match slot.lock() {
-                    Ok(mut guard) => {
-                        let provider = recognizer.provider_used().to_string();
-                        *guard = Some(recognizer);
-                        format!("识别引擎已切换：Paraformer流式（{provider}）\n立即生效，不用重启")
-                    }
-                    Err(_) => "切换失败：内存槽位异常".to_string(),
-                },
-                Err(error) => format!("切换失败：{error}"),
-            };
-            switching_flag.store(false, Ordering::Relaxed);
-            post_switch_anim(MSG_SWITCH_ANIM_STOP);
-            hud.show_text(&toast, true, false);
-            info!("paraformer streaming hot-swap finished");
-        });
-    });
-}
 
 fn set_funasr_gguf_backend() {
     const ENGINE: &str = "funasr-gguf";
@@ -1120,195 +961,6 @@ fn set_funasr_gguf_backend() {
                 warn!(error = %error, engine = ENGINE, "failed to persist gguf switch");
                 state.switching.store(false, Ordering::Relaxed);
                 post_switch_anim(MSG_SWITCH_ANIM_STOP);
-            }
-        }
-    });
-}
-
-fn set_whisper_turbo_backend() {
-    const ENGINE: &str = "whisper-turbo";
-    const MODEL_DIR: &str = "models/whisper-turbo";
-    TRAY_STATE.with(|state| {
-        let mut state_cell = state.borrow_mut();
-        let Some(state) = state_cell.as_mut() else {
-            return;
-        };
-        if state.switching.load(Ordering::Relaxed) {
-            state.hud.show_text("正在切换引擎，请稍等完成", false, false);
-            return;
-        }
-        if normalize_engine_key(&state.current_engine) == ENGINE {
-            state.hud.show_text("识别引擎已是：whisper-turbo", true, false);
-            return;
-        }
-        // 快切换也给动画：占位即闪，播够约 0.9 秒再还，不堵托盘。
-        state.switching.store(true, Ordering::Relaxed);
-        post_switch_anim(MSG_SWITCH_ANIM_START);
-        let anim_started = std::time::Instant::now();
-        match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
-            Ok(()) => {
-                state.current_engine = ENGINE.to_string();
-                if let Ok(mut live) = state.shared_engine.lock() {
-                    *live = ENGINE.to_string();
-                }
-                let endpoint = state.turbo_config.endpoint_url.clone();
-                state.hud.show_text(
-                    &format!("识别引擎已切换：Whisper-Turbo（显卡流式）\n{endpoint}\n先跑 scripts/start_turbo_sidecar.ps1 起边车\n边车没起会如实报错，不用重启"),
-                    true,
-                    false,
-                );
-                info!(engine = ENGINE, config_path = %state.config_path.display(), "whisper-turbo switch from tray");
-                release_switch_anim_after_min_visible(
-                    Arc::clone(&state.switching),
-                    anim_started,
-                );
-            }
-            Err(error) => {
-                state.hud.show_text(&format!("切换失败：{error}"), false, false);
-                warn!(error = %error, engine = ENGINE, "failed to persist turbo switch");
-                state.switching.store(false, Ordering::Relaxed);
-                post_switch_anim(MSG_SWITCH_ANIM_STOP);
-            }
-        }
-    });
-}
-
-/// Turbo直贴实验开关：托盘点选即翻转，活线立刻生效，落盘 [whisper_turbo] 方便下次记住。
-fn toggle_turbo_direct_paste() {
-    TRAY_STATE.with(|state| {
-        let mut state_cell = state.borrow_mut();
-        let Some(state) = state_cell.as_mut() else {
-            return;
-        };
-        if state.switching.load(Ordering::Relaxed) {
-            state.hud.show_text("正在切换引擎，请稍等完成", false, false);
-            return;
-        }
-        // 开关也闪一下：占位即闪，播够约 0.9 秒再还，不堵托盘。
-        state.switching.store(true, Ordering::Relaxed);
-        post_switch_anim(MSG_SWITCH_ANIM_START);
-        let anim_started = std::time::Instant::now();
-        let next = !state.shared_turbo_direct.load(Ordering::Relaxed);
-        match update_whisper_turbo_flag(&state.config_path, "direct_paste_experiment", next) {
-            Ok(()) => {
-                state.shared_turbo_direct.store(next, Ordering::Relaxed);
-                state.turbo_config.direct_paste_experiment = next;
-                let voice_on = state.voice_command.enabled();
-                state.hud.show_text(
-                    if next {
-                        if voice_on {
-                            "Turbo直贴实验：开\n但语音指令（老蔡老蔡）开着，直贴被否决仍走HUD；\n托盘取消勾选语音指令即生效"
-                        } else {
-                            "Turbo直贴实验：开\n只贴定稿增量，草稿还不贴；改写/终端/换窗口自动退回HUD"
-                        }
-                    } else {
-                        "Turbo直贴实验：关\n回到HUD看草稿、松开粘贴"
-                    },
-                    true,
-                    false,
-                );
-                info!(enabled = next, "turbo direct-paste experiment toggled from tray");
-                release_switch_anim_after_min_visible(
-                    Arc::clone(&state.switching),
-                    anim_started,
-                );
-            }
-            Err(error) => {
-                state.hud.show_text(&format!("开关没存上：{error}"), false, false);
-                warn!(error = %error, "failed to persist turbo direct-paste toggle");
-                state.switching.store(false, Ordering::Relaxed);
-                post_switch_anim(MSG_SWITCH_ANIM_STOP);
-            }
-        }
-    });
-}
-
-/// 给 [whisper_turbo] 写一个裸 bool 键（true/false 不加引号），段不存在就补段。
-fn update_whisper_turbo_flag(
-    config_path: &std::path::Path,
-    key: &str,
-    value: bool,
-) -> Result<()> {
-    use std::fs;
-
-    if !config_path.exists() {
-        anyhow::bail!("config file not found: {}", config_path.display());
-    }
-    let raw = fs::read_to_string(config_path)
-        .with_context(|| format!("read config {}", config_path.display()))?;
-    let section = "[whisper_turbo]";
-    let wanted = value.to_string();
-    let mut in_section = false;
-    let mut section_seen = false;
-    let mut replaced = false;
-    let mut output: Vec<String> = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            if in_section && !replaced {
-                output.push(format!("{key} = {wanted}"));
-                replaced = true;
-            }
-            section_seen = section_seen || trimmed.eq_ignore_ascii_case(section);
-            in_section = trimmed.eq_ignore_ascii_case(section);
-            output.push(line.to_string());
-            continue;
-        }
-        if in_section && !replaced && trimmed.split('=').next().map(str::trim) == Some(key) {
-            output.push(format!("{key} = {wanted}"));
-            replaced = true;
-            continue;
-        }
-        output.push(line.to_string());
-    }
-    if in_section && !replaced {
-        output.push(format!("{key} = {wanted}"));
-    }
-    if !section_seen {
-        output.push(section.to_string());
-        output.push(format!("{key} = {wanted}"));
-    }
-    let write_target = config_path.with_extension("toml.tmp-write");
-    fs::write(&write_target, format!("{}\n", output.join("\n")))
-        .with_context(|| format!("write config {}", write_target.display()))?;
-    fs::rename(&write_target, config_path)
-        .with_context(|| format!("replace config {}", config_path.display()))?;
-    Ok(())
-}
-#[allow(dead_code)]
-fn set_nim_whisper_backend() {
-    const ENGINE: &str = "nim-whisper";
-    const MODEL_DIR: &str = "models/nim-whisper";
-    TRAY_STATE.with(|state| {
-        let mut state_cell = state.borrow_mut();
-        let Some(state) = state_cell.as_mut() else {
-            return;
-        };
-        if state.switching.load(Ordering::Relaxed) {
-            state.hud.show_text("正在切换引擎，请稍等完成", false, false);
-            return;
-        }
-        if normalize_engine_key(&state.current_engine) == ENGINE {
-            state.hud.show_text("识别引擎已是：nim-whisper", true, false);
-            return;
-        }
-        match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
-            Ok(()) => {
-                state.current_engine = ENGINE.to_string();
-                if let Ok(mut live) = state.shared_engine.lock() {
-                    *live = ENGINE.to_string();
-                }
-                let endpoint = state.nim_config.endpoint_url.clone();
-                state.hud.show_text(
-                    &format!("识别引擎已切换：Whisper云端\n{endpoint}\n连不上会如实报错（需本地 NIM 容器或云授权），不用重启"),
-                    true,
-                    false,
-                );
-                info!(engine = ENGINE, config_path = %state.config_path.display(), "nim-whisper switch from tray");
-            }
-            Err(error) => {
-                state.hud.show_text(&format!("切换失败：{error}"), false, false);
-                warn!(error = %error, engine = ENGINE, "failed to persist nim switch");
             }
         }
     });
@@ -1541,18 +1193,18 @@ mod tests {
         )
         .unwrap();
 
-        update_local_engine_config(&path, "qwen3-asr", "models/qwen3-asr").unwrap();
+        update_local_engine_config(&path, "funasr-gguf", "models/funasr-gguf").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("engine = \"qwen3-asr\""));
-        assert!(raw.contains("model_dir = \"models/qwen3-asr\""));
+        assert!(raw.contains("engine = \"funasr-gguf\""));
+        assert!(raw.contains("model_dir = \"models/funasr-gguf\""));
         assert!(raw.contains("num_threads = 4"));
         assert!(raw.contains("[rewrite]"));
         assert!(raw.contains("enabled = false"));
 
-        let result = update_local_engine_config(&path, "funasr-nano", "models/funasr-nano");
+        let result = update_local_engine_config(&path, "sense-voice", "models/sense-voice");
         assert!(result.is_ok());
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("engine = \"funasr-nano\""));
+        assert!(raw.contains("engine = \"sense-voice\""));
     }
 
     #[test]
@@ -1563,10 +1215,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("missing.toml");
         std::fs::write(&path, "[local_nonstreaming]\nnum_threads = 4\n").unwrap();
-        update_local_engine_config(&path, "qwen3-asr", "models/qwen3-asr").unwrap();
+        update_local_engine_config(&path, "funasr-gguf", "models/funasr-gguf").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("engine = \"qwen3-asr\""));
-        assert!(raw.contains("model_dir = \"models/qwen3-asr\""));
+        assert!(raw.contains("engine = \"funasr-gguf\""));
+        assert!(raw.contains("model_dir = \"models/funasr-gguf\""));
         assert!(raw.contains("num_threads = 4"));
     }
 
@@ -1574,6 +1226,6 @@ mod tests {
     fn missing_config_file_is_err() {
         let dir = std::env::temp_dir().join("ainput-tray-test");
         let path = dir.join("no-such-file.toml");
-        assert!(update_local_engine_config(&path, "qwen3-asr", "models/qwen3-asr").is_err());
+        assert!(update_local_engine_config(&path, "funasr-gguf", "models/funasr-gguf").is_err());
     }
 }

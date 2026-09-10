@@ -194,7 +194,13 @@ class Handler(BaseHTTPRequestHandler):
             with os.fdopen(fd, "wb") as f:
                 f.write(raw)
             result = engine.transcribe(tmp, language=None, verbose=False)
-            self._json(200, {"text": result_text(result)})
+            text = result_text(result)
+            if "====解码有误" in text:
+                # 上游 LLM 熔断标记是内部调试串，不进用户文档：转报错，
+                # Rust 侧转 HUD 人话（这句没转出来，重说一遍）。
+                self._json(500, {"error": "llm decode fused after retries"})
+                return
+            self._json(200, {"text": text})
         except Exception as e:
             self._json(500, {"error": f"transcribe failed: {e!r}"[:500]})
         finally:
