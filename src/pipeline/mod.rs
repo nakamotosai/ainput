@@ -434,7 +434,7 @@ impl VoiceWorker {
             .context("acquire cloud ASR session")?;
         let audio = self.audio.subscribe(self.config.asr.pre_roll_ms);
         let mut resampler = LinearResampler::new(
-            self.audio.sample_rate_hz,
+            self.audio.sample_rate_hz(),
             asr_session.sample_rate_hz.max(1) as u32,
         );
         let mut pending = Vec::<f32>::new();
@@ -456,7 +456,7 @@ impl VoiceWorker {
         info!(
             utterance_id,
             session_id = %asr_session.session_id,
-            input_sample_rate_hz = self.audio.sample_rate_hz,
+            input_sample_rate_hz = self.audio.sample_rate_hz(),
             asr_sample_rate_hz = asr_session.sample_rate_hz,
             chunk_samples,
             pre_roll_ms = self.config.asr.pre_roll_ms,
@@ -974,11 +974,11 @@ impl VoiceWorker {
         self.hud.show_active();
         let audio = self.audio.subscribe(self.config.asr.pre_roll_ms);
         let sample_rate_hz = self.config.whisper.sample_rate_hz.max(1);
-        let mut resampler = LinearResampler::new(self.audio.sample_rate_hz, sample_rate_hz);
+        let mut resampler = LinearResampler::new(self.audio.sample_rate_hz(), sample_rate_hz);
         let mut samples = Vec::<f32>::new();
         info!(
             utterance_id,
-            input_sample_rate_hz = self.audio.sample_rate_hz,
+            input_sample_rate_hz = self.audio.sample_rate_hz(),
             whisper_sample_rate_hz = sample_rate_hz,
             pre_roll_ms = self.config.asr.pre_roll_ms,
             mode = "whisper_zh",
@@ -1424,12 +1424,9 @@ impl VoiceWorker {
         self.hud.show_meter_listening();
         let audio = self.audio.subscribe(self.config.asr.pre_roll_ms);
         let sample_rate_hz = self.config.local_nonstreaming.sample_rate_hz.max(1);
-        let mut resampler = LinearResampler::new(self.audio.sample_rate_hz, sample_rate_hz);
+        let mut resampler = LinearResampler::new(self.audio.sample_rate_hz(), sample_rate_hz);
         let mut samples = Vec::<f32>::new();
-        // engine 即后端 id（托盘切换通道）：gguf 是 HTTP 边车，失败如实报错
-        // （HUD + 历史），绝不静默回退成本地。
-        // 读托盘活线，不读启动快照；锁坏时回退启动快照。
-        // 按住攒音，松开再按 engine 分发。
+        // 按住攒音，松开进行 SenseVoice 本地推理。
         let engine_key = self
             .shared_engine
             .lock()
@@ -1448,7 +1445,7 @@ impl VoiceWorker {
         };
         info!(
             utterance_id,
-            input_sample_rate_hz = self.audio.sample_rate_hz,
+            input_sample_rate_hz = self.audio.sample_rate_hz(),
             local_sample_rate_hz = sample_rate_hz,
             pre_roll_ms = self.config.asr.pre_roll_ms,
             mode = "local_nonstreaming",
@@ -1509,59 +1506,22 @@ impl VoiceWorker {
             return Ok(());
         }
 
-        // 分发：只留 funasr-gguf HTTP 分支与 sense-voice 本地；
-        // 其余引擎键视为未支持、如实报错（不静默回退）。
-        let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) =
-            if engine_key == "funasr-gguf" || engine_key == "funasr_gguf" {
-                let client = crate::funasr_gguf::GgufClient::new(&self.config.funasr_gguf)
-                    .context("funasr-gguf sidecar not configured")?;
-                let transcribe_started = Instant::now();
-                let transcribe_result = client
-                    .transcribe(sample_rate_hz, &samples)
-                    .context("transcribe with funasr-gguf sidecar (边车没起？先跑 sidecar/funasr_gguf_server.py)");
-                let text = match transcribe_result {
-                    Ok(text) => text,
-                    Err(error) => {
-                        // 熔断/边车故障都不贴脏字：HUD 给人话，本句记错。
-                        let mut record = HistoryRecord::new(
-                            &utterance_id,
-                            profile_id.as_str(),
-                            "local_nonstreaming",
-                        );
-                        record.audio_ms = audio_ms;
-                        record.asr_elapsed_ms = transcribe_started.elapsed().as_millis();
-                        record.total_elapsed_ms = started_at.elapsed().as_millis();
-                        record.error = format!("{error:#}");
-                        record.skipped_reason = "gguf_transcribe_failed".to_string();
-                        self.history.record(record);
-                        warn!(
-                            utterance_id,
-                            error = %format!("{error:#}"),
-                            "gguf transcribe failed; showing HUD instead of pasting"
-                        );
-                        self.hud.show_text("这句没转出来，重按再说一遍", false, false);
-                        return Ok(());
-                    }
-                };
-                let root = PathBuf::from(&self.config.funasr_gguf.model_dir);
-                (text, root, transcribe_started.elapsed().as_millis())
-            } else if matches!(engine_key.as_str(), "sense-voice" | "sensevoice" | "") {
-                let guard = self
-                    .local_recognizer
-                    .lock()
-                    .map_err(|_| anyhow!("local recognizer lock poisoned"))?;
-                let recognizer = guard
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("local non-streaming recognizer is unavailable"))?;
-                let transcribe_started = Instant::now();
-                let response = recognizer
-                    .transcribe_samples(sample_rate_hz, &samples)
-                    .context("transcribe with local SenseVoice")?;
-                let root = response.model_root.clone();
-                (response.text, root, transcribe_started.elapsed().as_millis())
-            } else {
-                bail!("unsupported engine '{engine_key}' (only sense-voice / funasr-gguf)");
-            };
+        // 本地分发：SenseVoice 原生推理
+        let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) = {
+            let guard = self
+                .local_recognizer
+                .lock()
+                .map_err(|_| anyhow!("local recognizer lock poisoned"))?;
+            let recognizer = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("local non-streaming recognizer is unavailable"))?;
+            let transcribe_started = Instant::now();
+            let response = recognizer
+                .transcribe_samples(sample_rate_hz, &samples)
+                .context("transcribe with local SenseVoice")?;
+            let root = response.model_root.clone();
+            (response.text, root, transcribe_started.elapsed().as_millis())
+        };
         info!(
             engine = %engine_key,
             model_root = %backend_model_root.display(),
@@ -1593,14 +1553,9 @@ impl VoiceWorker {
             }
         }
 
-        // 2026-09-03: SenseVoice 关掉 use_itn 后输出裸文本（标点随 ITN 一起没了）。
-        // 这里用独立的离线标点模型把标点补回来；补不了（没装模型/推理失败）就原样放行。
-        // funasr-gguf 自带标点，跳过离线标点模型（省一次 CPU 推理）。
-        let native_punct = engine_key == "funasr-gguf" || engine_key == "funasr_gguf";
-        if !native_punct {
-            if let Some(punctuated) = self.apply_local_punctuation(&raw_text) {
-                raw_text = punctuated;
-            }
+        // 离线标点补全：若标点模型可用则补充句中标点。
+        if let Some(punctuated) = self.apply_local_punctuation(&raw_text) {
+            raw_text = punctuated;
         }
 
         let raw_finalized =

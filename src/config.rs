@@ -17,7 +17,6 @@ pub struct AppConfig {
     pub asr: AsrConfig,
     pub whisper: WhisperConfig,
     pub local_nonstreaming: LocalNonstreamingConfig,
-    pub funasr_gguf: FunasrGgufConfig,
     pub rewrite: RewriteConfig,
     #[serde(default = "RewriteConfig::prompt_studio_default")]
     pub prompt_studio: RewriteConfig,
@@ -102,18 +101,6 @@ pub struct LocalNonstreamingConfig {
     pub punct_model_dir: String,
     pub num_threads: i32,
     pub release_grace_ms: u64,
-    pub min_audio_ms: u64,
-    pub min_rms_dbfs: f32,
-}
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct FunasrGgufConfig {
-    pub enabled: bool,
-    pub endpoint_url: String,
-    pub model_dir: String,
-    pub sample_rate_hz: u32,
-    pub language: String,
-    pub request_timeout_ms: u64,
     pub min_audio_ms: u64,
     pub min_rms_dbfs: f32,
 }
@@ -768,7 +755,6 @@ impl Default for AppConfig {
             asr: AsrConfig::default(),
             whisper: WhisperConfig::default(),
             local_nonstreaming: LocalNonstreamingConfig::default(),
-            funasr_gguf: FunasrGgufConfig::default(),
             rewrite: RewriteConfig::default(),
             prompt_studio: RewriteConfig::prompt_studio_default(),
             suspect_terms: SuspectTermsConfig::default(),
@@ -790,7 +776,7 @@ impl Default for ModeConfig {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            voice_input: "CapsLock".to_string(),
+            voice_input: "MouseX1".to_string(),
             poll_ms: 8,
             activation_delay_ms: 200,
         }
@@ -822,12 +808,12 @@ impl VoiceProfileConfig {
                 mode: InputMode::WhisperZh,
                 hotkey: "Alt+Z".to_string(),
                 activation_delay_ms: 250,
-                suppress_key: true,
+                suppress_key: false,
             },
             VoiceProfileId::LocalNonstreaming => Self {
                 enabled: true,
                 mode: InputMode::LocalNonstreaming,
-                hotkey: "CapsLock".to_string(),
+                hotkey: "MouseX1".to_string(),
                 activation_delay_ms: 220,
                 suppress_key: true,
             },
@@ -893,20 +879,6 @@ impl Default for LocalNonstreamingConfig {
             punct_model_dir: "models/punct".to_string(),
             num_threads: 4,
             release_grace_ms: 80,
-            min_audio_ms: 800,
-            min_rms_dbfs: -56.0,
-        }
-    }
-}
-impl Default for FunasrGgufConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint_url: "http://127.0.0.1:8765/transcribe".to_string(),
-            model_dir: "models/funasr-gguf".to_string(),
-            sample_rate_hz: 16_000,
-            language: "auto".to_string(),
-            request_timeout_ms: 30_000,
             min_audio_ms: 800,
             min_rms_dbfs: -56.0,
         }
@@ -1152,7 +1124,7 @@ mod tests {
     fn defaults_to_three_voice_profiles() {
         let config = AppConfig::default();
         assert_eq!(config.mode.default, InputMode::LocalNonstreaming);
-        assert_eq!(config.hotkey.voice_input, "CapsLock");
+        assert_eq!(config.hotkey.voice_input, "MouseX1");
         assert_eq!(config.hotkey.activation_delay_ms, 200);
         assert!(!config.profiles.streaming.enabled);
         assert_eq!(config.profiles.streaming.mode, InputMode::StreamingAsr);
@@ -1160,13 +1132,13 @@ mod tests {
         assert!(!config.profiles.whisper.enabled);
         assert_eq!(config.profiles.whisper.mode, InputMode::WhisperZh);
         assert_eq!(config.profiles.whisper.hotkey, "Alt+Z");
-        assert!(config.profiles.whisper.suppress_key);
+        assert!(!config.profiles.whisper.suppress_key);
         assert!(config.profiles.local_nonstreaming.enabled);
         assert_eq!(
             config.profiles.local_nonstreaming.mode,
             InputMode::LocalNonstreaming
         );
-        assert_eq!(config.profiles.local_nonstreaming.hotkey, "CapsLock");
+        assert_eq!(config.profiles.local_nonstreaming.hotkey, "MouseX1");
         assert_eq!(config.profiles.local_nonstreaming.activation_delay_ms, 220);
         assert!(config.profiles.local_nonstreaming.suppress_key);
         assert_eq!(config.local_nonstreaming.model_dir, "models/sense-voice");
