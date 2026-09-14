@@ -44,3 +44,8 @@ sidecar/_upstream/
 sidecar/funasr-gguf-bin/
 sidecar/export-venv/
 sidecar/_conv_b10876/
+
+# 大文件禁入仓（2026-09-14）：GPU 安装包与模型源包只留磁盘，SenseVoice 运行模型除外
+engine-gpu/wheels/
+engine-gpu/*.tar.bz2
+/punct-int8.tar.bz2
