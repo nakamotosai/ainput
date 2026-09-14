@@ -20,7 +20,7 @@ impl LocalEngine {
         match engine.trim().to_ascii_lowercase().as_str() {
             "sense-voice" | "sensevoice" | "" => Ok(Self::SenseVoice),
             other => Err(anyhow!(
-                "unsupported local ASR engine '{}': expected 'sense-voice' or 'funasr-gguf'",
+                "unsupported local ASR engine '{}': expected 'sense-voice'",
                 other
             )),
         }

@@ -57,7 +57,7 @@ impl HotkeyUserController {
             .local_nonstreaming
             .lock()
             .map(|g| g.clone())
-            .unwrap_or_else(|_| "CapsLock".to_string())
+            .unwrap_or_else(|_| "MouseX1".to_string())
     }
 
     pub fn set_local_nonstreaming(&self, label: &str) -> Result<String, String> {

@@ -72,7 +72,6 @@ const MENU_VOICE_COMMAND_ENABLED: usize = 2901;
 const MENU_VOICE_COMMAND_EDIT: usize = 2902;
 const MENU_HOTKEY_EDIT: usize = 2910;
 const MENU_ENGINE_SENSE_VOICE: usize = 3001;
-const MENU_ENGINE_FUNASR_GGUF: usize = 3004;
 
 pub struct Tray {
     thread_id: u32,
@@ -98,7 +97,6 @@ impl Tray {
         shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
         install_root: PathBuf,
         local_config: crate::config::LocalNonstreamingConfig,
-        gguf_config: crate::config::FunasrGgufConfig,
         api_notifications: mpsc::Receiver<String>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -126,7 +124,6 @@ impl Tray {
                     shared_recognizer,
                     install_root,
                     local_config,
-                    gguf_config,
                     switching: Arc::new(AtomicBool::new(false)),
                     shutdown,
                 });
@@ -179,7 +176,6 @@ struct TrayState {
     shared_recognizer: Arc<Mutex<Option<crate::local_asr::LocalSenseVoiceRecognizer>>>,
     install_root: PathBuf,
     local_config: crate::config::LocalNonstreamingConfig,
-    gguf_config: crate::config::FunasrGgufConfig,
     switching: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
@@ -341,17 +337,13 @@ unsafe fn show_api_setup_balloon(hwnd: HWND, message: &str) {
 fn normalize_engine_key(engine: &str) -> String {
     let lowered = engine.trim().to_ascii_lowercase();
     match lowered.as_str() {
-        "funasr-gguf" | "funasr_gguf" | "fun-asr-gguf" | "funasrgguf" => "funasr-gguf".to_string(),
-        "sense-voice" | "sense_voice" | "sensevoice" | "" => "sense-voice".to_string(),
-        _ => lowered,
+        "sense-voice" | "sensevoice" | "" => "sense-voice".to_string(),
+        _ => "sense-voice".to_string(),
     }
 }
 
-fn engine_display_name(engine: &str) -> &'static str {
-    match normalize_engine_key(engine).as_str() {
-        "funasr-gguf" => "FunASR-GGUF",
-        _ => "SenseVoice",
-    }
+fn engine_display_name(_engine: &str) -> &'static str {
+    "SenseVoice"
 }
 
 fn cached_app_icon() -> HICON {
@@ -648,17 +640,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_ENGINE_SENSE_VOICE,
             "SenseVoice（默认·最快）",
         );
-        append_menu_text(
-            menu,
-            engine_flag
-                | if normalize_engine_key(&current_engine) == "funasr-gguf" {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_ENGINE_FUNASR_GGUF,
-            "FunASR-GGUF（更准·本地）",
-        );
     }
     let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
     unsafe {
@@ -699,7 +680,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             MENU_VOICE_COMMAND_EDIT => open_voice_command_panel(),
             MENU_HOTKEY_EDIT => open_hotkey_panel(),
             MENU_ENGINE_SENSE_VOICE => set_local_engine("sense-voice", "models/sense-voice"),
-            MENU_ENGINE_FUNASR_GGUF => set_funasr_gguf_backend(),
             MENU_AUTO_START => toggle_auto_start(),
             MENU_RESTART => {
                 // 重启 = 以当前 exe 再拉一个新实例：新实例发现互斥锁被占，
@@ -919,48 +899,6 @@ fn set_local_engine(engine: &str, model_dir: &str) {
     });
 }
 
-fn set_funasr_gguf_backend() {
-    const ENGINE: &str = "funasr-gguf";
-    const MODEL_DIR: &str = "models/funasr-gguf";
-    TRAY_STATE.with(|state| {
-        let mut state_cell = state.borrow_mut();
-        let Some(state) = state_cell.as_mut() else {
-            return;
-        };
-        if state.switching.load(Ordering::Relaxed) {
-            state.hud.show_text("正在切换引擎，请稍等完成", false, false);
-            return;
-        }
-        if normalize_engine_key(&state.current_engine) == ENGINE {
-            state.hud.show_text("已是 FunASR-GGUF", true, false);
-            return;
-        }
-        // 快切换也给动画：占位即闪，播够约 0.9 秒再还，不堵托盘。
-        state.switching.store(true, Ordering::Relaxed);
-        post_switch_anim(MSG_SWITCH_ANIM_START);
-        let anim_started = std::time::Instant::now();
-        match update_local_engine_config(&state.config_path, ENGINE, MODEL_DIR) {
-            Ok(()) => {
-                state.current_engine = ENGINE.to_string();
-                if let Ok(mut live) = state.shared_engine.lock() {
-                    *live = ENGINE.to_string();
-                }
-                state.hud.show_text("已切换 FunASR-GGUF", true, false);
-                info!(engine = ENGINE, config_path = %state.config_path.display(), "funasr-gguf switch from tray");
-                release_switch_anim_after_min_visible(
-                    Arc::clone(&state.switching),
-                    anim_started,
-                );
-            }
-            Err(error) => {
-                state.hud.show_text(&format!("切换失败：{error}"), false, false);
-                warn!(error = %error, engine = ENGINE, "failed to persist gguf switch");
-                state.switching.store(false, Ordering::Relaxed);
-                post_switch_anim(MSG_SWITCH_ANIM_STOP);
-            }
-        }
-    });
-}
 
 fn update_local_engine_config(config_path: &std::path::Path, engine: &str, model_dir: &str) -> Result<()> {
     use std::fs;
@@ -1189,14 +1127,12 @@ mod tests {
         )
         .unwrap();
 
-        update_local_engine_config(&path, "funasr-gguf", "models/funasr-gguf").unwrap();
+        let result = update_local_engine_config(&path, "sense-voice", "models/sense-voice");
+        assert!(result.is_ok());
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("engine = \"funasr-gguf\""));
-        assert!(raw.contains("model_dir = \"models/funasr-gguf\""));
+        assert!(raw.contains("engine = \"sense-voice\""));
+        assert!(raw.contains("model_dir = \"models/sense-voice\""));
         assert!(raw.contains("num_threads = 4"));
-        assert!(raw.contains("[rewrite]"));
-        assert!(raw.contains("enabled = false"));
-
         let result = update_local_engine_config(&path, "sense-voice", "models/sense-voice");
         assert!(result.is_ok());
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -1211,10 +1147,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("missing.toml");
         std::fs::write(&path, "[local_nonstreaming]\nnum_threads = 4\n").unwrap();
-        update_local_engine_config(&path, "funasr-gguf", "models/funasr-gguf").unwrap();
+        update_local_engine_config(&path, "sense-voice", "models/sense-voice").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("engine = \"funasr-gguf\""));
-        assert!(raw.contains("model_dir = \"models/funasr-gguf\""));
+        assert!(raw.contains("engine = \"sense-voice\""));
+        assert!(raw.contains("model_dir = \"models/sense-voice\""));
         assert!(raw.contains("num_threads = 4"));
     }
 
@@ -1222,6 +1158,6 @@ mod tests {
     fn missing_config_file_is_err() {
         let dir = std::env::temp_dir().join("ainput-tray-test");
         let path = dir.join("no-such-file.toml");
-        assert!(update_local_engine_config(&path, "funasr-gguf", "models/funasr-gguf").is_err());
+        assert!(update_local_engine_config(&path, "sense-voice", "models/sense-voice").is_err());
     }
 }

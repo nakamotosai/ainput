@@ -3,7 +3,7 @@
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -27,7 +27,8 @@ pub struct RewritePromptPanelController {
 }
 
 struct Inner {
-    base_url: String,
+    state: Arc<ServerState>,
+    base_url: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -39,33 +40,14 @@ struct ServerState {
 
 impl RewritePromptPanelController {
     pub fn start(prompt: RewritePromptController, shutdown: Arc<AtomicBool>) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").context("bind rewrite prompt web server")?;
-        let addr = listener
-            .local_addr()
-            .context("rewrite prompt listener local_addr")?;
-        let base_url = format!("http://{addr}");
         let state = Arc::new(ServerState {
             path: prompt.path().to_path_buf(),
             prompt,
         });
-        let shutdown_server = Arc::clone(&shutdown);
-        let state_server = Arc::clone(&state);
-
-        thread::Builder::new()
-            .name("ainput-prompt-web".into())
-            .spawn(move || {
-                if let Err(error) = run_server(listener, state_server, shutdown_server) {
-                    warn!(error = %error, "rewrite prompt web server stopped with error");
-                } else {
-                    info!("rewrite prompt web server stopped");
-                }
-            })
-            .context("spawn rewrite prompt web server")?;
-
-        info!(%base_url, "rewrite prompt web UI ready (loopback)");
         Ok(Self {
             inner: Arc::new(Inner {
-                base_url,
+                state,
+                base_url: Mutex::new(None),
                 shutdown,
             }),
         })
@@ -75,7 +57,45 @@ impl RewritePromptPanelController {
         if self.inner.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let url = self.inner.base_url.clone();
+        let url = {
+            let mut guard = match self.inner.base_url.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(existing) = guard.as_ref() {
+                existing.clone()
+            } else {
+                match TcpListener::bind("127.0.0.1:0") {
+                    Ok(listener) => match listener.local_addr() {
+                        Ok(addr) => {
+                            let url = format!("http://{addr}");
+                            let state_server = Arc::clone(&self.inner.state);
+                            let shutdown_server = Arc::clone(&self.inner.shutdown);
+                            let _ = thread::Builder::new()
+                                .name("ainput-prompt-web".into())
+                                .spawn(move || {
+                                    if let Err(error) = run_server(listener, state_server, shutdown_server) {
+                                        warn!(error = %error, "rewrite prompt web server stopped with error");
+                                    } else {
+                                        info!("rewrite prompt web server stopped");
+                                    }
+                                });
+                            info!(%url, "lazy started rewrite prompt web UI (loopback)");
+                            *guard = Some(url.clone());
+                            url
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "rewrite prompt listener local_addr failed");
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        warn!(error = %error, "bind rewrite prompt web server failed");
+                        return;
+                    }
+                }
+            }
+        };
         match open_browser_hidden(&url) {
             Ok(()) => info!(%url, "opened rewrite prompt web UI"),
             Err(error) => warn!(error = %error, %url, "open rewrite prompt web UI failed"),

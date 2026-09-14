@@ -3,7 +3,7 @@
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -25,7 +25,8 @@ pub struct VoiceCommandPanelController {
 }
 
 struct Inner {
-    base_url: String,
+    state: Arc<ServerState>,
+    base_url: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -37,33 +38,14 @@ struct ServerState {
 
 impl VoiceCommandPanelController {
     pub fn start(voice: VoiceCommandController, shutdown: Arc<AtomicBool>) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").context("bind voice command web server")?;
-        let addr = listener
-            .local_addr()
-            .context("voice command listener local_addr")?;
-        let base_url = format!("http://{addr}");
         let state = Arc::new(ServerState {
             path: voice.path().to_path_buf(),
             voice,
         });
-        let shutdown_server = Arc::clone(&shutdown);
-        let state_server = Arc::clone(&state);
-
-        thread::Builder::new()
-            .name("ainput-voice-cmd-web".into())
-            .spawn(move || {
-                if let Err(error) = run_server(listener, state_server, shutdown_server) {
-                    warn!(error = %error, "voice command web server stopped with error");
-                } else {
-                    info!("voice command web server stopped");
-                }
-            })
-            .context("spawn voice command web server")?;
-
-        info!(%base_url, "voice command web UI ready (loopback)");
         Ok(Self {
             inner: Arc::new(Inner {
-                base_url,
+                state,
+                base_url: Mutex::new(None),
                 shutdown,
             }),
         })
@@ -73,7 +55,45 @@ impl VoiceCommandPanelController {
         if self.inner.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let url = self.inner.base_url.clone();
+        let url = {
+            let mut guard = match self.inner.base_url.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(existing) = guard.as_ref() {
+                existing.clone()
+            } else {
+                match TcpListener::bind("127.0.0.1:0") {
+                    Ok(listener) => match listener.local_addr() {
+                        Ok(addr) => {
+                            let url = format!("http://{addr}");
+                            let state_server = Arc::clone(&self.inner.state);
+                            let shutdown_server = Arc::clone(&self.inner.shutdown);
+                            let _ = thread::Builder::new()
+                                .name("ainput-voice-cmd-web".into())
+                                .spawn(move || {
+                                    if let Err(error) = run_server(listener, state_server, shutdown_server) {
+                                        warn!(error = %error, "voice command web server stopped with error");
+                                    } else {
+                                        info!("voice command web server stopped");
+                                    }
+                                });
+                            info!(%url, "lazy started voice command web UI (loopback)");
+                            *guard = Some(url.clone());
+                            url
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "voice command listener local_addr failed");
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        warn!(error = %error, "bind voice command web server failed");
+                        return;
+                    }
+                }
+            }
+        };
         match open_browser_hidden(&url) {
             Ok(()) => info!(%url, "opened voice command web UI"),
             Err(error) => warn!(error = %error, %url, "open voice command web UI failed"),

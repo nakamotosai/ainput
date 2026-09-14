@@ -7,7 +7,6 @@ mod asr_pool;
 mod audio;
 mod cloud_asr;
 mod config;
-mod funasr_gguf;
 mod debug_panel;
 mod history;
 mod history_panel;
@@ -209,29 +208,38 @@ fn run_app() -> Result<()> {
     let corrections_path = state_root.join("config").join("personal-corrections.json");
     let (suspect_notification_tx, _suspect_notification_rx) = mpsc::channel();
     let (api_notification_tx, api_notification_rx) = mpsc::channel();
-    // Background analyzers stay disabled by default; no UI entry points ship in public product.
-    let _suspect_terms = suspect_terms::SuspectTermsController::start(
-        config.suspect_terms.clone(),
-        history.path().to_path_buf(),
-        state_root.join("logs").join("suspect-terms.json"),
-        corrections_path.clone(),
-        suspect_notification_tx,
-        Arc::clone(&shutdown),
-    )
-    .context("start suspect terms analyzer")?;
-    let _term_embeddings = term_embeddings::TermEmbeddingController::start(
-        config.term_embeddings.clone(),
-        corrections_path,
-        state_root.join("logs").join("suspect-terms.json"),
-        history.path().to_path_buf(),
-        state_root.join("logs").join("term-embeddings.json"),
-        state_root.join("logs").join("term-embedding-status.json"),
-        state_root.join("logs").join("term-families.json"),
-        state_root.join("logs").join("term-hotwords.json"),
-        Arc::clone(&shutdown),
-    )
-    .context("start term embedding worker")?;
-
+    // Background analyzers stay disabled by default in lightweight mode.
+    let _suspect_terms = if config.suspect_terms.enabled {
+        Some(suspect_terms::SuspectTermsController::start(
+            config.suspect_terms.clone(),
+            history.path().to_path_buf(),
+            state_root.join("logs").join("suspect-terms.json"),
+            corrections_path.clone(),
+            suspect_notification_tx,
+            Arc::clone(&shutdown),
+        )
+        .context("start suspect terms analyzer")?)
+    } else {
+        info!("suspect terms analyzer disabled (lightweight mode)");
+        None
+    };
+    let _term_embeddings = if config.term_embeddings.enabled {
+        Some(term_embeddings::TermEmbeddingController::start(
+            config.term_embeddings.clone(),
+            corrections_path,
+            state_root.join("logs").join("suspect-terms.json"),
+            history.path().to_path_buf(),
+            state_root.join("logs").join("term-embeddings.json"),
+            state_root.join("logs").join("term-embedding-status.json"),
+            state_root.join("logs").join("term-families.json"),
+            state_root.join("logs").join("term-hotwords.json"),
+            Arc::clone(&shutdown),
+        )
+        .context("start term embedding worker")?)
+    } else {
+        info!("term embedding worker disabled (lightweight mode)");
+        None
+    };
     let shared_rewriter = ai_rewrite::SharedRewriter::new(config.rewrite.clone());
     let rewrite_prompt = rewrite_prompt::RewritePromptController::load_or_default(
         state_root.join("config").join("rewrite-prompt.toml"),
@@ -268,23 +276,9 @@ fn run_app() -> Result<()> {
     .context("start hotkey panel")?;
     let shared_recognizer: Arc<Mutex<Option<local_asr::LocalSenseVoiceRecognizer>>> =
         Arc::new(Mutex::new(None));
-    // engine 字符串即后端 id（沿用托盘现有切换通道）。
-    // 托盘→worker 加 shared_engine 活线，分发每句读它；
-    // sense-voice 走 shared_recognizer（托盘热换槽）；
-    // gguf 是 HTTP 边车（每次转写现建客户端），失败直接报错、不回退。
     let shared_engine: Arc<Mutex<String>> =
         Arc::new(Mutex::new(config.local_nonstreaming.engine.clone()));
-    let engine_key = config.local_nonstreaming.engine.trim().to_ascii_lowercase();
-    let engine_key = engine_key.as_str();
-    let local_cfg_for_slot = if matches!(engine_key, "sense-voice" | "sensevoice" | "") {
-        config.local_nonstreaming.clone()
-    } else {
-        // HTTP 边车（gguf）或未知键：槽里放 SenseVoice 兜底，保证老链路不断。
-        let mut fallback = config.local_nonstreaming.clone();
-        fallback.engine = "sense-voice".to_string();
-        fallback.model_dir = "models/sense-voice".to_string();
-        fallback
-    };
+    let local_cfg_for_slot = config.local_nonstreaming.clone();
     let _tray = tray::Tray::start(
         hud.clone(),
         api_settings,
@@ -303,7 +297,6 @@ fn run_app() -> Result<()> {
         Arc::clone(&shared_recognizer),
         install_root.clone(),
         config.local_nonstreaming.clone(),
-        config.funasr_gguf.clone(),
         api_notification_rx,
         Arc::clone(&shutdown),
     )

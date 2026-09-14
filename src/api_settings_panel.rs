@@ -4,7 +4,7 @@
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -31,7 +31,8 @@ pub struct ApiSettingsPanelController {
 }
 
 struct Inner {
-    base_url: String,
+    state: Arc<ServerState>,
+    base_url: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -48,34 +49,15 @@ impl ApiSettingsPanelController {
         rewriter: SharedRewriter,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").context("bind API settings web server")?;
-        let addr = listener
-            .local_addr()
-            .context("API settings listener local_addr")?;
-        let base_url = format!("http://{addr}");
         let state = Arc::new(ServerState {
-            api_path: api_path.clone(),
+            api_path,
             rewrite_language,
             rewriter,
         });
-        let shutdown_server = Arc::clone(&shutdown);
-        let state_server = Arc::clone(&state);
-
-        thread::Builder::new()
-            .name("ainput-api-web".into())
-            .spawn(move || {
-                if let Err(error) = run_server(listener, state_server, shutdown_server) {
-                    warn!(error = %error, "API settings web server stopped with error");
-                } else {
-                    info!("API settings web server stopped");
-                }
-            })
-            .context("spawn API settings web server")?;
-
-        info!(%base_url, path = %api_path.display(), "API settings web UI ready (loopback)");
         Ok(Self {
             inner: Arc::new(Inner {
-                base_url,
+                state,
+                base_url: Mutex::new(None),
                 shutdown,
             }),
         })
@@ -85,15 +67,57 @@ impl ApiSettingsPanelController {
         if self.inner.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let url = self.inner.base_url.clone();
+        let url = {
+            let mut guard = match self.inner.base_url.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(existing) = guard.as_ref() {
+                existing.clone()
+            } else {
+                match TcpListener::bind("127.0.0.1:0") {
+                    Ok(listener) => match listener.local_addr() {
+                        Ok(addr) => {
+                            let url = format!("http://{addr}");
+                            let state_server = Arc::clone(&self.inner.state);
+                            let shutdown_server = Arc::clone(&self.inner.shutdown);
+                            let _ = thread::Builder::new()
+                                .name("ainput-api-web".into())
+                                .spawn(move || {
+                                    if let Err(error) = run_server(listener, state_server, shutdown_server) {
+                                        warn!(error = %error, "API settings web server stopped with error");
+                                    } else {
+                                        info!("API settings web server stopped");
+                                    }
+                                });
+                            info!(%url, path = %self.inner.state.api_path.display(), "lazy started API settings web UI (loopback)");
+                            *guard = Some(url.clone());
+                            url
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "API settings listener local_addr failed");
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        warn!(error = %error, "bind API settings web server failed");
+                        return;
+                    }
+                }
+            }
+        };
         match open_browser_hidden(&url) {
             Ok(()) => info!(%url, "opened API settings web UI in browser"),
             Err(error) => warn!(error = %error, %url, "open API settings web UI failed"),
         }
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.inner.base_url
+    pub fn base_url(&self) -> Option<String> {
+        self.inner
+            .base_url
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
     }
 }
 

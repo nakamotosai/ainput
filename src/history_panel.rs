@@ -29,7 +29,7 @@ pub struct HistoryPanelController {
 
 struct Inner {
     history_path: PathBuf,
-    base_url: String,
+    base_url: Mutex<Option<String>>,
     shutdown: Arc<AtomicBool>,
     /// Last open error for diagnostics.
     last_error: Mutex<Option<String>>,
@@ -37,34 +37,10 @@ struct Inner {
 
 impl HistoryPanelController {
     pub fn start(history_path: PathBuf, shutdown: Arc<AtomicBool>) -> Result<Self> {
-        // Bind ephemeral port on loopback only.
-        let listener = TcpListener::bind("127.0.0.1:0").context("bind history web server")?;
-        listener
-            .set_nonblocking(false)
-            .context("configure history listener")?;
-        let addr = listener
-            .local_addr()
-            .context("history listener local_addr")?;
-        let base_url = format!("http://{addr}");
-        let path_for_server = history_path.clone();
-        let shutdown_server = Arc::clone(&shutdown);
-
-        thread::Builder::new()
-            .name("ainput-history-web".into())
-            .spawn(move || {
-                if let Err(error) = run_server(listener, path_for_server, shutdown_server) {
-                    warn!(error = %error, "history web server stopped with error");
-                } else {
-                    info!("history web server stopped");
-                }
-            })
-            .context("spawn history web server")?;
-
-        info!(%base_url, path = %history_path.display(), "history web UI ready (loopback)");
         Ok(Self {
             inner: Arc::new(Inner {
                 history_path,
-                base_url,
+                base_url: Mutex::new(None),
                 shutdown,
                 last_error: Mutex::new(None),
             }),
@@ -75,7 +51,48 @@ impl HistoryPanelController {
         if self.inner.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let url = self.inner.base_url.clone();
+        let url = {
+            let mut guard = match self.inner.base_url.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(existing) = guard.as_ref() {
+                existing.clone()
+            } else {
+                match TcpListener::bind("127.0.0.1:0") {
+                    Ok(listener) => {
+                        let _ = listener.set_nonblocking(false);
+                        match listener.local_addr() {
+                            Ok(addr) => {
+                                let url = format!("http://{addr}");
+                                let path_for_server = self.inner.history_path.clone();
+                                let shutdown_server = Arc::clone(&self.inner.shutdown);
+                                let _ = thread::Builder::new()
+                                    .name("ainput-history-web".into())
+                                    .spawn(move || {
+                                        if let Err(error) = run_server(listener, path_for_server, shutdown_server) {
+                                            warn!(error = %error, "history web server stopped with error");
+                                        } else {
+                                            info!("history web server stopped");
+                                        }
+                                    });
+                                info!(%url, path = %self.inner.history_path.display(), "lazy started history web UI (loopback)");
+                                *guard = Some(url.clone());
+                                url
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "history listener local_addr failed");
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "bind history web server failed");
+                        return;
+                    }
+                }
+            }
+        };
         match open_browser_hidden(&url) {
             Ok(()) => {
                 info!(%url, "opened history web UI in browser");
@@ -96,8 +113,12 @@ impl HistoryPanelController {
         &self.inner.history_path
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.inner.base_url
+    pub fn base_url(&self) -> Option<String> {
+        self.inner
+            .base_url
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
     }
 }
 
