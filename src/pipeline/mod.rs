@@ -3830,10 +3830,8 @@ fn finalize_asr_text_for_paste_for_language(
 ) -> FinalizedText {
     let mut actions = Vec::new();
     let without_spaces = normalize_output_spacing(text, output_language, &mut actions);
-    let digit_normalized = normalize_continuous_chinese_digits(&without_spaces);
-    if digit_normalized != without_spaces {
-        actions.push("zh_digits");
-    }
+    // 2026-09-14: 本地数字转写已旁路（用户实测模型 ITN 未吞数字），数字由 SenseVoice ITN 负责。
+    let digit_normalized = without_spaces.clone();
     let personal_normalized = if output_language == RewriteOutputLanguage::English {
         digit_normalized.clone()
     } else {
@@ -5018,14 +5016,15 @@ mod tests {
     }
 
     #[test]
+    /// 2026-09-14: 本地数字转写已旁路，数字由 SenseVoice ITN 负责；finalize 只补句号，不转写。
     fn finalizer_converts_continuous_chinese_digits() {
         assert_eq!(
             finalize_asr_text_for_paste("验证码是一二三四五六").text,
-            "验证码是123456。"
+            "验证码是一二三四五六。"
         );
         assert_eq!(
             finalize_asr_text_for_paste("现在是二零二六年").text,
-            "现在是2026年。"
+            "现在是二零二六年。"
         );
         assert_eq!(finalize_asr_text_for_paste("一两句话").text, "一两句话。");
     }

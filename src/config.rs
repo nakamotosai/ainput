@@ -872,9 +872,8 @@ impl Default for LocalNonstreamingConfig {
             provider: "cpu".to_string(),
             sample_rate_hz: 16_000,
             language: "auto".to_string(),
-            // 2026-09-02: SenseVoice 自带 ITN 会把「十」吞成 1、「一点一点」转成
-            // 「1.1点」，默认关闭；数字转写在 pipeline 的 normalize 层自己做。
-            use_itn: false,
+            // 2026-09-14: 用户实测模型 ITN 未吞数字，默认恢复 true；本地数字规则已旁路。
+            use_itn: true,
             punct_enabled: true,
             punct_model_dir: "models/punct".to_string(),
             num_threads: 4,
