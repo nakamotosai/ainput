@@ -4695,8 +4695,9 @@ fn dump_utterance_audio(
         let dir = audio_dump_dir(history_path);
         let initial = match count_existing_dumps(&dir) {
             Some(existing) => existing.min(AUDIO_DUMP_MAX_FILES),
-            // On any IO error default to cap-reached (skip) rather than unbounded growth.
-            None => AUDIO_DUMP_MAX_FILES,
+            // Missing dir means zero dumps so far; create_dir_all below creates it.
+            // Other IO errors also start at zero and surface via create/write warns.
+            None => 0,
         };
         match AUDIO_DUMP_COUNT.compare_exchange(
             usize::MAX,
