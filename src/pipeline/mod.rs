@@ -18,7 +18,7 @@ use crate::ai_rewrite::{
     rewrite_error_is_backend_unavailable, rewrite_prompt_for_language,
 };
 use crate::asr_pool::AsrSessionPool;
-use crate::audio::AudioHub;
+use crate::audio::{AudioHub, AudioSession};
 use crate::cloud_asr::{ChunkResponse, CloudAsrClient, WhisperClient};
 use crate::config::{AppConfig, ClipboardPolicy, OutputConfig, RewriteOutputLanguage};
 use crate::debug_panel::DebugPanelController;
@@ -306,7 +306,70 @@ impl VoicePipeline for LocalNonstreamingPipeline {
         hotkey_rx: &mpsc::Receiver<HotkeyEvent>,
         profile_id: VoiceProfileId,
     ) -> Result<()> {
-        worker.run_local_nonstreaming_session(hotkey_rx, profile_id)
+        worker.run_local_nonstreaming_session(hotkey_rx, profile_id, None)
+    }
+}
+
+// R1 key-gate overlap: speculative pre-press arm. One Option slot per profile_id; the slot
+// owns its AudioHub subscription (subscribe + resampler + prealloc happen at arm time) and
+// buffers resampled audio until Pressed commits it or Cancel/abort/shutdown/timeout drops
+// it. Drops emit no wav and no history by construction (the buffer never reaches the gate).
+const PRE_PRESS_SLOT_TIMEOUT_MS: u64 = 3_000;
+const PRE_PRESS_PREALLOC_SECS: u64 = 8;
+
+struct PrePressSlot {
+    profile_id: VoiceProfileId,
+    audio: AudioSession,
+    resampler: LinearResampler,
+    samples: Vec<f32>,
+    armed_at: Instant,
+}
+
+fn pre_press_slot_index(profile_id: VoiceProfileId) -> usize {
+    match profile_id {
+        VoiceProfileId::StreamingDefault => 0,
+        VoiceProfileId::WhisperCapslock => 1,
+        VoiceProfileId::LocalNonstreaming => 2,
+    }
+}
+
+/// Drain whatever the hub has queued into the speculative buffer (non-blocking).
+fn pump_pre_press_slot(slot: &mut PrePressSlot) {
+    while let Ok(chunk) = slot.audio.rx.try_recv() {
+        slot.resampler.push(&chunk);
+    }
+    slot.samples.extend_from_slice(&slot.resampler.take_available());
+}
+
+/// Drop arms that never saw a Pressed (lost Cancel, stuck key, abandoned hint).
+fn discard_stale_pre_press_slots(slots: &mut [Option<PrePressSlot>]) {
+    for slot in slots.iter_mut() {
+        let stale = slot
+            .as_ref()
+            .is_some_and(|arm| arm.armed_at.elapsed() > Duration::from_millis(PRE_PRESS_SLOT_TIMEOUT_MS));
+        if stale {
+            let arm = slot.take();
+            if let Some(arm) = arm {
+                info!(
+                    profile = arm.profile_id.as_str(),
+                    provisional_age_ms = arm.armed_at.elapsed().as_millis(),
+                    timeout_ms = PRE_PRESS_SLOT_TIMEOUT_MS,
+                    "pre-press slot timed out (buffer discarded, subscriber pruned)"
+                );
+            }
+        }
+    }
+}
+
+impl LocalNonstreamingPipeline {
+    fn run_with_slot(
+        &self,
+        worker: &VoiceWorker,
+        hotkey_rx: &mpsc::Receiver<HotkeyEvent>,
+        profile_id: VoiceProfileId,
+        slot: Option<PrePressSlot>,
+    ) -> Result<()> {
+        worker.run_local_nonstreaming_session(hotkey_rx, profile_id, slot)
     }
 }
 
@@ -369,6 +432,29 @@ impl VoiceWorker {
         }
     }
 
+    fn local_sample_rate_hz(&self) -> u32 {
+        self.config.local_nonstreaming.sample_rate_hz.max(1)
+    }
+
+    /// R1 key-gate overlap: arm one speculative slot — subscribe + resampler + prealloc.
+    /// The first pump fills pre-roll; later pumps buffer speech before Pressed qualifies.
+    fn arm_pre_press_slot(&self, profile_id: VoiceProfileId) -> PrePressSlot {
+        let audio = self.audio.subscribe(self.config.asr.pre_roll_ms);
+        let sample_rate_hz = self.local_sample_rate_hz();
+        let resampler = LinearResampler::new(self.audio.sample_rate_hz(), sample_rate_hz);
+        let mut samples = Vec::<f32>::new();
+        samples.reserve(
+            sample_rate_hz as usize * PRE_PRESS_PREALLOC_SECS as usize,
+        );
+        PrePressSlot {
+            profile_id,
+            audio,
+            resampler,
+            samples,
+            armed_at: Instant::now(),
+        }
+    }
+
     pub fn run(&mut self, hotkey_rx: mpsc::Receiver<HotkeyEvent>) -> Result<()> {
         let _streaming_pipeline = StreamingParakeetPipeline;
         let _whisper_pipeline = WhisperZhPipeline;
@@ -383,43 +469,101 @@ impl VoiceWorker {
             "voice pipelines registered (cloud paths inactive)"
         );
         info!("voice worker started");
+        // R1 key-gate overlap: one speculative Option slot per profile_id. Duplicates dropped;
+        // Cancel/abort/shutdown/timeout discards the buffer and prunes the subscriber.
+        let mut pre_press_slots: [Option<PrePressSlot>; 3] = [None, None, None];
         while !self.shutdown.load(Ordering::Relaxed) {
-            match hotkey_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(HotkeyEvent::Voice(event)) if event.phase == TriggerPhase::Pressed => {
-                    let mode = if self.debug_panel.is_enabled() {
-                        self.modes.get()
-                    } else {
-                        event.mode
-                    };
-                    let result = match mode {
-                        InputMode::LocalNonstreaming => {
-                            local_pipeline.run(self, &hotkey_rx, event.profile_id)
+            // R1: keep speculative buffers flowing while waiting for the gate (non-blocking).
+            for slot in pre_press_slots.iter_mut().flatten() {
+                pump_pre_press_slot(slot);
+            }
+            discard_stale_pre_press_slots(&mut pre_press_slots);
+            let idle_timeout = if pre_press_slots.iter().any(|slot| slot.is_some()) {
+                Duration::from_millis(12)
+            } else {
+                Duration::from_millis(50)
+            };
+            match hotkey_rx.recv_timeout(idle_timeout) {
+                Ok(HotkeyEvent::Voice(event)) => match event.phase {
+                    TriggerPhase::PrePress => {
+                        let index = pre_press_slot_index(event.profile_id);
+                        if pre_press_slots[index].is_some() {
+                            info!(
+                                profile = event.profile_id.as_str(),
+                                "pre-press duplicate dropped (slot already armed)"
+                            );
+                        } else {
+                            let mut slot = self.arm_pre_press_slot(event.profile_id);
+                            pump_pre_press_slot(&mut slot);
+                            info!(
+                                profile = event.profile_id.as_str(),
+                                speculative_buffer_ms =
+                                    audio_ms(slot.samples.len(), self.local_sample_rate_hz()),
+                                "pre-press slot armed"
+                            );
+                            pre_press_slots[index] = Some(slot);
                         }
-                        InputMode::StreamingAsr | InputMode::WhisperZh => {
-                            warn!(
+                    }
+                    TriggerPhase::Cancel => {
+                        let index = pre_press_slot_index(event.profile_id);
+                        if pre_press_slots[index].take().is_some() {
+                            info!(
+                                profile = event.profile_id.as_str(),
+                                "pre-press slot cancelled (buffer discarded, subscriber pruned)"
+                            );
+                        }
+                    }
+                    TriggerPhase::Pressed => {
+                        let mode = if self.debug_panel.is_enabled() {
+                            self.modes.get()
+                        } else {
+                            event.mode
+                        };
+                        let index = pre_press_slot_index(event.profile_id);
+                        let result = match mode {
+                            InputMode::LocalNonstreaming => {
+                                // R1: commit the speculative buffer into the session.
+                                let slot = pre_press_slots[index].take();
+                                local_pipeline.run_with_slot(self, &hotkey_rx, event.profile_id, slot)
+                            }
+                            InputMode::StreamingAsr | InputMode::WhisperZh => {
+                                // R1 abort: discard the speculative arm; no wav, no history.
+                                if pre_press_slots[index].take().is_some() {
+                                    info!(
+                                        profile = event.profile_id.as_str(),
+                                        "pre-press slot discarded (cloud profile inactive)"
+                                    );
+                                }
+                                warn!(
+                                    ?mode,
+                                    profile = event.profile_id.as_str(),
+                                    "cloud voice profile disabled in public ainput; only local SenseVoice is active"
+                                );
+                                self.hud
+                                    .show_text("仅支持本地语音 (CapsLock)", false, false);
+                                Ok(())
+                            }
+                        };
+                        if let Err(error) = result {
+                            self.hud.clear();
+                            error!(
                                 ?mode,
                                 profile = event.profile_id.as_str(),
-                                "cloud voice profile disabled in public ainput; only local SenseVoice is active"
+                                error = %error,
+                                "voice session failed"
                             );
-                            self.hud
-                                .show_text("仅支持本地语音 (CapsLock)", false, false);
-                            Ok(())
                         }
-                    };
-                    if let Err(error) = result {
-                        self.hud.clear();
-                        error!(
-                            ?mode,
-                            profile = event.profile_id.as_str(),
-                            error = %error,
-                            "voice session failed"
-                        );
                     }
-                }
-                Ok(_) => {}
+                    // Stray release with no active session (the hold loop consumes the paired one).
+                    TriggerPhase::Released => {}
+                },
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+        }
+        // R1 shutdown: discard every speculative arm (prunes hub subscribers); no wav, no history.
+        for slot in pre_press_slots.iter_mut() {
+            slot.take();
         }
         info!("voice worker stopped");
         Ok(())
@@ -1423,6 +1567,7 @@ impl VoiceWorker {
         &self,
         hotkey_rx: &mpsc::Receiver<HotkeyEvent>,
         profile_id: VoiceProfileId,
+        pre_press: Option<PrePressSlot>,
     ) -> Result<()> {
         let utterance_id = next_utterance_id();
         let started_at = Instant::now();
@@ -1430,10 +1575,33 @@ impl VoiceWorker {
         let gate_qualified_at = started_at;
         // B′ silent particle meter (no text, no dark rect) for CapsLock local path.
         self.hud.show_meter_listening();
-        let audio = self.audio.subscribe(self.config.asr.pre_roll_ms);
+        // R1: adopt the speculative arm when present — same hub subscription, so no double
+        // pre-roll. Otherwise the legacy subscribe path below (byte-identical semantics).
+        let (audio, mut resampler, mut samples) = match pre_press {
+            Some(mut slot) => {
+                pump_pre_press_slot(&mut slot);
+                let provisional_age_ms = slot.armed_at.elapsed().as_millis();
+                let speculative_buffer_ms =
+                    audio_ms(slot.samples.len(), self.local_sample_rate_hz());
+                info!(
+                    utterance_id,
+                    profile = slot.profile_id.as_str(),
+                    provisional_age_ms,
+                    speculative_buffer_ms,
+                    "local non-streaming session adopted pre-press slot"
+                );
+                (slot.audio, slot.resampler, slot.samples)
+            }
+            None => {
+                let audio = self.audio.subscribe(self.config.asr.pre_roll_ms);
+                let sample_rate_hz = self.config.local_nonstreaming.sample_rate_hz.max(1);
+                let resampler =
+                    LinearResampler::new(self.audio.sample_rate_hz(), sample_rate_hz);
+                let samples = Vec::<f32>::new();
+                (audio, resampler, samples)
+            }
+        };
         let sample_rate_hz = self.config.local_nonstreaming.sample_rate_hz.max(1);
-        let mut resampler = LinearResampler::new(self.audio.sample_rate_hz(), sample_rate_hz);
-        let mut samples = Vec::<f32>::new();
         // 按住攒音，松开进行 SenseVoice 本地推理。
         let engine_key = self
             .shared_engine

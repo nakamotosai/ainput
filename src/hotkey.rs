@@ -26,6 +26,12 @@ use crate::modes::{InputMode, VoiceProfileId};
 pub enum TriggerPhase {
     Pressed,
     Released,
+    /// R1 key-gate overlap hint: physical key down observed, before activation_delay qualifies.
+    /// Emitted from the poll loop only (never from LL hook callbacks). Arms speculative audio only.
+    PrePress,
+    /// R1: key released before activation_delay qualified (no Pressed was sent).
+    /// Discards the speculative arm; emits no wav and no history downstream.
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +60,22 @@ impl VoiceTriggerEvent {
             profile_id,
             mode,
             phase: TriggerPhase::Released,
+        }
+    }
+
+    fn pre_press(profile_id: VoiceProfileId, mode: InputMode) -> Self {
+        Self {
+            profile_id,
+            mode,
+            phase: TriggerPhase::PrePress,
+        }
+    }
+
+    fn cancel(profile_id: VoiceProfileId, mode: InputMode) -> Self {
+        Self {
+            profile_id,
+            mode,
+            phase: TriggerPhase::Cancel,
         }
     }
 }
@@ -393,11 +415,23 @@ fn run_boolean_hotkey_loop<F>(
     let mut up_since: Option<Instant> = None;
     // R0 latency span: press edge instant, paired with the debounced release below (log-only).
     let mut press_detected_at: Option<Instant> = None;
+    // R1 key-gate overlap: PrePress hint goes out once per press attempt from this poll loop
+    // only (never from the LL hook callbacks); Cancel goes out on release before activation.
+    let mut pre_press_sent = false;
     while !shutdown.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
         let pressed = is_pressed(active);
         if pressed {
             up_since = None;
             let since = down_since.get_or_insert_with(Instant::now);
+            if !active && !pre_press_sent {
+                pre_press_sent = true;
+                let _ = tx.send(HotkeyEvent::Voice(VoiceTriggerEvent::pre_press(profile_id, mode)));
+                info!(
+                    profile = profile_id.as_str(),
+                    mode = ?mode,
+                    "hotkey pre-press hint"
+                );
+            }
             if !active && since.elapsed() >= activation_delay {
                 active = true;
                 press_detected_at = Some(Instant::now());
@@ -428,12 +462,26 @@ fn run_boolean_hotkey_loop<F>(
                 }
             } else {
                 up_since = None;
+                // R1: released before activation qualified — no Pressed went out, so Cancel
+                // the speculative arm instead of a debounced Released.
+                if pre_press_sent {
+                    pre_press_sent = false;
+                    let _ = tx.send(HotkeyEvent::Voice(VoiceTriggerEvent::cancel(profile_id, mode)));
+                    info!(
+                        profile = profile_id.as_str(),
+                        mode = ?mode,
+                        "hotkey pre-press cancelled"
+                    );
+                }
             }
         }
         thread::sleep(poll);
     }
     if active {
         let _ = tx.send(HotkeyEvent::Voice(VoiceTriggerEvent::released(profile_id, mode)));
+    } else if pre_press_sent {
+        // R1: loop stopped mid press-attempt — prune the speculative arm downstream.
+        let _ = tx.send(HotkeyEvent::Voice(VoiceTriggerEvent::cancel(profile_id, mode)));
     }
 }
 
@@ -866,7 +914,6 @@ mod tests {
         hotkey_supports_suppress, is_alt_z_hotkey, is_capslock_hotkey, is_mouse_side_hotkey,
         parse_hotkey, parse_hotkey_label, validate_hotkey_label,
     };
-
     #[test]
     fn parses_capslock_hotkey_aliases() {
         assert!(is_capslock_hotkey("CapsLock"));
@@ -895,5 +942,90 @@ mod tests {
         assert_eq!(parse_hotkey_label("mousex1").unwrap(), "MouseX1");
         assert!(validate_hotkey_label("F13").is_ok());
         assert!(validate_hotkey_label("Ctrl").is_err());
+    }
+
+    fn spawn_loop_with_held(
+        activation_delay: std::time::Duration,
+        held: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tx: std::sync::mpsc::Sender<super::HotkeyEvent>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            super::run_boolean_hotkey_loop(
+                crate::modes::VoiceProfileId::LocalNonstreaming,
+                crate::modes::InputMode::LocalNonstreaming,
+                activation_delay,
+                std::time::Duration::from_millis(45),
+                std::time::Duration::from_millis(5),
+                tx,
+                shutdown,
+                stop,
+                move |_| held.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        })
+    }
+
+    fn recv_phase(rx: &std::sync::mpsc::Receiver<super::HotkeyEvent>) -> super::TriggerPhase {
+        match rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("hotkey event")
+        {
+            super::HotkeyEvent::Voice(event) => event.phase,
+        }
+    }
+
+    #[test]
+    fn pre_press_arms_before_activation_and_pressed_still_fires() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (tx, rx) = std::sync::mpsc::channel::<super::HotkeyEvent>();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let held = std::sync::Arc::new(AtomicBool::new(false));
+        let join = spawn_loop_with_held(
+            std::time::Duration::from_millis(40),
+            std::sync::Arc::clone(&held),
+            tx,
+            std::sync::Arc::clone(&shutdown),
+            std::sync::Arc::clone(&stop),
+        );
+        held.store(true, Ordering::Relaxed);
+        // R1: PrePress hint arrives on the first pressed poll, Pressed only after the delay.
+        assert_eq!(recv_phase(&rx), super::TriggerPhase::PrePress);
+        assert_eq!(recv_phase(&rx), super::TriggerPhase::Pressed);
+        held.store(false, Ordering::Relaxed);
+        // R0: debounced Released path is unchanged.
+        assert_eq!(recv_phase(&rx), super::TriggerPhase::Released);
+        shutdown.store(true, Ordering::Relaxed);
+        join.join().expect("loop thread");
+    }
+
+    #[test]
+    fn release_before_activation_sends_cancel_not_pressed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (tx, rx) = std::sync::mpsc::channel::<super::HotkeyEvent>();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let held = std::sync::Arc::new(AtomicBool::new(false));
+        let join = spawn_loop_with_held(
+            std::time::Duration::from_millis(400),
+            std::sync::Arc::clone(&held),
+            tx,
+            std::sync::Arc::clone(&shutdown),
+            std::sync::Arc::clone(&stop),
+        );
+        held.store(true, Ordering::Relaxed);
+        assert_eq!(recv_phase(&rx), super::TriggerPhase::PrePress);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        held.store(false, Ordering::Relaxed);
+        // R1: short tap cancels the speculative arm; Pressed never fires.
+        assert_eq!(recv_phase(&rx), super::TriggerPhase::Cancel);
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(700))
+            .is_err());
+        shutdown.store(true, Ordering::Relaxed);
+        join.join().expect("loop thread");
     }
 }
