@@ -572,6 +572,8 @@ pub fn paste_text_to_target_with_trace(
         }
     };
     let clipboard_set_ms = clipboard_report.set_elapsed_ms;
+    // R0 latency span: clipboard write done (log-only).
+    let clipboard_set_end_at = Instant::now();
 
     if let Some(copy_only_reason) = direct_output_disabled_reason(config) {
         append_action(&mut prepared.actions, copy_only_reason);
@@ -600,6 +602,7 @@ pub fn paste_text_to_target_with_trace(
             clipboard_set_retries = clipboard_report.set_retries,
             clipboard_previous_text_captured = clipboard_report.previous_text_captured,
             clipboard_previous_text_error = %clipboard_report.previous_text_error,
+            clipboard_set_span_ms = clipboard_set_end_at.duration_since(started_at).as_millis(),
             paste_total_ms = started_at.elapsed().as_millis(),
             direct_paste = false,
             clipboard_retained = clipboard_report.clipboard_retained(),
@@ -763,6 +766,8 @@ pub fn paste_text_to_target_with_trace(
     }
     let paste_result = send_ctrl_v();
     let paste_done_ms = started_at.elapsed().as_millis();
+    // R0 latency span: Ctrl+V sent (log-only).
+    let ctrl_v_sent_at = Instant::now();
     if paste_result.is_ok() {
         // 2026-09-07：拆掉 wezterm 读屏复查。它治的是「SendInput 假成功但窗格吞字」，
         // 代价是每次粘贴后要连环调 wezterm cli 读屏（最坏 13 秒还堵住下一句）。
@@ -772,6 +777,8 @@ pub fn paste_text_to_target_with_trace(
         }
         restore_previous_clipboard_text_if_needed(&mut clipboard_report, config);
     }
+    // R0 latency span: paste settled, post clipboard restore (log-only).
+    let paste_settled_at = Instant::now();
     if target.is_wezterm() {
         info!(
             utterance_id,
@@ -832,6 +839,9 @@ pub fn paste_text_to_target_with_trace(
             clipboard_restore_error = %clipboard_report.restore_error,
             paste_done_ms,
             paste_total_ms = paste_done_ms,
+            clipboard_set_span_ms = clipboard_set_end_at.duration_since(started_at).as_millis(),
+            ctrl_v_span_ms = ctrl_v_sent_at.duration_since(started_at).as_millis(),
+            paste_settled_ms = paste_settled_at.duration_since(started_at).as_millis(),
             paste_stabilize_ms = config.paste_stabilize_ms,
             direct_paste = true,
             clipboard_retained = clipboard_report.clipboard_retained(),
@@ -876,6 +886,9 @@ pub fn paste_text_to_target_with_trace(
             clipboard_restore_error = %clipboard_report.restore_error,
             paste_done_ms,
             paste_total_ms = paste_done_ms,
+            clipboard_set_span_ms = clipboard_set_end_at.duration_since(started_at).as_millis(),
+            ctrl_v_span_ms = ctrl_v_sent_at.duration_since(started_at).as_millis(),
+            paste_settled_ms = paste_settled_at.duration_since(started_at).as_millis(),
             paste_stabilize_ms = config.paste_stabilize_ms,
             direct_paste = true,
             clipboard_retained = clipboard_report.clipboard_retained(),

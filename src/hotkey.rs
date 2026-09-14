@@ -391,6 +391,8 @@ fn run_boolean_hotkey_loop<F>(
     let mut active = false;
     let mut down_since: Option<Instant> = None;
     let mut up_since: Option<Instant> = None;
+    // R0 latency span: press edge instant, paired with the debounced release below (log-only).
+    let mut press_detected_at: Option<Instant> = None;
     while !shutdown.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
         let pressed = is_pressed(active);
         if pressed {
@@ -398,7 +400,13 @@ fn run_boolean_hotkey_loop<F>(
             let since = down_since.get_or_insert_with(Instant::now);
             if !active && since.elapsed() >= activation_delay {
                 active = true;
+                press_detected_at = Some(Instant::now());
                 let _ = tx.send(HotkeyEvent::Voice(VoiceTriggerEvent::pressed(profile_id, mode)));
+                info!(
+                    profile = profile_id.as_str(),
+                    mode = ?mode,
+                    "hotkey press detected"
+                );
             }
         } else {
             down_since = None;
@@ -408,6 +416,15 @@ fn run_boolean_hotkey_loop<F>(
                     active = false;
                     up_since = None;
                     let _ = tx.send(HotkeyEvent::Voice(VoiceTriggerEvent::released(profile_id, mode)));
+                    if let Some(press_at) = press_detected_at.take() {
+                        let release_debounced_at = Instant::now();
+                        info!(
+                            profile = profile_id.as_str(),
+                            mode = ?mode,
+                            hold_ms = release_debounced_at.duration_since(press_at).as_millis(),
+                            "hotkey release debounced"
+                        );
+                    }
                 }
             } else {
                 up_since = None;

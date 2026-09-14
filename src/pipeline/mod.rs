@@ -1420,6 +1420,8 @@ impl VoiceWorker {
     ) -> Result<()> {
         let utterance_id = next_utterance_id();
         let started_at = Instant::now();
+        // R0 latency span: session entry == hotkey gate qualified (Pressed accepted; log-only).
+        let gate_qualified_at = started_at;
         // B′ silent particle meter (no text, no dark rect) for CapsLock local path.
         self.hud.show_meter_listening();
         let audio = self.audio.subscribe(self.config.asr.pre_roll_ms);
@@ -1464,17 +1466,23 @@ impl VoiceWorker {
             self.hud.clear();
             return Ok(());
         }
+        // R0 latency span: hold loop observed release (log-only).
+        let hold_loop_exit_at = Instant::now();
         self.drain_release_audio(
             &audio.rx,
             &mut resampler,
             &mut samples,
             self.config.local_nonstreaming.release_grace_ms,
         );
+        // R0 latency span: release grace drain done (log-only).
+        let grace_end_at = Instant::now();
         self.hud.show_meter_busy();
         drop(audio);
 
         let audio_ms = audio_ms(samples.len(), sample_rate_hz);
         let rms_dbfs = rms_dbfs(&samples);
+        // R0 latency span: audio RMS gate evaluated (log-only).
+        let gate_check_end_at = Instant::now();
         if audio_ms < self.config.local_nonstreaming.min_audio_ms
             || rms_dbfs < self.config.local_nonstreaming.min_rms_dbfs
         {
@@ -1488,6 +1496,9 @@ impl VoiceWorker {
                 utterance_id,
                 audio_ms,
                 rms_dbfs,
+                hold_ms = hold_loop_exit_at.duration_since(gate_qualified_at).as_millis(),
+                grace_ms = grace_end_at.duration_since(hold_loop_exit_at).as_millis(),
+                gate_check_ms = gate_check_end_at.duration_since(grace_end_at).as_millis(),
                 min_audio_ms = self.config.local_nonstreaming.min_audio_ms,
                 min_rms_dbfs = self.config.local_nonstreaming.min_rms_dbfs,
                 mode = "local_nonstreaming",
@@ -1507,6 +1518,8 @@ impl VoiceWorker {
         }
 
         // 本地分发：SenseVoice 原生推理
+        // R0 latency span: decode window opens here (log-only).
+        let decode_start_at = Instant::now();
         let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) = {
             let guard = self
                 .local_recognizer
@@ -1522,11 +1535,16 @@ impl VoiceWorker {
             let root = response.model_root.clone();
             (response.text, root, transcribe_started.elapsed().as_millis())
         };
+        let decode_end_at = Instant::now();
         info!(
             engine = %engine_key,
             model_root = %backend_model_root.display(),
             transcribe_ms = asr_elapsed_ms,
             audio_ms = audio_ms,
+            hold_ms = hold_loop_exit_at.duration_since(gate_qualified_at).as_millis(),
+            grace_ms = grace_end_at.duration_since(hold_loop_exit_at).as_millis(),
+            gate_check_ms = gate_check_end_at.duration_since(grace_end_at).as_millis(),
+            decode_ms = decode_end_at.duration_since(decode_start_at).as_millis(),
             "local_nonstreaming dispatch (engine comes from tray live channel)"
         );
         let response = crate::local_asr::LocalTranscription {
@@ -1560,6 +1578,8 @@ impl VoiceWorker {
 
         let raw_finalized =
             finalize_asr_text_for_paste_for_language(&raw_text, RewriteOutputLanguage::Chinese);
+        // R0 latency span: finalize done (log-only).
+        let finalize_end_at = Instant::now();
         let raw_text_for_paste = raw_finalized.text.as_str();
         if raw_text_for_paste.is_empty() {
             let mut record =
@@ -1578,6 +1598,7 @@ impl VoiceWorker {
                 audio_ms,
                 model_root = %response.model_root.display(),
                 transcribe_ms = asr_elapsed_ms,
+                finalize_ms = finalize_end_at.duration_since(decode_end_at).as_millis(),
                 mode = "local_nonstreaming",
                 "local non-streaming returned no text"
             );
@@ -1718,6 +1739,7 @@ impl VoiceWorker {
                 target_text_actions = %paste_outcome.text_actions,
                 rewrite_output_route = %output_target.route.as_str(),
                 transcribe_ms = asr_elapsed_ms,
+                finalize_ms = finalize_end_at.duration_since(decode_end_at).as_millis(),
                 total_elapsed_ms = started_at.elapsed().as_millis(),
                 mode = "local_nonstreaming",
                 "local non-streaming raw text pasted; AI rewrite disabled"
@@ -1871,6 +1893,7 @@ impl VoiceWorker {
             target_text_actions = %paste_outcome.text_actions,
             rewrite_output_route = %output_target.route.as_str(),
             transcribe_ms = asr_elapsed_ms,
+            finalize_ms = finalize_end_at.duration_since(decode_end_at).as_millis(),
             total_elapsed_ms = started_at.elapsed().as_millis(),
             mode = "local_nonstreaming",
             "local non-streaming raw text pasted; async rewrite scheduled"
