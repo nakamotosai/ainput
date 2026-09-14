@@ -99,6 +99,8 @@ pub struct LocalNonstreamingConfig {
     pub punct_enabled: bool,
     /// 相对 install_root 或绝对路径；目录内需有 model.onnx 或 model.int8.onnx。
     pub punct_model_dir: String,
+    /// R23: decoder threads. 0 = auto (available parallelism clamped to
+    /// [1, 8]); positive values clamp to [1, 8].
     pub num_threads: i32,
     pub release_grace_ms: u64,
     pub min_audio_ms: u64,
@@ -876,7 +878,8 @@ impl Default for LocalNonstreamingConfig {
             use_itn: true,
             punct_enabled: true,
             punct_model_dir: "models/punct".to_string(),
-            num_threads: 4,
+            // R23: 0 = auto (resolves to available parallelism clamped to [1, 8]).
+            num_threads: 0,
             release_grace_ms: 80,
             min_audio_ms: 800,
             min_rms_dbfs: -56.0,

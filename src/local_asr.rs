@@ -52,6 +52,19 @@ pub struct LocalTranscription {
     pub model_root: PathBuf,
 }
 
+/// R23 decode-side threads: configured > 0 clamps to [1, 8]; 0/negative means
+/// auto (available parallelism clamped to [1, 8]).
+pub fn effective_decoder_threads(configured: i32) -> i32 {
+    if configured > 0 {
+        configured.clamp(1, 8)
+    } else {
+        std::thread::available_parallelism()
+            .map(|cores| cores.get() as i32)
+            .unwrap_or(4)
+            .clamp(1, 8)
+    }
+}
+
 pub struct LocalSenseVoiceRecognizer {
     recognizer: OfflineRecognizer,
     engine: LocalEngine,
@@ -68,6 +81,7 @@ impl LocalSenseVoiceRecognizer {
     ) -> Result<Self> {
         let engine = LocalEngine::parse(&config.engine)?;
         let model_dir = resolve_model_dir(&config.model_dir, install_root.as_ref());
+        let effective_threads = effective_decoder_threads(config.num_threads);
         let (recognizer_config, root_dir, punctuator) = match engine {
             LocalEngine::SenseVoice => {
                 let model_bundle = prepare_runtime_bundle(SenseVoiceModelBundle::discover(
@@ -90,7 +104,7 @@ impl LocalSenseVoiceRecognizer {
                 recognizer_config.feat_config.sample_rate = config.sample_rate_hz.max(1) as i32;
                 recognizer_config.model_config.tokens = Some(tokens_path);
                 recognizer_config.model_config.provider = Some(config.provider.clone());
-                recognizer_config.model_config.num_threads = config.num_threads.max(1);
+                recognizer_config.model_config.num_threads = effective_threads;
                 recognizer_config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
                     model: Some(model_path),
                     language: Some(config.language.clone()),
@@ -109,7 +123,8 @@ impl LocalSenseVoiceRecognizer {
             provider = %config.provider,
             language = %config.language,
             use_itn = config.use_itn,
-            num_threads = config.num_threads,
+            num_threads = effective_threads,
+            configured_num_threads = config.num_threads,
             punctuation = punctuator.is_some(),
             "local ASR recognizer created"
         );
@@ -148,6 +163,15 @@ impl LocalSenseVoiceRecognizer {
             text: result.text,
             model_root: self.root_dir.clone(),
         })
+    }
+
+    /// R23 decode warmup: one tiny silence decode so the first real utterance
+    /// does not pay one-time init cost. Best-effort; result discarded.
+    pub fn warmup_once(&self, sample_rate_hz: u32) {
+        let stream = self.recognizer.create_stream();
+        let silence = vec![0.0f32; 1600];
+        stream.accept_waveform(sample_rate_hz.max(1) as i32, &silence);
+        self.recognizer.decode(&stream);
     }
 }
 
@@ -420,6 +444,21 @@ mod tests {
         assert!(matches!(LocalEngine::parse("sensevoice"), Ok(LocalEngine::SenseVoice)));
         assert!(LocalEngine::parse("whisper").is_err());
         assert!(LocalEngine::parse("unknown-engine").is_err());
+    }
+
+    #[test]
+    fn effective_decoder_threads_mapping() {
+        // Explicit values clamp to [1, 8].
+        assert_eq!(effective_decoder_threads(4), 4);
+        assert_eq!(effective_decoder_threads(100), 8);
+        // 0 / negative means auto: available parallelism clamped to [1, 8].
+        let cores = std::thread::available_parallelism()
+            .map(|cores| cores.get() as i32)
+            .unwrap_or(4)
+            .clamp(1, 8);
+        assert_eq!(effective_decoder_threads(0), cores);
+        assert_eq!(effective_decoder_threads(-1), cores);
+        assert!(effective_decoder_threads(0) >= 1 && effective_decoder_threads(0) <= 8);
     }
 
     /// 2026-09-03: 用真实 75MB int8 标点模型验证「裸识别文本 → 带标点」契约，

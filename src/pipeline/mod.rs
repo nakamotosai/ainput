@@ -361,6 +361,44 @@ fn discard_stale_pre_press_slots(slots: &mut [Option<PrePressSlot>]) {
     }
 }
 
+/// R23 decode warmup: one silence decode overlapping the release-grace drain +
+/// audio gate so the first real decode skips one-time init cost. The handle must
+/// be reaped (reap_decoder_warmup) before any real decode so warmup and decode
+/// never run concurrently.
+fn spawn_decoder_warmup(
+    recognizer: Arc<Mutex<Option<LocalSenseVoiceRecognizer>>>,
+    sample_rate_hz: u32,
+) -> Option<thread::JoinHandle<()>> {
+    Some(thread::spawn(move || {
+        let guard = match recognizer.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if let Some(active) = guard.as_ref() {
+            active.warmup_once(sample_rate_hz);
+        }
+    }))
+}
+
+/// Reap the R23 warmup thread with a bounded wait, then block to guarantee the
+/// real decode below never overlaps it.
+fn reap_decoder_warmup(handle: Option<thread::JoinHandle<()>>, utterance_id: &str) {
+    let Some(handle) = handle else { return };
+    const WARMUP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+    let wait_started = Instant::now();
+    while !handle.is_finished() {
+        if wait_started.elapsed() >= WARMUP_JOIN_TIMEOUT {
+            warn!(
+                utterance_id,
+                "decoder warmup join timed out; blocking until warmup finishes"
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = handle.join();
+}
+
 impl LocalNonstreamingPipeline {
     fn run_with_slot(
         &self,
@@ -1642,6 +1680,9 @@ impl VoiceWorker {
         }
         // R0 latency span: hold loop observed release (log-only).
         let hold_loop_exit_at = Instant::now();
+        // R23 decode warmup: overlaps the drain + gate below; reaped before decode.
+        let mut warmup_handle =
+            spawn_decoder_warmup(Arc::clone(&self.local_recognizer), sample_rate_hz);
         self.drain_release_audio(
             &audio.rx,
             &mut resampler,
@@ -1660,6 +1701,8 @@ impl VoiceWorker {
         if audio_ms < self.config.local_nonstreaming.min_audio_ms
             || rms_dbfs < self.config.local_nonstreaming.min_rms_dbfs
         {
+            // R23: gate-failed utterances never decode; reap the warmup thread here.
+            reap_decoder_warmup(warmup_handle.take(), &utterance_id);
             let mut record =
                 HistoryRecord::new(&utterance_id, profile_id.as_str(), "local_nonstreaming");
             record.audio_ms = audio_ms;
@@ -1702,6 +1745,8 @@ impl VoiceWorker {
 
         // 本地分发：SenseVoice 原生推理
         // R0 latency span: decode window opens here (log-only).
+        // R23: warmup is always joined before the real decode (never concurrent).
+        reap_decoder_warmup(warmup_handle.take(), &utterance_id);
         let decode_start_at = Instant::now();
         let (backend_text, backend_model_root, asr_elapsed_ms): (String, PathBuf, u128) = {
             let guard = self
