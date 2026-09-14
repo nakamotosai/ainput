@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -74,6 +75,11 @@ const ASYNC_REWRITE_REPLACEMENT_MAX_AGE_MS: u128 = 12_000;
 // 终端/不可替换目标走「先改写再上屏」：这里不再用 450ms 抢先贴原文，而是等改写完成
 // （最多 15s，等于改写超时上限），改写结果直接上屏，避免「贴了原文却替换不了」。
 const HUD_FIRST_REWRITE_DEADLINE_MS: u64 = 15_000;
+
+// R0.5 regression audio dump: per-utterance raw-audio wav, auto-stops at cap.
+const AUDIO_DUMP_MAX_FILES: usize = 200;
+static AUDIO_DUMP_COUNT: AtomicUsize = AtomicUsize::new(usize::MAX);
+static AUDIO_DUMP_CAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 struct AsyncWhisperRewriteJob {
     utterance_id: String,
@@ -1516,6 +1522,15 @@ impl VoiceWorker {
             self.hud.clear();
             return Ok(());
         }
+
+        // R0.5 regression audio dump: best-effort raw-audio wav, never fails dictation.
+        let _ = dump_utterance_audio(
+            self.history.path(),
+            &utterance_id,
+            &samples,
+            sample_rate_hz,
+            audio_ms,
+        );
 
         // 本地分发：SenseVoice 原生推理
         // R0 latency span: decode window opens here (log-only).
@@ -4662,6 +4677,147 @@ fn is_whisper_short_hallucination(text: &str, audio_ms: u64) -> bool {
 fn next_utterance_id() -> String {
     let sequence = UTTERANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("utt-{sequence:08}")
+}
+
+/// R0.5: dump per-utterance raw audio to `<history_dir>/audio/<utterance_id>.wav`
+/// (16-bit PCM mono) for later regression comparison. Best-effort only:
+/// never panics and never propagates errors; returns the written path on
+/// success, None when skipped (cap reached) or failed.
+fn dump_utterance_audio(
+    history_path: &std::path::Path,
+    utterance_id: &str,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    audio_ms_value: u64,
+) -> Option<std::path::PathBuf> {
+    let mut count = AUDIO_DUMP_COUNT.load(Ordering::Relaxed);
+    if count == usize::MAX {
+        let dir = audio_dump_dir(history_path);
+        let initial = match count_existing_dumps(&dir) {
+            Some(existing) => existing.min(AUDIO_DUMP_MAX_FILES),
+            // On any IO error default to cap-reached (skip) rather than unbounded growth.
+            None => AUDIO_DUMP_MAX_FILES,
+        };
+        match AUDIO_DUMP_COUNT.compare_exchange(
+            usize::MAX,
+            initial,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => count = initial,
+            Err(actual) => count = actual,
+        }
+    }
+    if count >= AUDIO_DUMP_MAX_FILES {
+        if !AUDIO_DUMP_CAP_LOGGED.swap(true, Ordering::Relaxed) {
+            info!(
+                cap = AUDIO_DUMP_MAX_FILES,
+                "utterance audio dump cap reached; skipping further dumps"
+            );
+        }
+        return None;
+    }
+    let dir = audio_dump_dir(history_path);
+    if std::fs::create_dir_all(&dir).is_err() {
+        warn!("utterance audio dump skipped: cannot create audio dir");
+        return None;
+    }
+    let safe_id = utterance_id.replace('/', "_").replace('\\', "_");
+    let path = dir.join(format!("{safe_id}.wav"));
+    match write_mono_pcm16_wav(&path, samples, sample_rate_hz) {
+        Ok(()) => {
+            let index = AUDIO_DUMP_COUNT
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            info!(
+                utterance_id,
+                audio_ms = audio_ms_value,
+                path = %path.display(),
+                dumped_index = index,
+                cap = AUDIO_DUMP_MAX_FILES,
+                "utterance audio dumped for regression comparison"
+            );
+            Some(path)
+        }
+        Err(error) => {
+            warn!(
+                utterance_id,
+                error = %error,
+                "utterance audio dump skipped: wav write failed"
+            );
+            None
+        }
+    }
+}
+
+/// Sibling `audio/` dir of the history file (`state/logs/history.jsonl` -> `state/logs/audio`).
+fn audio_dump_dir(history_path: &std::path::Path) -> std::path::PathBuf {
+    match history_path.parent() {
+        Some(parent) => parent.join("audio"),
+        None => std::path::PathBuf::from("audio"),
+    }
+}
+
+fn count_existing_dumps(dir: &std::path::Path) -> Option<usize> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut count = 0usize;
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(_) => continue,
+        };
+        let is_wav = match path.extension() {
+            Some(ext) => ext.to_string_lossy().eq_ignore_ascii_case("wav"),
+            None => false,
+        };
+        if is_wav {
+            count = count.saturating_add(1);
+        }
+    }
+    Some(count)
+}
+
+/// Hand-written 44-byte header, 16-bit PCM mono WAV. No new dependencies.
+fn write_mono_pcm16_wav(
+    path: &std::path::Path,
+    samples: &[f32],
+    sample_rate_hz: u32,
+) -> std::io::Result<()> {
+    let sample_rate_hz = sample_rate_hz.max(1);
+    let data_bytes: u32 = samples
+        .len()
+        .saturating_mul(2)
+        .min(u32::MAX as usize) as u32;
+    let header = wav_header(sample_rate_hz, data_bytes);
+    let mut pcm = Vec::with_capacity(samples.len().saturating_mul(2));
+    for sample in samples {
+        let quantized = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+        pcm.extend_from_slice(&quantized.to_le_bytes());
+    }
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&header)?;
+    file.write_all(&pcm)?;
+    Ok(())
+}
+
+fn wav_header(sample_rate_hz: u32, data_bytes: u32) -> [u8; 44] {
+    let byte_rate = sample_rate_hz.saturating_mul(2);
+    let chunk_size = data_bytes.saturating_add(36);
+    let mut header = [0u8; 44];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&chunk_size.to_le_bytes());
+    header[8..12].copy_from_slice(b"WAVE");
+    header[12..16].copy_from_slice(b"fmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&1u16.to_le_bytes());
+    header[22..24].copy_from_slice(&1u16.to_le_bytes());
+    header[24..28].copy_from_slice(&sample_rate_hz.to_le_bytes());
+    header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    header[32..34].copy_from_slice(&2u16.to_le_bytes());
+    header[34..36].copy_from_slice(&16u16.to_le_bytes());
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_bytes.to_le_bytes());
+    header
 }
 
 #[cfg(test)]
