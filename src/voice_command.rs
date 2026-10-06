@@ -1,5 +1,6 @@
-//! Voice command wake phrase: "老蔡老蔡" → generate instead of dictation rewrite.
-//! Toggle + editable system prompt via tray / loopback panel.
+//! Voice command wake phrase: a neutral default ("小助手小助手") → generate
+//! instead of dictation rewrite. Toggle + editable system prompt via tray /
+//! loopback panel; the wake phrase itself is user-editable.
 
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -11,11 +12,17 @@ use std::sync::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-/// Primary wake phrase (after ASR normalization).
-pub const WAKE_PHRASE: &str = "老蔡老蔡";
+/// Primary wake phrase (after ASR normalization). Neutral, product-appropriate;
+/// users can change it via the tray / voice-command panel.
+pub const WAKE_PHRASE: &str = "小助手小助手";
 
 /// Optional ASR variants that should also trigger command mode.
-const WAKE_VARIANTS: &[&str] = &["老蔡老蔡", "老菜老菜", "老财老财"];
+const WAKE_VARIANTS: &[&str] = &["小助手小助手", "小助手", "小助 手小助手"];
+
+/// Legacy personal wake phrase kept working so existing users' muscle memory
+/// (and any persisted history) still triggers command mode after the default
+/// changed to a neutral phrase.
+const LEGACY_WAKE_PHRASES: &[&str] = &["老蔡老蔡", "老菜老菜", "老财老财"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceCommand {
@@ -40,7 +47,11 @@ pub fn parse_voice_command_with(text: &str, wake_phrase: &str) -> Option<VoiceCo
         return None;
     }
     let variants: Vec<&str> = if wake_phrase == WAKE_PHRASE {
-        WAKE_VARIANTS.to_vec()
+        // Default phrase: accept its ASR variants plus the legacy personal
+        // phrases (so long-time users' existing habit keeps working).
+        let mut v = WAKE_VARIANTS.to_vec();
+        v.extend_from_slice(LEGACY_WAKE_PHRASES);
+        v
     } else {
         vec![wake_phrase]
     };
@@ -82,7 +93,7 @@ pub struct VoiceCommandUserConfig {
     pub enabled: Option<bool>,
     /// Custom system prompt; empty → default `command_system_prompt()`.
     pub custom_prompt: Option<String>,
-    /// Custom wake phrase; empty/None → `WAKE_PHRASE` ("老蔡老蔡").
+    /// Custom wake phrase; empty/None → `WAKE_PHRASE` (neutral default).
     pub wake_phrase: Option<String>,
 }
 

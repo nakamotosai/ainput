@@ -226,6 +226,12 @@ pub fn clear(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create history dir {}", parent.display()))?;
+        // Also drop any opt-in raw-audio dumps so "clear history" truly wipes
+        // the user's speech, not just the transcript.
+        let audio_dir = parent.join("audio");
+        if audio_dir.is_dir() {
+            let _ = std::fs::remove_dir_all(&audio_dir);
+        }
     }
     File::create(path).with_context(|| format!("clear history {}", path.display()))?;
     Ok(())

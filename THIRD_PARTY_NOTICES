@@ -13,7 +13,13 @@ This product bundles or links against third-party components.
 
 - Rust crate `sherpa-onnx` (pinned in Cargo.toml)
 - Used for offline SenseVoice inference
-- See https://github.com/k2-fsa/sherpa-onnx for upstream license (typically Apache-2.0)
+- Upstream: https://github.com/k2-fsa/sherpa-onnx — Apache-2.0
+
+## ONNX Runtime
+
+- Bundled `onnxruntime.dll` (+ `onnxruntime_providers_shared.dll`); the CUDA /
+  TensorRT providers are NOT shipped (CPU inference only).
+- Upstream: https://github.com/microsoft/onnxruntime — MIT
 
 ## Other Rust dependencies
 

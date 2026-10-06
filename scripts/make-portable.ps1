@@ -1,5 +1,7 @@
 param(
-  [string]$Version = "0.1.0",
+  # Empty => derive from Cargo.toml (recommended; avoids drift). Pass an explicit
+  # value only to double-check it matches Cargo.toml.
+  [string]$Version = "",
   [switch]$Overwrite
 )
 
@@ -11,7 +13,10 @@ $CargoToml = Get-Content (Join-Path $Root "Cargo.toml") -Raw
 $CargoVersionMatch = [regex]::Match($CargoToml, '(?m)^version\s*=\s*"([^"]+)"')
 if (-not $CargoVersionMatch.Success) { throw "Cannot find package version in Cargo.toml" }
 $CargoVersion = $CargoVersionMatch.Groups[1].Value
-if ($CargoVersion -ne $Version) {
+if ([string]::IsNullOrWhiteSpace($Version)) {
+  $Version = $CargoVersion
+  Write-Host "Version derived from Cargo.toml: $Version"
+} elseif ($CargoVersion -ne $Version) {
   throw "Version mismatch: Cargo.toml is $CargoVersion but -Version is $Version"
 }
 
@@ -26,8 +31,28 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 
 New-Item -ItemType Directory -Force $Dist | Out-Null
 Copy-Item "$Root\target\release\ainput.exe" $Dist
-Get-ChildItem "$Root\target\release" -Filter "*.dll" -File -ErrorAction SilentlyContinue |
-  ForEach-Object { Copy-Item $_.FullName $Dist -Force }
+# Allow-list only the DLLs the CPU ASR path needs. A wildcard sweep would drag
+# in onnxruntime_providers_cuda.dll (~275MB) / _tensorrt.dll, which the shipped
+# config (provider="cpu") never loads — a ~166MB (compressed) download bloat.
+$RuntimeDlls = @(
+  "onnxruntime.dll",
+  "onnxruntime_providers_shared.dll",
+  "sherpa-onnx-c-api.dll",
+  "sherpa-onnx-cxx-api.dll",
+  "cargs.dll"
+)
+foreach ($dll in $RuntimeDlls) {
+  $src = Join-Path "$Root\target\release" $dll
+  if (Test-Path $src) { Copy-Item $src $Dist -Force }
+  else { Write-Warning "expected runtime DLL not found in target/release: $dll" }
+}
+# The MSVC C runtime is a hard import (VCRUNTIME140.dll). A green "unpack and
+# run" zip must carry it, or it fails on machines without the VC++ redist.
+foreach ($crt in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
+  $src = Join-Path $env:WINDIR "System32\$crt"
+  if (Test-Path $src) { Copy-Item $src $Dist -Force }
+  else { Write-Warning "C runtime DLL not found (users may need the VC++ redistributable): $crt" }
+}
 Copy-Item "$Root\run-ainput.bat" $Dist -ErrorAction SilentlyContinue
 Copy-Item -Recurse "$Root\config" $Dist
 Copy-Item "$Root\README.md" $Dist -ErrorAction SilentlyContinue

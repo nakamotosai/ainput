@@ -27,12 +27,14 @@
 
 https://input.saaaai.com/
 
-## Download (v0.1.3)
+## Download
+
+Latest release: see [GitHub Releases](https://github.com/nakamotosai/ainput/releases/latest).
 
 | Channel | Link |
 |---|---|
-| **GitHub Release** | [ainput-0.1.3-win64.zip](https://github.com/nakamotosai/ainput/releases/download/v0.1.3/ainput-0.1.3-win64.zip) |
-| **Hugging Face mirror** | [ainput-0.1.3-win64.zip](https://huggingface.co/nakamotosai/cnjp-input/resolve/main/ainput-0.1.3-win64.zip) · [repo](https://huggingface.co/nakamotosai/cnjp-input) |
+| **GitHub Releases** | https://github.com/nakamotosai/ainput/releases |
+| **Hugging Face mirror** | https://huggingface.co/nakamotosai/cnjp-input |
 | Site | https://input.saaaai.com/ |
 
 ## Quick start
@@ -55,7 +57,7 @@ Tray → **API / 改写设置…** (loopback web form, no native Win32 panel):
 | Base URL | Prefilled `https://integrate.api.nvidia.com/v1` (any OpenAI-compatible endpoint works) |
 | API Key | You provide; stored only in local `state/config/` |
 | Model | Type manually, or click **拉取模型** after Key is filled |
-| Timeout (ms) | Default `5000` — used for rewrite, model list pull, and save probe |
+| Timeout (ms) | Default `15000` — used for rewrite, model list pull, and save probe |
 | Save | Writes **API Key** to local `state/config/api-connections.json` and probes connectivity (HTTP status + latency ms) |
 
 Values hot-reload on Save (no restart). Disable rewrite to keep pure local dictation. No Python helper process.
@@ -65,7 +67,7 @@ Values hot-reload on Save (no restart). Disable rewrite to keep pure local dicta
 Requirements: Rust (MSVC), Windows SDK.
 
 ```powershell
-cd F:\ainput
+cd <repo>
 # Place SenseVoice bundle under models\sense-voice\ (see release pack)
 cargo build --release
 .\target\release\ainput.exe
@@ -74,7 +76,7 @@ cargo build --release
 Package a portable folder + zip:
 
 ```powershell
-.\scripts\make-portable.ps1 -Version 0.1.3
+.\scripts\make-portable.ps1  # version auto-derived from Cargo.toml
 ```
 
 ## Privacy
@@ -83,6 +85,8 @@ Package a portable folder + zip:
 - Rewrite (if enabled) sends text only to the endpoint **you** configured.
 - No default SaaS gateway. Keys stay in local `state/config/` (plain JSON on disk).
 - Dictation history is local-only at `state/logs/history.jsonl`. Each line may include full raw/rewrite text plus target process name and window title. **Do not share your `state/` folder** (keys + history). Delete `history.jsonl` or the whole `state/` tree to wipe local archives.
+- Release logs do **not** contain your dictated text (only character counts). Set `AINPUT_LOG_TEXT=1` to opt in to full-text logging when debugging.
+- Raw-utterance audio dumps are **off by default**; enable only for regression work with `AINPUT_DUMP_AUDIO=1` (they land under `state/logs/audio/`).
 - Green release zips never include `state/`.
 
 ## Model attribution

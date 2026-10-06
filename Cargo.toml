@@ -1,6 +1,6 @@
 [package]
 name = "ainput"
-version = "0.1.29-preview"
+version = "0.1.30-preview"
 edition = "2024"
 license = "MIT"
 description = "Local-first Windows voice input with optional OpenAI-compatible rewrite"

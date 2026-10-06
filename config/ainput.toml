@@ -4,7 +4,7 @@
 default = "local_nonstreaming"
 
 [hotkey]
-voice_input = "MouseX1"
+voice_input = "CapsLock"
 poll_ms = 8
 activation_delay_ms = 200
 
@@ -25,7 +25,7 @@ suppress_key = false
 [profiles.local_nonstreaming]
 enabled = true
 mode = "local_nonstreaming"
-hotkey = "MouseX1"
+hotkey = "CapsLock"
 activation_delay_ms = 220
 suppress_key = true
 

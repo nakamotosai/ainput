@@ -7,7 +7,7 @@
 
 ## 1 · 问题（已证实）
 
-`ainput` 在启动时一次性 `AudioHub::start_default()`（`src/main.rs:309`），cpal 采集流 `_stream` 在**整个进程生命周期内一直 `play()` 着**（`src/audio.rs:30/113/129`；看门狗只在 5s 卡顿后重建，从不主动停）。于是 USB 麦克风（DJI MIC MINI，`USB\VID_2CA3&PID_4011&MI_01`）的采集流常年打开 → `usbaudio` 驱动持有 **SYSTEM 电源请求** → 系统无法自动 S3 休眠。
+`ainput` 在启动时一次性 `AudioHub::start_default()`（`src/main.rs:309`），cpal 采集流 `_stream` 在**整个进程生命周期内一直 `play()` 着**（`src/audio.rs:30/113/129`；看门狗只在 5s 卡顿后重建，从不主动停）。于是 USB 麦克风（USB 麦克风，`USB 音频设备`）的采集流常年打开 → `usbaudio` 驱动持有 **SYSTEM 电源请求** → 系统无法自动 S3 休眠。
 
 `powercfg /requests` 里那一行 `[DRIVER] USB Audio Device … 音频流当前正在使用中` 就是它。
 
@@ -15,7 +15,7 @@
 
 ## 2 · 关键实测（本机，2026-10-06）
 
-用与项目同版本的 **cpal 0.17.3** 写探针（`C:\Users\sai\claude\mic-open-latency\cpal-probe\src\bin\pause_test.rs`），配合提权 `powercfg /requests` 逐步取证：
+用与项目同版本的 **cpal 0.17.3** 写探针（`本地探针`），配合提权 `powercfg /requests` 逐步取证：
 
 | 步骤 | USB 音频电源请求 |
 |---|---|
@@ -163,24 +163,24 @@ mic_resume_priming_ms = 200 # 恢复后最多等多久等首个回调；兜底�
 
 ---
 
-## 7 · ⚠️ 必须一并处理：`ainput2`
+## 7 · ⚠️ 必须一并处理：`第二个听写程序`
 
-**只改 `ainput` 不足以让电脑睡觉。** 实测电源请求是**按设备**计的：另一个程序再开一路采集流，那一行就回来了（探针里验证过）。而 `C:\Users\sai\ainput2` 有**完全相同的常驻占用**，且**开机自启**：
+**只改 `ainput` 不足以让电脑睡觉。** 实测电源请求是**按设备**计的：另一个程序再开一路采集流，那一行就回来了（探针里验证过）。而 `第二个听写程序` 有**完全相同的常驻占用**，且**开机自启**：
 
-- `HKCU\…\Run` → `ainput2` = `C:\Users\sai\ainput2\dist\ainput2-0.3.89\ainput2.exe`
+- `HKCU\…\Run` → `第二个听写程序` = `第二个听写程序\dist\第二个听写程序.exe`
 - `HKCU\…\Run` → `ainput` = `F:\projects\ainput\ainput.exe`（另有 `Startup\ainput.lnk`）
 
-`ainput2` 的 AGENTS.md 明确「Do not modify C:\Users\sai\ainput2」，所以这是**用户决策**，不是本仓改动：
+`第二个听写程序` 的 AGENTS.md 明确「Do not modify 第二个听写程序」，所以这是**用户决策**，不是本仓改动：
 
-- **选项 A（推荐）**：改完 `ainput` 后，把 `ainput2` 的自启关掉（删 `HKCU\…\Run` 的 `ainput2` 项 + 其 Startup 项），确认不再需要它。
-- **选项 B**：把同样的暂停补丁打到 `ainput2` 自己的仓库。
+- **选项 A（推荐）**：改完 `ainput` 后，把 `第二个听写程序` 的自启关掉（删 `HKCU\…\Run` 的 `第二个听写程序` 项 + 其 Startup 项），确认不再需要它。
+- **选项 B**：把同样的暂停补丁打到 `第二个听写程序` 自己的仓库。
 
 ---
 
 ## 8 · 验收标准
 
 1. **电源请求线**（判据是**具体那一行**，不是整表为空 —— `旧的内核调用程序` 会一直在）：
-   `powercfg /requests` 中 `USB Audio Device (USB\VID_2CA3&PID_4011&MI_01…)` 那行在**空闲时 ABSENT**、**按住键时 PRESENT**。
+   `powercfg /requests` 中 `USB Audio Device (USB 音频设备…)` 那行在**空闲时 ABSENT**、**按住键时 PRESENT**。
 2. **真的会睡**：把睡眠超时设短，离开，确认进入 S3。
 3. **首音节 A/B**：`mic_idle_pause_ms=0` vs 默认，各 ≥20 句以爆破音开头（北京/塔/打…），判据 0/20 丢字。
 4. 用**本项目构建的 exe**（不是 PortAudio 代理）复跑第 1 条。
@@ -206,4 +206,4 @@ mic_resume_priming_ms = 200 # 恢复后最多等多久等首个回调；兜底�
 
 ---
 
-*证据与原始探针：`C:\Users\sai\claude\mic-open-latency\`（`pause-test-out.txt` 为本表实测），根因报告：`C:\Users\sai\claude\sleep-forensics\EVIDENCE.md`。*
+*证据与原始探针：`本地探针目录`（`pause-test-out.txt` 为本表实测），根因报告：`根因报告`。*

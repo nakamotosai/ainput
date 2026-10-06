@@ -471,7 +471,7 @@ pub fn paste_text_to_target_with_trace(
             target_pid = target.fingerprint.process_id,
             target_process = %target.summary.process_name,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             "paste skipped because captured target changed"
         );
         return Err(anyhow!("target changed before paste"));
@@ -495,7 +495,7 @@ pub fn paste_text_to_target_with_trace(
             target_process = %target.summary.process_name,
             target_process_path = %target.process_path,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             target_right_context = target.context.right.as_str(),
             target_context_source = target.context.source,
             target_focus_class = %target.context.focus_class.as_deref().unwrap_or(""),
@@ -516,10 +516,10 @@ pub fn paste_text_to_target_with_trace(
             utterance_id,
             text_chars = prepared.text.chars().count(),
             text_hash = stable_text_hash(&prepared.text),
-            text_preview = %short_text(&prepared.text, 160),
+            text_preview = %log_text(&prepared.text, 160),
             target_process = %target.summary.process_name,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             "prepared paste text resembles a terminal mouse escape sequence"
         );
     }
@@ -542,7 +542,7 @@ pub fn paste_text_to_target_with_trace(
             cursor = %input_before_clipboard.cursor_label(),
             target_process = %target.summary.process_name,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             "terminal paste blocked while mouse button is down"
         );
         return Err(anyhow!(
@@ -562,7 +562,7 @@ pub fn paste_text_to_target_with_trace(
                 error = %error,
                 text_chars = prepared.text.chars().count(),
                 text_hash = stable_text_hash(&prepared.text),
-                text_preview = %short_text(&prepared.text, 160),
+                text_preview = %log_text(&prepared.text, 160),
                 clipboard_policy = config.clipboard_policy.as_str(),
                 clipboard_retry_count = config.clipboard_retry_count,
                 clipboard_retry_backoff_ms = config.clipboard_retry_backoff_ms,
@@ -581,7 +581,7 @@ pub fn paste_text_to_target_with_trace(
             utterance_id,
             text_chars = prepared.text.chars().count(),
             text_hash = stable_text_hash(&prepared.text),
-            text_preview = %short_text(&prepared.text, 160),
+            text_preview = %log_text(&prepared.text, 160),
             target_text_actions = %prepared.actions,
             target_right_context = target.context.right.as_str(),
             target_context_source = target.context.source,
@@ -591,7 +591,7 @@ pub fn paste_text_to_target_with_trace(
             target_process = %target.summary.process_name,
             target_process_path = %target.process_path,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             modifiers_before_clipboard = %input_before_clipboard.modifiers,
             mouse_buttons_before_clipboard = %input_before_clipboard.mouse_buttons,
             cursor_before_clipboard = %input_before_clipboard.cursor_label(),
@@ -626,7 +626,7 @@ pub fn paste_text_to_target_with_trace(
             utterance_id,
             text_chars = prepared.text.chars().count(),
             text_hash = stable_text_hash(&prepared.text),
-            text_preview = %short_text(&prepared.text, 160),
+            text_preview = %log_text(&prepared.text, 160),
             target_text_actions = %prepared.actions,
             target_right_context = target.context.right.as_str(),
             target_context_source = target.context.source,
@@ -636,7 +636,7 @@ pub fn paste_text_to_target_with_trace(
             target_process = %target.summary.process_name,
             target_process_path = %target.process_path,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             modifiers_before_clipboard = %input_before_clipboard.modifiers,
             mouse_buttons_before_clipboard = %input_before_clipboard.mouse_buttons,
             cursor_before_clipboard = %input_before_clipboard.cursor_label(),
@@ -689,14 +689,14 @@ pub fn paste_text_to_target_with_trace(
                     reason,
                     text_chars = prepared.text.chars().count(),
                     text_hash = stable_text_hash(&prepared.text),
-                    text_preview = %short_text(&prepared.text, 160),
+                    text_preview = %log_text(&prepared.text, 160),
                     target_text_actions = %prepared.actions,
                     target_hwnd = target.fingerprint.hwnd,
                     target_pid = target.fingerprint.process_id,
                     target_process = %target.summary.process_name,
                     target_process_path = %target.process_path,
                     target_class = %target.summary.class_name,
-                    target_title = %target.summary.title,
+                    target_title = %log_text(&target.summary.title, 80),
                     modifiers_after_stabilize = %input_after_stabilize.modifiers,
                     mouse_buttons_after_stabilize = %input_after_stabilize.mouse_buttons,
                     cursor_after_stabilize = %input_after_stabilize.cursor_label(),
@@ -738,10 +738,10 @@ pub fn paste_text_to_target_with_trace(
                 target_pid = target.fingerprint.process_id,
                 target_process = %target.summary.process_name,
                 target_class = %target.summary.class_name,
-                target_title = %target.summary.title,
+                target_title = %log_text(&target.summary.title, 80),
                 text_chars = prepared.text.chars().count(),
                 text_hash = stable_text_hash(&prepared.text),
-                text_preview = %short_text(&prepared.text, 160),
+                text_preview = %log_text(&prepared.text, 160),
                 target_text_actions = %prepared.actions,
                 modifiers_after_stabilize = %input_after_stabilize.modifiers,
                 mouse_buttons_after_stabilize = %input_after_stabilize.mouse_buttons,
@@ -807,7 +807,7 @@ pub fn paste_text_to_target_with_trace(
             utterance_id,
             text_chars = prepared.text.chars().count(),
             text_hash = stable_text_hash(&prepared.text),
-            text_preview = %short_text(&prepared.text, 160),
+            text_preview = %log_text(&prepared.text, 160),
             target_text_actions = %prepared.actions,
             target_right_context = target.context.right.as_str(),
             target_context_source = target.context.source,
@@ -817,7 +817,7 @@ pub fn paste_text_to_target_with_trace(
             target_process = %target.summary.process_name,
             target_process_path = %target.process_path,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             modifiers_before_clipboard = %input_before_clipboard.modifiers,
             mouse_buttons_before_clipboard = %input_before_clipboard.mouse_buttons,
             cursor_before_clipboard = %input_before_clipboard.cursor_label(),
@@ -854,7 +854,7 @@ pub fn paste_text_to_target_with_trace(
             error = %error,
             text_chars = prepared.text.chars().count(),
             text_hash = stable_text_hash(&prepared.text),
-            text_preview = %short_text(&prepared.text, 160),
+            text_preview = %log_text(&prepared.text, 160),
             target_text_actions = %prepared.actions,
             target_right_context = target.context.right.as_str(),
             target_context_source = target.context.source,
@@ -864,7 +864,7 @@ pub fn paste_text_to_target_with_trace(
             target_process = %target.summary.process_name,
             target_process_path = %target.process_path,
             target_class = %target.summary.class_name,
-            target_title = %target.summary.title,
+            target_title = %log_text(&target.summary.title, 80),
             modifiers_before_clipboard = %input_before_clipboard.modifiers,
             mouse_buttons_before_clipboard = %input_before_clipboard.mouse_buttons,
             cursor_before_clipboard = %input_before_clipboard.cursor_label(),
@@ -1129,7 +1129,7 @@ pub fn replace_recent_paste_with_trace(
                 target_pid = current_target.process_id.unwrap_or_default(),
                 target_process = %current_target.process_name.as_deref().unwrap_or("unknown"),
                 target_class = %current_target.class_name.as_deref().unwrap_or("unknown"),
-                target_title = %current_target.title.as_deref().unwrap_or(""),
+                target_title = %log_text(current_target.title.as_deref().unwrap_or(""), 80),
                 context_source,
                 selection_method,
                 clipboard_policy = clipboard_report.policy.as_str(),
@@ -2369,9 +2369,12 @@ fn log_replacement_skip(
         target_class = %target
             .and_then(|snapshot| snapshot.class_name.as_deref())
             .unwrap_or("unknown"),
-        target_title = %target
-            .and_then(|snapshot| snapshot.title.as_deref())
-            .unwrap_or(""),
+        target_title = %log_text(
+            target
+                .and_then(|snapshot| snapshot.title.as_deref())
+                .unwrap_or(""),
+            80
+        ),
         "async rewrite replacement skipped"
     );
 }
@@ -2476,6 +2479,18 @@ fn short_text(text: &str, max_chars: usize) -> String {
         value.push_str("...");
     }
     value
+}
+
+/// Log-safe rendering of dictated text: a public build must not write the user's
+/// speech to plaintext logs, so unless `AINPUT_LOG_TEXT=1` we emit only a length.
+fn log_text(text: &str, max_chars: usize) -> String {
+    if matches!(
+        std::env::var("AINPUT_LOG_TEXT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    ) {
+        return short_text(text, max_chars);
+    }
+    format!("<{} chars>", text.chars().count())
 }
 
 #[cfg(test)]

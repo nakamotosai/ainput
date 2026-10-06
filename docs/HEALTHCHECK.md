@@ -13,7 +13,7 @@ Release and regression health-check plan for the public product **ainput** (`F:\
 ```powershell
 cd F:\ainput
 cargo test
-.\scripts\make-portable.ps1 -Version 0.1.0
+.\scripts\make-portable.ps1
 ```
 
 ## Automated

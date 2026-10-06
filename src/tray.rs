@@ -472,6 +472,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
                 state.rewrite_prompt.preset(),
                 state.rewrite_prompt.preset_label().to_string(),
                 state.voice_command.enabled(),
+                state.voice_command.active_wake_phrase(),
                 state.hotkey_user.local_nonstreaming(),
                 state.current_engine.clone(),
                 state.switching.load(Ordering::Relaxed),
@@ -483,6 +484,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         prompt_preset,
         prompt_label,
         voice_command_enabled,
+        active_wake,
         voice_hotkey_label,
         current_engine,
         switching_engine,
@@ -601,7 +603,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             menu,
             MF_STRING | voice_flag,
             MENU_VOICE_COMMAND_ENABLED,
-            "语音指令（老蔡老蔡）",
+            &format!("语音指令（{}）", active_wake),
         );
         append_menu_text(
             menu,
@@ -777,9 +779,10 @@ fn set_voice_command_enabled(enabled: bool) {
         if let Some(state) = state.borrow().as_ref() {
             state.voice_command.set_enabled(enabled);
             let label = if enabled { "已开启" } else { "已关闭" };
+            let wake = state.voice_command.active_wake_phrase();
             state
                 .hud
-                .show_text(&format!("语音指令（老蔡老蔡）：{label}"), false, false);
+                .show_text(&format!("语音指令（{wake}）：{label}"), false, false);
             info!(enabled, "voice command toggle from tray");
         }
     });
@@ -1008,6 +1011,9 @@ fn toggle_auto_start() {
                 return;
             }
         };
+        // Quote the path so an install dir containing spaces still launches
+        // (reg stores the value verbatim; the shell needs the quotes).
+        let quoted = format!("\"{exe_path}\"");
         let _ = std::process::Command::new("reg")
             .args([
                 "add",
@@ -1017,7 +1023,7 @@ fn toggle_auto_start() {
                 "/t",
                 "REG_SZ",
                 "/d",
-                &exe_path,
+                &quoted,
                 "/f",
             ])
             .creation_flags(CREATE_NO_WINDOW)

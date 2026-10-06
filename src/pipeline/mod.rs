@@ -904,8 +904,8 @@ impl VoiceWorker {
             info!(
                 utterance_id,
                 session_id = %asr_session.session_id,
-                raw_snapshot = %short_text(&snapshot, 500),
-                text = %short_text(&paste_snapshot, 500),
+                raw_snapshot = %log_text(&snapshot, 500),
+                text = %log_text(&paste_snapshot, 500),
                 partial_updates = preview.partial_updates,
                 audio_ms = sent_audio_ms,
                 rms_dbfs = sent_rms_dbfs,
@@ -969,8 +969,8 @@ impl VoiceWorker {
             info!(
                 utterance_id,
                 session_id = %asr_session.session_id,
-                raw_snapshot = %short_text(&snapshot, 500),
-                text = %short_text(&paste_outcome.text, 500),
+                raw_snapshot = %log_text(&snapshot, 500),
+                text = %log_text(&paste_outcome.text, 500),
                 partial_updates = preview.partial_updates,
                 audio_ms = sent_audio_ms,
                 rms_dbfs = sent_rms_dbfs,
@@ -1039,8 +1039,8 @@ impl VoiceWorker {
             info!(
                 utterance_id,
                 session_id = %asr_session.session_id,
-                raw_snapshot = %short_text(&snapshot, 500),
-                text = %short_text(paste_snapshot, 500),
+                raw_snapshot = %log_text(&snapshot, 500),
+                text = %log_text(paste_snapshot, 500),
                 partial_updates = preview.partial_updates,
                 audio_ms = sent_audio_ms,
                 rms_dbfs = sent_rms_dbfs,
@@ -1132,8 +1132,8 @@ impl VoiceWorker {
         info!(
             utterance_id,
             session_id = %asr_session.session_id,
-            raw_snapshot = %short_text(&snapshot, 500),
-            text = %short_text(&paste_outcome.text, 500),
+            raw_snapshot = %log_text(&snapshot, 500),
+            text = %log_text(&paste_outcome.text, 500),
             partial_updates = preview.partial_updates,
             audio_ms = sent_audio_ms,
             rms_dbfs = sent_rms_dbfs,
@@ -1237,7 +1237,7 @@ impl VoiceWorker {
             info!(
                 utterance_id,
                 audio_ms = response.audio_ms,
-                raw_text = %short_text(&raw_text, 160),
+                raw_text = %log_text(&raw_text, 160),
                 mode = "whisper_zh",
                 "Whisper zh session skipped because result matches short hallucination guard"
             );
@@ -1316,8 +1316,8 @@ impl VoiceWorker {
                     elapsed_ms = response.elapsed_ms,
                     language = %response.language.as_deref().unwrap_or("unknown"),
                     model = %response.model,
-                    raw_text = %short_text(&raw_text, 500),
-                    text = %short_text(raw_text_for_paste, 500),
+                    raw_text = %log_text(&raw_text, 500),
+                    text = %log_text(raw_text_for_paste, 500),
                     finalizer_actions = %raw_finalized.actions,
                     transcribe_ms = transcribe_started.elapsed().as_millis(),
                     total_elapsed_ms = started_at.elapsed().as_millis(),
@@ -1360,8 +1360,8 @@ impl VoiceWorker {
                 elapsed_ms = response.elapsed_ms,
                 language = %response.language.as_deref().unwrap_or("unknown"),
                 model = %response.model,
-                raw_text = %short_text(&raw_text, 500),
-                text = %short_text(raw_text_for_paste, 500),
+                raw_text = %log_text(&raw_text, 500),
+                text = %log_text(raw_text_for_paste, 500),
                 finalizer_actions = %raw_finalized.actions,
                 transcribe_ms = transcribe_started.elapsed().as_millis(),
                 total_elapsed_ms = started_at.elapsed().as_millis(),
@@ -1434,8 +1434,8 @@ impl VoiceWorker {
                 elapsed_ms = response.elapsed_ms,
                 language = %response.language.as_deref().unwrap_or("unknown"),
                 model = %response.model,
-                text = %short_text(&paste_outcome.text, 500),
-                raw_text = %short_text(&raw_text, 500),
+                text = %log_text(&paste_outcome.text, 500),
+                raw_text = %log_text(&raw_text, 500),
                 finalizer_actions = %raw_finalized.actions,
                 target_text_actions = %paste_outcome.text_actions,
                 target_right_context = paste_outcome.target_context.right.as_str(),
@@ -1489,8 +1489,8 @@ impl VoiceWorker {
                 elapsed_ms = response.elapsed_ms,
                 language = %response.language.as_deref().unwrap_or("unknown"),
                 model = %response.model,
-                text = %short_text(raw_text_for_paste, 500),
-                raw_text = %short_text(&raw_text, 500),
+                text = %log_text(raw_text_for_paste, 500),
+                raw_text = %log_text(&raw_text, 500),
                 finalizer_actions = %raw_finalized.actions,
                 target_process = %output_target.summary.process_name,
                 target_class = %output_target.summary.class_name,
@@ -1586,8 +1586,8 @@ impl VoiceWorker {
             elapsed_ms = response.elapsed_ms,
             language = %response.language.as_deref().unwrap_or("unknown"),
             model = %response.model,
-            text = %short_text(&paste_outcome.text, 500),
-            raw_text = %short_text(&raw_text, 500),
+            text = %log_text(&paste_outcome.text, 500),
+            raw_text = %log_text(&raw_text, 500),
             finalizer_actions = %raw_finalized.actions,
             target_text_actions = %paste_outcome.text_actions,
             target_right_context = paste_outcome.target_context.right.as_str(),
@@ -1734,14 +1734,18 @@ impl VoiceWorker {
             return Ok(());
         }
 
-        // R0.5 regression audio dump: best-effort raw-audio wav, never fails dictation.
-        let _ = dump_utterance_audio(
-            self.history.path(),
-            &utterance_id,
-            &samples,
-            sample_rate_hz,
-            audio_ms,
-        );
+        // R0.5 regression audio dump: OPT-IN only. Raw speech must not be
+        // silently persisted in a public build — enable with AINPUT_DUMP_AUDIO=1.
+        // Best-effort; never fails dictation.
+        if audio_dump_enabled() {
+            let _ = dump_utterance_audio(
+                self.history.path(),
+                &utterance_id,
+                &samples,
+                sample_rate_hz,
+                audio_ms,
+            );
+        }
 
         // 本地分发：SenseVoice 原生推理
         // R0 latency span: decode window opens here (log-only).
@@ -1961,8 +1965,8 @@ impl VoiceWorker {
                 utterance_id,
                 audio_ms,
                 model_root = %response.model_root.display(),
-                text = %short_text(&paste_outcome.text, 500),
-                raw_text = %short_text(&raw_text, 500),
+                text = %log_text(&paste_outcome.text, 500),
+                raw_text = %log_text(&raw_text, 500),
                 finalizer_actions = %raw_finalized.actions,
                 target_text_actions = %paste_outcome.text_actions,
                 rewrite_output_route = %output_target.route.as_str(),
@@ -2019,8 +2023,8 @@ impl VoiceWorker {
                 utterance_id,
                 audio_ms,
                 model_root = %response.model_root.display(),
-                text = %short_text(raw_text_for_paste, 500),
-                raw_text = %short_text(&raw_text, 500),
+                text = %log_text(raw_text_for_paste, 500),
+                raw_text = %log_text(&raw_text, 500),
                 finalizer_actions = %raw_finalized.actions,
                 rewrite_output_route = %output_target.route.as_str(),
                 transcribe_ms = asr_elapsed_ms,
@@ -2115,8 +2119,8 @@ impl VoiceWorker {
             utterance_id,
             audio_ms,
             model_root = %response.model_root.display(),
-            text = %short_text(&paste_outcome.text, 500),
-            raw_text = %short_text(&raw_text, 500),
+            text = %log_text(&paste_outcome.text, 500),
+            raw_text = %log_text(&raw_text, 500),
             finalizer_actions = %raw_finalized.actions,
             target_text_actions = %paste_outcome.text_actions,
             rewrite_output_route = %output_target.route.as_str(),
@@ -2142,8 +2146,8 @@ impl VoiceWorker {
         self.hud.show_meter_busy();
         info!(
             utterance_id,
-            instruction = %short_text(instruction, 200),
-            raw_text = %short_text(raw_text, 200),
+            instruction = %log_text(instruction, 200),
+            raw_text = %log_text(raw_text, 200),
             "voice command detected (老蔡老蔡)"
         );
         let Some(rewriter) = self.rewriter.get() else {
@@ -2243,8 +2247,8 @@ impl VoiceWorker {
         self.hud.clear();
         info!(
             utterance_id,
-            instruction = %short_text(instruction, 200),
-            generated = %short_text(&generated, 300),
+            instruction = %log_text(instruction, 200),
+            generated = %log_text(&generated, 300),
             gen_ms,
             total_elapsed_ms = started_at.elapsed().as_millis(),
             "voice command pasted"
@@ -2378,7 +2382,7 @@ impl VoiceWorker {
             info!(
                 utterance_id = %job.utterance_id,
                 mode = history_mode,
-                rewrite_text = %short_text(candidate, 500),
+                rewrite_text = %log_text(candidate, 500),
                 rewrite_model = %trace.selected_model,
                 rewrite_elapsed_ms = trace.elapsed_ms,
                 rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -2597,7 +2601,7 @@ impl VoiceWorker {
                 info!(
                     utterance_id = %job.utterance_id,
                     mode = log_mode,
-                    rewrite_text = %short_text(&final_text, 500),
+                    rewrite_text = %log_text(&final_text, 500),
                     rewrite_model = %trace.selected_model,
                     rewrite_elapsed_ms = trace.elapsed_ms,
                     rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -2702,7 +2706,7 @@ impl VoiceWorker {
                 info!(
                     utterance_id = %job.utterance_id,
                     mode = log_mode,
-                    rewrite_text = %short_text(&final_text, 500),
+                    rewrite_text = %log_text(&final_text, 500),
                     rewrite_model = %trace.selected_model,
                     rewrite_elapsed_ms = trace.elapsed_ms,
                     rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -2745,7 +2749,7 @@ impl VoiceWorker {
                     info!(
                         utterance_id = %job.utterance_id,
                         mode = log_mode,
-                        rewrite_text = %short_text(&paste_outcome.text, 500),
+                        rewrite_text = %log_text(&paste_outcome.text, 500),
                         rewrite_model = %trace.selected_model,
                         rewrite_elapsed_ms = trace.elapsed_ms,
                         rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -2769,7 +2773,7 @@ impl VoiceWorker {
                         utterance_id = %job.utterance_id,
                         mode = log_mode,
                         error = %error,
-                        rewrite_text = %short_text(&final_text, 500),
+                        rewrite_text = %log_text(&final_text, 500),
                         rewrite_model = %trace.selected_model,
                         rewrite_elapsed_ms = trace.elapsed_ms,
                         rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -2890,7 +2894,7 @@ impl VoiceWorker {
             info!(
                 utterance_id = %job.utterance_id,
                 mode = "streaming_asr",
-                rewrite_text = %short_text(candidate, 500),
+                rewrite_text = %log_text(candidate, 500),
                 rewrite_model = %trace.selected_model,
                 rewrite_elapsed_ms = trace.elapsed_ms,
                 rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -3089,7 +3093,7 @@ impl VoiceWorker {
                 info!(
                     utterance_id = %job.utterance_id,
                     mode = "streaming_asr",
-                    rewrite_text = %short_text(&final_text, 500),
+                    rewrite_text = %log_text(&final_text, 500),
                     rewrite_model = %trace.selected_model,
                     rewrite_elapsed_ms = trace.elapsed_ms,
                     rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -3162,7 +3166,7 @@ impl VoiceWorker {
                 info!(
                     utterance_id = %job.utterance_id,
                     mode = "streaming_asr",
-                    rewrite_text = %short_text(&final_text, 500),
+                    rewrite_text = %log_text(&final_text, 500),
                     rewrite_model = %trace.selected_model,
                     rewrite_elapsed_ms = trace.elapsed_ms,
                     rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -3202,7 +3206,7 @@ impl VoiceWorker {
                     info!(
                         utterance_id = %job.utterance_id,
                         mode = "streaming_asr",
-                        rewrite_text = %short_text(&paste_outcome.text, 500),
+                        rewrite_text = %log_text(&paste_outcome.text, 500),
                         rewrite_model = %trace.selected_model,
                         rewrite_elapsed_ms = trace.elapsed_ms,
                         rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -3223,7 +3227,7 @@ impl VoiceWorker {
                         utterance_id = %job.utterance_id,
                         mode = "streaming_asr",
                         error = %error,
-                        rewrite_text = %short_text(&final_text, 500),
+                        rewrite_text = %log_text(&final_text, 500),
                         rewrite_model = %trace.selected_model,
                         rewrite_elapsed_ms = trace.elapsed_ms,
                         rewrite_attempts = %format_rewrite_attempts(&trace),
@@ -3535,8 +3539,8 @@ impl VoiceWorker {
                         audio_ms,
                         elapsed_ms,
                         language = %language.as_deref().unwrap_or("unknown"),
-                        raw_text = %short_text(&text, 220),
-                        display_text = %short_text(&display_text, 220),
+                        raw_text = %log_text(&text, 220),
+                        display_text = %log_text(&display_text, 220),
                         partial_updates = preview.partial_updates,
                         "streaming ASR finish text applied to HUD snapshot"
                     );
@@ -3581,7 +3585,7 @@ impl VoiceWorker {
                     elapsed_ms = response.elapsed_ms,
                     first_partial_ms = session_started_at.elapsed().as_millis(),
                     language = %response.language.as_deref().unwrap_or("unknown"),
-                    text = %short_text(&display_text, 220),
+                    text = %log_text(&display_text, 220),
                     "streaming ASR first partial received"
                 );
             }
@@ -3601,8 +3605,8 @@ impl VoiceWorker {
                 audio_ms = response.audio_ms,
                 elapsed_ms = response.elapsed_ms,
                 language = %response.language.as_deref().unwrap_or("unknown"),
-                raw_text = %short_text(&text, 220),
-                display_text = %short_text(&display_text, 220),
+                raw_text = %log_text(&text, 220),
+                display_text = %log_text(&display_text, 220),
                 partial_updates = preview.partial_updates,
                 "streaming ASR HUD partial updated"
             );
@@ -3690,8 +3694,8 @@ fn apply_whisper_rewrite_with(
             trace.output = None;
             warn!(
                 reason = %decision.reason,
-                raw_text = %short_text(raw_text, 160),
-                rewrite_text = %short_text(&output, 160),
+                raw_text = %log_text(raw_text, 160),
+                rewrite_text = %log_text(&output, 160),
                 "Whisper AI rewrite blocked by protected replacement"
             );
         }
@@ -4660,6 +4664,23 @@ fn short_text(text: &str, max_chars: usize) -> String {
     value
 }
 
+/// Log-safe rendering of dictated/rewritten text. A public build must not write
+/// the user's speech to plaintext logs, so unless `AINPUT_LOG_TEXT=1` is set we
+/// emit only a length marker. Used for every tracing text field.
+fn log_text(text: &str, _max_chars: usize) -> String {
+    if log_text_enabled() {
+        return short_text(text, _max_chars);
+    }
+    format!("<{} chars>", text.chars().count())
+}
+
+fn log_text_enabled() -> bool {
+    matches!(
+        std::env::var("AINPUT_LOG_TEXT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
+}
+
 fn apply_rewrite_trace_to_record(record: &mut HistoryRecord, trace: &RewriteTrace) {
     // Prefer true if either session stamp or this trace enabled rewrite.
     record.rewrite_enabled = trace.enabled || record.rewrite_enabled;
@@ -4890,6 +4911,16 @@ fn is_whisper_short_hallucination(text: &str, audio_ms: u64) -> bool {
 fn next_utterance_id() -> String {
     let sequence = UTTERANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("utt-{sequence:08}")
+}
+
+/// Whether raw-utterance audio dumping is enabled. Off by default so a public
+/// build never silently persists the user's speech; opt in with the
+/// `AINPUT_DUMP_AUDIO=1` environment variable (regression/debug use only).
+fn audio_dump_enabled() -> bool {
+    matches!(
+        std::env::var("AINPUT_DUMP_AUDIO").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    )
 }
 
 /// R0.5: dump per-utterance raw audio to `<history_dir>/audio/<utterance_id>.wav`

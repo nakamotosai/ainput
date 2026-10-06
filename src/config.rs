@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::api_config::ApiConnectionsConfig;
 use crate::modes::{InputMode, VoiceProfileId};
@@ -362,7 +363,21 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
-        let mut config: Self = toml::from_str(&raw).context("parse ainput config")?;
+        // A corrupt/half-written config must not brick the app: back it up and
+        // fall back to defaults (the tray can rewrite a clean file).
+        let mut config: Self = match toml::from_str(&raw) {
+            Ok(config) => config,
+            Err(error) => {
+                let backup = path.with_extension("toml.bad");
+                let _ = std::fs::rename(path, &backup);
+                warn!(
+                    error = %error,
+                    backup = %backup.display(),
+                    "config parse failed; backed up and using defaults"
+                );
+                Self::default()
+            }
+        };
         config.hud.apply_runtime_defaults();
         config.apply_legacy_hotkey_if_needed(&raw);
         if let Some(parent) = path.parent() {
@@ -782,7 +797,7 @@ impl Default for ModeConfig {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            voice_input: "MouseX1".to_string(),
+            voice_input: "CapsLock".to_string(),
             poll_ms: 8,
             activation_delay_ms: 200,
         }
@@ -819,7 +834,7 @@ impl VoiceProfileConfig {
             VoiceProfileId::LocalNonstreaming => Self {
                 enabled: true,
                 mode: InputMode::LocalNonstreaming,
-                hotkey: "MouseX1".to_string(),
+                hotkey: "CapsLock".to_string(),
                 activation_delay_ms: 220,
                 suppress_key: true,
             },
@@ -1131,7 +1146,7 @@ mod tests {
     fn defaults_to_three_voice_profiles() {
         let config = AppConfig::default();
         assert_eq!(config.mode.default, InputMode::LocalNonstreaming);
-        assert_eq!(config.hotkey.voice_input, "MouseX1");
+        assert_eq!(config.hotkey.voice_input, "CapsLock");
         assert_eq!(config.hotkey.activation_delay_ms, 200);
         assert!(!config.profiles.streaming.enabled);
         assert_eq!(config.profiles.streaming.mode, InputMode::StreamingAsr);
@@ -1145,7 +1160,7 @@ mod tests {
             config.profiles.local_nonstreaming.mode,
             InputMode::LocalNonstreaming
         );
-        assert_eq!(config.profiles.local_nonstreaming.hotkey, "MouseX1");
+        assert_eq!(config.profiles.local_nonstreaming.hotkey, "CapsLock");
         assert_eq!(config.profiles.local_nonstreaming.activation_delay_ms, 220);
         assert!(config.profiles.local_nonstreaming.suppress_key);
         assert_eq!(config.local_nonstreaming.model_dir, "models/sense-voice");

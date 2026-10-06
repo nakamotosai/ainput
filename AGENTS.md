@@ -14,7 +14,7 @@ cargo build --release
 cargo test
 
 ## Package
-.\scripts\make-portable.ps1 -Version 0.1.0 -Overwrite
+.\scripts\make-portable.ps1 -Overwrite  # version auto-derived from Cargo.toml
 
 ## Rules
 - Local SenseVoice only (no cloud ASR)
