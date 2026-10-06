@@ -75,8 +75,19 @@ hf upload nakamotosai/cnjp-input "dist/ainput-<ver>-setup.exe" "ainput-<ver>-set
 - [ ] 官网显示新版本号 + 新下载链接
 - [ ] 仓库工作树干净（`git status`）
 
-## 附：签名（当前未做）
+## 附：代码签名（已内置，有证书即生效）
 
-exe 未做 Authenticode 签名 → 用户下载会撞 SmartScreen。拿到 EV/OV 代码签名证书后：
-在打包脚本里加 `signtool sign /fd SHA256 /f <cert.pfx> /p <pw> /tr <ts> ainput.exe`，
-对 `ainput.exe` 与最终 `setup.exe` 都签，再走上面流程。
+打包脚本已内置签名步骤 `scripts/sign-if-available.ps1`：**有证书就签，没有就跳过**（不影响打包）。
+
+拿到 EV/OV 代码签名证书后，任选一种方式启用，然后照常 `make-portable.ps1` + `build-installer.ps1`：
+
+- **PFX 文件**：设环境变量
+  ```powershell
+  $env:AINPUT_SIGN_PFX = "C:\path\cert.pfx"
+  $env:AINPUT_SIGN_PFX_PASS = "<password>"
+  ```
+- **证书已导入本机**：把证书装进 `Cert:\CurrentUser\My`（带私钥），脚本自动选用。
+
+脚本会对 `ainput.exe` 和最终 `setup.exe` 都签名，并用 DigiCert 时间戳（签名在证书过期后仍有效），签完 `signtool verify` 自检。签名后重新上传 GitHub/HF 资产即可。
+
+> 当前发布未签名 → 用户首次运行可能见 SmartScreen「已保护你的电脑」。

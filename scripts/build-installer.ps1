@@ -28,6 +28,8 @@ if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
 
 $out = Join-Path $Root "dist\ainput-$Version-setup.exe"
 if (Test-Path $out) {
+  # Authenticode-sign the installer if a cert is configured (no-op otherwise).
+  & (Join-Path $PSScriptRoot "sign-if-available.ps1") -File $out
   Write-Host ("Installer: {0} ({1:N1} MB)" -f $out, ((Get-Item $out).Length / 1MB))
 } else {
   throw "Expected installer not produced: $out"

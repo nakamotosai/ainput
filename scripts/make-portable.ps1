@@ -37,6 +37,8 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 
 New-Item -ItemType Directory -Force $Dist | Out-Null
 Copy-Item "$Root\target\release\ainput.exe" $Dist
+# Authenticode-sign the exe if a cert is configured (no-op otherwise).
+& (Join-Path $PSScriptRoot "sign-if-available.ps1") -File (Join-Path $Dist "ainput.exe")
 # Allow-list only the DLLs the CPU ASR path needs. A wildcard sweep would drag
 # in onnxruntime_providers_cuda.dll (~275MB) / _tensorrt.dll, which the shipped
 # config (provider="cpu") never loads — a ~166MB (compressed) download bloat.
