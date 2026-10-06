@@ -39,12 +39,14 @@ Latest release: see [GitHub Releases](https://github.com/nakamotosai/ainput/rele
 
 ## Quick start
 
-1. Download the release zip (or build from source).
-2. Unpack anywhere.
-3. Run `ainput.exe` or `run-ainput.bat`.
-4. Hold the voice hotkey (default **CapsLock**), speak, release — text pastes into the focused window. Change the key via tray → **自定义语音快捷键…** (restart after save). Mouse side buttons strip system Back/Forward like CapsLock.
-5. (Optional) Tray → **API / 改写设置…** opens a **local browser page** → fill Key → **拉取模型** → pick model → set timeout → enable rewrite → **保存并测连通**.
-6. Tray → **听写历史…** opens another **local browser page** to browse counts and rewrite before/after.
+**安装包（推荐）**：运行 `ainput-<version>-setup.exe`，按向导装好即可（含开始菜单、可选开机自启、卸载器）。
+**绿色包**：下载 zip，解压到任意目录，运行 `ainput.exe` 或 `run-ainput.bat`。
+
+> **首次运行提示**：本程序未做代码签名，Windows 可能弹出「Windows 已保护你的电脑 / SmartScreen」——点「更多信息」→「仍要运行」即可（这是未签名程序的通用提示，非病毒告警）。
+
+1. 按住语音热键（默认 **CapsLock**）说话，松开后文字自动贴进当前窗口。托盘 → **自定义语音快捷键…** 可改键（侧键/F 键，改后重启生效）。
+2. （可选）托盘 → **API / 改写设置…** 打开本地浏览器页 → 填 Key → **拉取模型** → 选模型 → 设超时 → 开启改写 → **保存并测连通**。
+3. 托盘 → **听写历史…** 打开另一个本地页，查看条数与改写前后。
 
 Both UIs bind loopback only (`http://127.0.0.1:<ephemeral-port>/`). Runtime state is stored next to the executable under `state/` (config, logs, history). History is local-only JSONL: `state/logs/history.jsonl`.
 
