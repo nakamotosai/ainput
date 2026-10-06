@@ -13,10 +13,12 @@ $ErrorActionPreference = "Continue"
 function Find-Signtool {
   $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
   if ($cmd) { return $cmd.Source }
-  $kit = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory -ErrorAction SilentlyContinue |
-    Sort-Object Name -Descending | Select-Object -First 1
-  if ($kit) {
-    $st = Join-Path $kit.FullName "x64\signtool.exe"
+  # Windows Kits layout: bin\<sdk-version>\x64\signtool.exe (bin\x86 has none).
+  $base = "C:\Program Files (x86)\Windows Kits\10\bin"
+  $ver = Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^\d+\.' } | Sort-Object Name -Descending
+  foreach ($v in $ver) {
+    $st = Join-Path $v.FullName "x64\signtool.exe"
     if (Test-Path $st) { return $st }
   }
   return $null
