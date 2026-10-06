@@ -1,6 +1,0 @@
-LIBRARY onnxruntime
-EXPORTS
-    OrtGetApiBase
-    OrtSessionOptionsAppendExecutionProvider_CPU
-    OrtSessionOptionsAppendExecutionProvider_CUDA
-    OrtSessionOptionsAppendExecutionProvider_Tensorrt

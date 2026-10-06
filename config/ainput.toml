@@ -148,10 +148,8 @@ clipboard_retry_backoff_ms = 35
 paste_preflight_recheck = true
 replacement_preflight_recheck = true
 # Process names (case-insensitive, ".exe" optional) to exempt from the built-in
-# terminal safety skip in output.rs::is_terminal_process_name. Add wezterm-gui.exe
-# so AI rewrite actually replaces ASR text in wezterm (default behavior skips
-# all listed terminals, which wezterm-gui.exe is on).
-rewrite_terminal_allowlist = ["wezterm-gui.exe"]
+# terminal safety skip, so AI rewrite may replace ASR text there. Empty by default.
+rewrite_terminal_allowlist = []
 
 [hud]
 style = "floating_text"

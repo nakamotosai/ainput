@@ -374,6 +374,10 @@ fn format_timestamp_ms(timestamp_ms: u128) -> String {
     }
 }
 
+/// Keep at most this many recent history records so the local JSONL does not
+/// grow without bound (it contains dictated text). Trimmed opportunistically.
+const HISTORY_MAX_RECORDS: usize = 5_000;
+
 fn append_record(path: &Path, record: &HistoryRecord) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -385,7 +389,31 @@ fn append_record(path: &Path, record: &HistoryRecord) -> Result<()> {
         .with_context(|| format!("write history {}", path.display()))?;
     file.write_all(b"\n")
         .with_context(|| format!("write history newline {}", path.display()))?;
+    drop(file);
+    trim_if_oversized(path);
     Ok(())
+}
+
+/// Best-effort trim: when the JSONL exceeds the cap, rewrite it keeping only the
+/// most recent `HISTORY_MAX_RECORDS` lines. Never fails the caller.
+fn trim_if_oversized(path: &Path) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let total = raw.lines().count();
+    if total <= HISTORY_MAX_RECORDS {
+        return;
+    }
+    let keep: Vec<&str> = raw
+        .lines()
+        .skip(total - HISTORY_MAX_RECORDS)
+        .collect();
+    let mut out = keep.join("\n");
+    out.push('\n');
+    let tmp = path.with_extension("jsonl.tmp");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 fn one_line(text: &str, max_chars: usize) -> String {

@@ -49,3 +49,12 @@ sidecar/_conv_b10876/
 engine-gpu/wheels/
 engine-gpu/*.tar.bz2
 /punct-int8.tar.bz2
+
+# 私有工作流/开发机文件（2026-10-06 移出公开仓）
+AGENTS.md
+.scold/
+build-dist.bat
+build-msvc.bat
+scripts/make-shortcut.ps1
+engine-gpu/x/
+engine-gpu/test.wav
