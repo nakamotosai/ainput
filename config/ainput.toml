@@ -35,6 +35,9 @@ chunk_ms = 100
 release_grace_ms = 0
 pre_roll_ms = 160
 audio_ring_ms = 600
+# 空闲多久（毫秒）没人用麦克风就暂停它，释放 usbaudio 电源请求、让系统能自动休眠。
+# 0 = 从不暂停（保留常驻流，旧行为）。恢复是同一句柄 play()，亚毫秒，首音节不丢。
+mic_idle_pause_ms = 30000
 language = "zh-CN"
 request_timeout_ms = 8000
 

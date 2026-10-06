@@ -306,8 +306,11 @@ fn run_app() -> Result<()> {
         state_root.clone(),
         api_notification_tx,
     );
-    let audio = audio::AudioHub::start_default(config.asr.audio_ring_ms)
-        .context("start resident microphone")?;
+    let audio = audio::AudioHub::start(
+        config.asr.audio_ring_ms,
+        config.asr.mic_idle_pause_ms,
+    )
+    .context("start resident microphone")?;
     hud.bind_audio_level(audio.level_share());
     let whisper =
         cloud_asr::WhisperClient::new(&config.whisper).context("create cloud Whisper client")?;

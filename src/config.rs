@@ -66,6 +66,10 @@ pub struct AsrConfig {
     pub release_grace_ms: u64,
     pub pre_roll_ms: u64,
     pub audio_ring_ms: u64,
+    /// Pause the microphone after this many ms with no dictation activity, which
+    /// releases the usbaudio SYSTEM power request so the PC can auto-sleep.
+    /// 0 = never pause (keep the resident stream, old behavior).
+    pub mic_idle_pause_ms: u64,
     pub language: String,
     pub request_timeout_ms: u64,
     pub api_key_env: String,
@@ -843,6 +847,7 @@ impl Default for AsrConfig {
             release_grace_ms: 0,
             pre_roll_ms: 160,
             audio_ring_ms: 600,
+            mic_idle_pause_ms: 30_000,
             language: "zh-CN".to_string(),
             request_timeout_ms: 8000,
             api_key_env: String::new(),
