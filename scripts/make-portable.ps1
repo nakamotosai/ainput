@@ -26,6 +26,12 @@ if (Test-Path $Dist) {
   Remove-Item -Recurse -Force $Dist
 }
 
+# cargo is often at ~\.cargo\bin but not on PATH; add it so this script works
+# when invoked directly (README documents that).
+$CargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+if ((Test-Path $CargoBin) -and ($env:PATH -notlike "*$CargoBin*")) {
+  $env:PATH = "$CargoBin;$env:PATH"
+}
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 
